@@ -103,6 +103,8 @@ app.post('/api/move-message', async (req, res) => {
     }
 });
 
+
+
 app.post('/api/append-sent', async (req, res) => {
     const { email, password, host, port, secure, rawMessage, sentFolderName } = req.body;
     if (!rawMessage) {

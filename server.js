@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const { ImapFlow } = require('imapflow');
 const cors = require('cors');
 
@@ -65,7 +65,7 @@ app.post('/api/messages', async (req, res) => {
             messages.push({
                 uid: msg.uid,
                 subject: msg.envelope.subject,
-                from: msg.envelope.from[0].address,
+                from: (msg.envelope.from?.[0]?.address || email),
                 date: msg.envelope.date
             });
         }

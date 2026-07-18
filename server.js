@@ -1,9 +1,6 @@
-const express = require('express');
+﻿const express = require('express');
 const { ImapFlow } = require('imapflow');
 const cors = require('cors');
-const nodemailer = require('nodemailer');
-const multer = require('multer');
-const upload = multer({ dest: 'uploads/' }); // carpeta temporal para adjuntos
 
 const app = express();
 app.use(cors());
@@ -84,107 +81,90 @@ app.post('/api/messages', async (req, res) => {
     }
 });
 
-// ------------------- NUEVO: ENVÍO SIMPLE (JSON) -------------------
-app.post('/api/send', async (req, res) => {
+// ------------------- MOVER MENSAJE -------------------
+app.post('/api/move-message', async (req, res) => {
+    const { email, password, host, port, secure, uid, fromFolder, toFolder } = req.body;
+    if (!uid || !fromFolder || !toFolder) {
+        return res.status(400).json({ success: false, error: 'Faltan parámetros (uid, fromFolder, toFolder)' });
+    }
+
+    const client = new ImapFlow({
+        host: host || 'imap.gmail.com',
+        port: port || 993,
+        secure: secure !== undefined ? secure : true,
+        auth: { user: email, pass: password },
+        tls: insecureTls
+    });
+
     try {
-        const { email, password, host, port, secure, to, subject, body,
-                smtpHost, smtpPort, smtpSecure, sentFolderName } = req.body;
-
-        // Construir transporte SMTP con las credenciales del usuario
-        const transporter = nodemailer.createTransport({
-            host: smtpHost || host || 'smtp.office365.com',
-            port: parseInt(smtpPort || port, 10) || 587,
-            secure: (smtpSecure || secure) === true,
-            auth: {
-                user: email,
-                pass: password
-            },
-            tls: {
-                rejectUnauthorized: false, // igual que en IMAP, ignora certificados
-                checkServerIdentity: () => undefined
-            }
-        });
-
-        const info = await transporter.sendMail({
-            from: email,
-            to: to,
-            subject: subject,
-            text: body
-        });
-
-        // Opcional: guardar en carpeta Enviados (requiere IMAP)
-        if (sentFolderName) {
-            try {
-                const imapClient = new ImapFlow({
-                    host: host || 'imap.gmail.com',
-                    port: port || 993,
-                    secure: secure !== undefined ? secure : true,
-                    auth: { user: email, pass: password },
-                    tls: insecureTls
-                });
-                await imapClient.connect();
-                await imapClient.mailboxOpen(sentFolderName);
-                await imapClient.append(body, { flags: ['\\Seen'] });
-                await imapClient.logout();
-            } catch (imapError) {
-                console.warn('No se pudo guardar en Enviados:', imapError.message);
-            }
-        }
-
-        res.json({ success: true, messageId: info.messageId });
+        await client.connect();
+        await client.mailboxOpen(fromFolder);
+        await client.messageMove(uid, toFolder, { uid: true });
+        await client.logout();
+        res.json({ success: true });
     } catch (error) {
-        console.error('Error en /api/send:', error.message);
+        console.error('Error en /api/move-message:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// ------------------- NUEVO: ENVÍO CON ADJUNTOS (multipart) -------------------
-app.post('/api/send-attachments', upload.array('attachments', 10), async (req, res) => {
+// ------------------- GUARDAR EN ENVIADOS (APPEND) -------------------
+app.post('/api/append-sent', async (req, res) => {
+    const { email, password, host, port, secure, rawMessage, sentFolderName } = req.body;
+    if (!rawMessage) {
+        return res.status(400).json({ success: false, error: 'Falta el contenido del mensaje (rawMessage)' });
+    }
+
+    const client = new ImapFlow({
+        host: host || 'imap.gmail.com',
+        port: port || 993,
+        secure: secure !== undefined ? secure : true,
+        auth: { user: email, pass: password },
+        tls: insecureTls
+    });
+
     try {
-        const { email, password, host, port, secure, to, subject, body,
-                smtpHost, smtpPort, smtpSecure, sentFolderName } = req.body;
-
-        // Procesar archivos adjuntos subidos
-        const attachments = (req.files || []).map(file => ({
-            filename: file.originalname,
-            path: file.path
-        }));
-
-        const transporter = nodemailer.createTransport({
-            host: smtpHost || host || 'smtp.office365.com',
-            port: parseInt(smtpPort || port, 10) || 587,
-            secure: (smtpSecure || secure) === true,
-            auth: {
-                user: email,
-                pass: password
-            },
-            tls: {
-                rejectUnauthorized: false,
-                checkServerIdentity: () => undefined
-            }
-        });
-
-        const info = await transporter.sendMail({
-            from: email,
-            to: to,
-            subject: subject,
-            text: body,
-            attachments: attachments
-        });
-
-        // Limpiar archivos temporales
-        (req.files || []).forEach(file => {
-            try { require('fs').unlinkSync(file.path); } catch (_) {}
-        });
-
-        res.json({ success: true, messageId: info.messageId });
+        await client.connect();
+        const folder = sentFolderName || 'Sent';
+        await client.mailboxOpen(folder);
+        await client.append(folder, rawMessage, ['\\Seen']);
+        await client.logout();
+        res.json({ success: true });
     } catch (error) {
-        console.error('Error en /api/send-attachments:', error.message);
+        console.error('Error en /api/append-sent:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ------------------- ELIMINAR MENSAJE (permanente) -------------------
+app.post('/api/delete-message', async (req, res) => {
+    const { email, password, host, port, secure, uid, folder } = req.body;
+    if (!uid || !folder) {
+        return res.status(400).json({ success: false, error: 'Faltan parámetros (uid, folder)' });
+    }
+
+    const client = new ImapFlow({
+        host: host || 'imap.gmail.com',
+        port: port || 993,
+        secure: secure !== undefined ? secure : true,
+        auth: { user: email, pass: password },
+        tls: insecureTls
+    });
+
+    try {
+        await client.connect();
+        await client.mailboxOpen(folder);
+        await client.messageDelete(uid, { uid: true });
+        await client.expunge();
+        await client.logout();
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Error en /api/delete-message:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Backend de correo corriendo en puerto ${PORT}`);
+    console.log(Backend de correo corriendo en puerto );
 });

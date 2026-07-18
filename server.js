@@ -6,21 +6,18 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Configuración TLS que ignora TODO: CA, caducidad, nombre del host
 const insecureTls = {
     rejectUnauthorized: false,
     checkServerIdentity: () => undefined
 };
 
-// Ruta de prueba para verificar que Express está vivo
 app.get('/ping', (req, res) => {
     res.json({ alive: true, time: new Date().toISOString() });
 });
 
-// ------------------- IMAP: CARPETAS -------------------
 app.post('/api/folders', async (req, res) => {
     const { email, password, host, port, secure } = req.body;
-    console.log('Petición recibida en /api/folders', email);
+    console.log('Peticion recibida en /api/folders', email);
 
     const client = new ImapFlow({
         host: host || 'imap.gmail.com',
@@ -47,10 +44,9 @@ app.post('/api/folders', async (req, res) => {
     }
 });
 
-// ------------------- IMAP: MENSAJES -------------------
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, secure, folder } = req.body;
-    console.log('Petición recibida en /api/messages', email);
+    console.log('Peticion recibida en /api/messages', email);
 
     const client = new ImapFlow({
         host: host || 'imap.gmail.com',
@@ -81,11 +77,10 @@ app.post('/api/messages', async (req, res) => {
     }
 });
 
-// ------------------- MOVER MENSAJE -------------------
 app.post('/api/move-message', async (req, res) => {
     const { email, password, host, port, secure, uid, fromFolder, toFolder } = req.body;
     if (!uid || !fromFolder || !toFolder) {
-        return res.status(400).json({ success: false, error: 'Faltan parámetros (uid, fromFolder, toFolder)' });
+        return res.status(400).json({ success: false, error: 'Faltan parametros (uid, fromFolder, toFolder)' });
     }
 
     const client = new ImapFlow({
@@ -108,7 +103,6 @@ app.post('/api/move-message', async (req, res) => {
     }
 });
 
-// ------------------- GUARDAR EN ENVIADOS (APPEND) -------------------
 app.post('/api/append-sent', async (req, res) => {
     const { email, password, host, port, secure, rawMessage, sentFolderName } = req.body;
     if (!rawMessage) {
@@ -127,7 +121,7 @@ app.post('/api/append-sent', async (req, res) => {
         await client.connect();
         const folder = sentFolderName || 'Sent';
         await client.mailboxOpen(folder);
-        await client.append(folder, rawMessage, ['\\Seen']);
+        await client.append(folder, rawMessage, ['\\\\Seen']);
         await client.logout();
         res.json({ success: true });
     } catch (error) {
@@ -136,11 +130,10 @@ app.post('/api/append-sent', async (req, res) => {
     }
 });
 
-// ------------------- ELIMINAR MENSAJE (permanente) -------------------
 app.post('/api/delete-message', async (req, res) => {
     const { email, password, host, port, secure, uid, folder } = req.body;
     if (!uid || !folder) {
-        return res.status(400).json({ success: false, error: 'Faltan parámetros (uid, folder)' });
+        return res.status(400).json({ success: false, error: 'Faltan parametros (uid, folder)' });
     }
 
     const client = new ImapFlow({
@@ -166,5 +159,5 @@ app.post('/api/delete-message', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(Backend de correo corriendo en puerto );
+    console.log('Backend de correo corriendo en puerto ' + PORT);
 });

@@ -121,7 +121,7 @@ app.post('/api/append-sent', async (req, res) => {
         await client.connect();
         const folder = sentFolderName || 'Sent';
         await client.mailboxOpen(folder);
-        await client.append(folder, rawMessage, ['\\\\Seen']);
+        await client.append(folder, rawMessage, ['\\Seen']);
         await client.logout();
         res.json({ success: true });
     } catch (error) {
@@ -160,30 +160,4 @@ app.post('/api/delete-message', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log('Backend de correo corriendo en puerto ' + PORT);
-});
-app.post('/api/append-sent', async (req, res) => {
-    const { email, password, host, port, secure, rawMessage, sentFolderName } = req.body;
-    if (!rawMessage) {
-        return res.status(400).json({ success: false, error: 'Falta el contenido del mensaje (rawMessage)' });
-    }
-
-    const client = new ImapFlow({
-        host: host || 'imap.gmail.com',
-        port: port || 993,
-        secure: secure !== undefined ? secure : true,
-        auth: { user: email, pass: password },
-        tls: insecureTls
-    });
-
-    try {
-        await client.connect();
-        const folder = sentFolderName || 'Sent';
-        await client.mailboxOpen(folder);
-        await client.append(folder, rawMessage, ['\\Seen']);
-        await client.logout();
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Error en /api/append-sent:', error.message);
-        res.status(500).json({ success: false, error: error.message });
-    }
 });

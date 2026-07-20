@@ -57,7 +57,12 @@ app.post('/api/messages', async (req, res) => {
         await client.connect();
         await client.mailboxOpen(folder || 'INBOX');
         const messages = [];
-        for await (const msg of client.fetch('1:*', { envelope: true, bodyStructure: true, flags: true })) {
+        for await (const msg of client.fetch('1:*', { 
+            envelope: true, 
+            bodyStructure: true, 
+            flags: true,
+            bodyParts: ['HEADER', 'TEXT']
+        })) {
             let body = '';
             let htmlBody = '';
             let attachments = [];
@@ -65,64 +70,46 @@ app.post('/api/messages', async (req, res) => {
             let isRead = false;
             let isFlagged = false;
             
-            // Verificar flags
             if (msg.flags) {
                 isRead = msg.flags.has('\\Seen');
                 isFlagged = msg.flags.has('\\Flagged');
             }
             
+            // Intentar obtener el texto del mensaje
+            if (msg.bodyParts && msg.bodyParts.get('TEXT')) {
+                body = msg.bodyParts.get('TEXT').toString().substring(0, 100000);
+            }
+            
+            // Si no hay texto, intentar obtener el header completo
+            if (!body && msg.bodyParts && msg.bodyParts.get('HEADER')) {
+                body = msg.bodyParts.get('HEADER').toString().substring(0, 100000);
+            }
+            
+            // Buscar adjuntos en la estructura
             if (msg.bodyStructure) {
-                const struct = msg.bodyStructure;
-                
-                // Función para encontrar y descargar todas las partes
-                const processPart = async (node, parentPath = '') => {
+                const findAttachments = (node) => {
                     if (!node) return;
-                    
-                    const currentPath = parentPath ? parentPath + '.' + node.part : node.part;
-                    
-                    // Si es texto plano
-                    if (node.type === 'text' && node.subtype === 'plain' && !body) {
-                        try {
-                            const result = await client.download(msg.uid, currentPath, { uid: true });
-                            body = result.toString().substring(0, 100000);
-                        } catch (e) {}
-                    }
-                    
-                    // Si es HTML
-                    if (node.type === 'text' && node.subtype === 'html') {
-                        try {
-                            const result = await client.download(msg.uid, currentPath, { uid: true });
-                            htmlBody = result.toString().substring(0, 100000);
-                        } catch (e) {}
-                    }
-                    
-                    // Si es adjunto
-                    if (node.disposition === 'attachment' || 
-                        (node.type === 'application' && node.parameters?.name) ||
-                        (node.type === 'image' && node.disposition !== 'inline')) {
-                        hasAttachments = true;
-                        attachments.push({
-                            filename: node.dispositionParameters?.filename || node.parameters?.name || 'adjunto',
-                            contentType: node.type + '/' + (node.subtype || 'octet-stream'),
-                            size: node.size || 0,
-                            partId: currentPath
-                        });
-                    }
-                    
-                    // Procesar hijos
                     if (node.childNodes) {
                         for (const child of node.childNodes) {
-                            await processPart(child, currentPath);
+                            if (child.disposition === 'attachment' || 
+                                (child.type === 'application' && child.parameters && child.parameters.name)) {
+                                hasAttachments = true;
+                                attachments.push({
+                                    filename: child.dispositionParameters?.filename || child.parameters?.name || 'adjunto',
+                                    contentType: child.type + '/' + (child.subtype || 'octet-stream'),
+                                    size: child.size || 0,
+                                    partId: child.part
+                                });
+                            }
+                            findAttachments(child);
                         }
                     }
                 };
-                
-                await processPart(struct);
+                findAttachments(msg.bodyStructure);
             }
             
-            // Si no se obtuvo HTML, usar texto
-            if (!body && !htmlBody) {
-                body = '(Sin contenido)';
+            if (!body) {
+                body = msg.envelope.subject || '(Sin contenido)';
             }
 
             messages.push({

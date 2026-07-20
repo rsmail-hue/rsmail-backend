@@ -219,3 +219,65 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log('Backend de correo corriendo en puerto ' + PORT);
 });
+
+// ------------------- MARCAR COMO LEÍDO/NO LEÍDO -------------------
+app.post('/api/toggle-read', async (req, res) => {
+    const { email, password, host, port, secure, uid, folder, read } = req.body;
+    if (uid === undefined || folder === undefined) {
+        return res.status(400).json({ success: false, error: 'Faltan parametros' });
+    }
+
+    const client = new ImapFlow({
+        host: host || 'imap.gmail.com',
+        port: port || 993,
+        secure: secure !== undefined ? secure : true,
+        auth: { user: email, pass: password },
+        tls: insecureTls
+    });
+
+    try {
+        await client.connect();
+        await client.mailboxOpen(folder);
+        if (read) {
+            await client.messageFlagsAdd(uid, ['\\\\Seen'], { uid: true });
+        } else {
+            await client.messageFlagsRemove(uid, ['\\\\Seen'], { uid: true });
+        }
+        await client.logout();
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Error en /api/toggle-read:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ------------------- MARCAR COMO IMPORTANTE -------------------
+app.post('/api/toggle-flagged', async (req, res) => {
+    const { email, password, host, port, secure, uid, folder, flagged } = req.body;
+    if (uid === undefined || folder === undefined) {
+        return res.status(400).json({ success: false, error: 'Faltan parametros' });
+    }
+
+    const client = new ImapFlow({
+        host: host || 'imap.gmail.com',
+        port: port || 993,
+        secure: secure !== undefined ? secure : true,
+        auth: { user: email, pass: password },
+        tls: insecureTls
+    });
+
+    try {
+        await client.connect();
+        await client.mailboxOpen(folder);
+        if (flagged) {
+            await client.messageFlagsAdd(uid, ['\\\\Flagged'], { uid: true });
+        } else {
+            await client.messageFlagsRemove(uid, ['\\\\Flagged'], { uid: true });
+        }
+        await client.logout();
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Error en /api/toggle-flagged:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});

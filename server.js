@@ -58,61 +58,15 @@ app.post('/api/messages', async (req, res) => {
         await client.mailboxOpen(folder || 'INBOX');
         const messages = [];
         for await (const msg of client.fetch('1:*', { envelope: true, bodyStructure: true, flags: true })) {
-            let body = '';
-            let htmlBody = '';
-            let attachments = [];
-            let hasAttachments = false;
-            let isRead = false;
-            let isFlagged = false;
-            
-            if (msg.flags) {
-                isRead = msg.flags.has('\\Seen');
-                isFlagged = msg.flags.has('\\Flagged');
-            }
-            
-            // Intentar descargar el texto del mensaje
-            try {
-                const result = await client.download(msg.uid, 'BODY[TEXT]', { uid: true });
-                body = result.toString().substring(0, 100000);
-            } catch (e) {
-                body = msg.envelope.subject || '(Sin contenido)';
-            }
-            
-            // Buscar adjuntos en la estructura
-            if (msg.bodyStructure) {
-                const findAttachments = (node) => {
-                    if (!node) return;
-                    if (node.childNodes) {
-                        for (const child of node.childNodes) {
-                            if (child.disposition === 'attachment' || 
-                                (child.type === 'application' && child.parameters && child.parameters.name)) {
-                                hasAttachments = true;
-                                attachments.push({
-                                    filename: child.dispositionParameters?.filename || child.parameters?.name || 'adjunto',
-                                    contentType: child.type + '/' + (child.subtype || 'octet-stream'),
-                                    size: child.size || 0,
-                                    partId: child.part
-                                });
-                            }
-                            findAttachments(child);
-                        }
-                    }
-                };
-                findAttachments(msg.bodyStructure);
-            }
-
             messages.push({
                 uid: msg.uid,
                 subject: msg.envelope.subject || '(Sin asunto)',
                 from: (msg.envelope.from && msg.envelope.from[0]) ? msg.envelope.from[0].address : email,
                 to: (msg.envelope.to && msg.envelope.to[0]) ? msg.envelope.to[0].address : '',
                 date: msg.envelope.date || new Date().toISOString(),
-                body: body,
-                htmlBody: htmlBody,
-                hasAttachments: hasAttachments,
-                attachments: attachments,
-                isRead: isRead,
-                isFlagged: isFlagged
+                body: '',
+                hasAttachments: false,
+                attachments: []
             });
         }
         await client.logout();

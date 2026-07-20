@@ -163,3 +163,55 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log('Backend de correo corriendo en puerto ' + PORT);
 });
+
+// ------------------- CREAR CARPETA -------------------
+app.post('/api/create-folder', async (req, res) => {
+    const { email, password, host, port, secure, folderName } = req.body;
+    if (!folderName) {
+        return res.status(400).json({ success: false, error: 'Falta el nombre de la carpeta' });
+    }
+
+    const client = new ImapFlow({
+        host: host || 'imap.gmail.com',
+        port: port || 993,
+        secure: secure !== undefined ? secure : true,
+        auth: { user: email, pass: password },
+        tls: insecureTls
+    });
+
+    try {
+        await client.connect();
+        await client.createMailbox(folderName);
+        await client.logout();
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Error en /api/create-folder:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ------------------- BORRAR CARPETA -------------------
+app.post('/api/delete-folder', async (req, res) => {
+    const { email, password, host, port, secure, folderName } = req.body;
+    if (!folderName) {
+        return res.status(400).json({ success: false, error: 'Falta el nombre de la carpeta' });
+    }
+
+    const client = new ImapFlow({
+        host: host || 'imap.gmail.com',
+        port: port || 993,
+        secure: secure !== undefined ? secure : true,
+        auth: { user: email, pass: password },
+        tls: insecureTls
+    });
+
+    try {
+        await client.connect();
+        await client.deleteMailbox(folderName);
+        await client.logout();
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Error en /api/delete-folder:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});

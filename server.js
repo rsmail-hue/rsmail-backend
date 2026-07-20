@@ -57,79 +57,72 @@ app.post('/api/messages', async (req, res) => {
         await client.connect();
         await client.mailboxOpen(folder || 'INBOX');
         const messages = [];
-        for await (const msg of client.fetch('1:*', { envelope: true, bodyStructure: true })) {
+        for await (const msg of client.fetch('1:*', { envelope: true, bodyStructure: true, flags: true })) {
             let body = '';
             let htmlBody = '';
             let attachments = [];
+            let hasAttachments = false;
+            let isRead = false;
+            let isFlagged = false;
             
-            // Descargar partes del mensaje
+            // Verificar flags
+            if (msg.flags) {
+                isRead = msg.flags.has('\\Seen');
+                isFlagged = msg.flags.has('\\Flagged');
+            }
+            
             if (msg.bodyStructure) {
                 const struct = msg.bodyStructure;
                 
-                // Función recursiva para extraer texto
-                const extractText = (node) => {
+                // Función para encontrar y descargar todas las partes
+                const processPart = async (node, parentPath = '') => {
                     if (!node) return;
-                    if (node.type === 'text' && node.subtype === 'plain') {
-                        return { part: node.part, type: 'text' };
+                    
+                    const currentPath = parentPath ? parentPath + '.' + node.part : node.part;
+                    
+                    // Si es texto plano
+                    if (node.type === 'text' && node.subtype === 'plain' && !body) {
+                        try {
+                            const result = await client.download(msg.uid, currentPath, { uid: true });
+                            body = result.toString().substring(0, 100000);
+                        } catch (e) {}
                     }
+                    
+                    // Si es HTML
                     if (node.type === 'text' && node.subtype === 'html') {
-                        return { part: node.part, type: 'html' };
+                        try {
+                            const result = await client.download(msg.uid, currentPath, { uid: true });
+                            htmlBody = result.toString().substring(0, 100000);
+                        } catch (e) {}
                     }
-                    if (node.childNodes) {
-                        for (const child of node.childNodes) {
-                            const result = extractText(child);
-                            if (result) return result;
-                        }
-                    }
-                    if (node.type === 'application' || node.disposition === 'attachment') {
+                    
+                    // Si es adjunto
+                    if (node.disposition === 'attachment' || 
+                        (node.type === 'application' && node.parameters?.name) ||
+                        (node.type === 'image' && node.disposition !== 'inline')) {
+                        hasAttachments = true;
                         attachments.push({
                             filename: node.dispositionParameters?.filename || node.parameters?.name || 'adjunto',
                             contentType: node.type + '/' + (node.subtype || 'octet-stream'),
                             size: node.size || 0,
-                            partId: node.part
+                            partId: currentPath
                         });
                     }
-                    return null;
-                };
-                
-                const textPart = extractText(struct);
-                
-                if (textPart && textPart.part) {
-                    try {
-                        const result = await client.download(msg.uid, textPart.part, { uid: true });
-                        if (textPart.type === 'text') {
-                            body = result.toString().substring(0, 100000);
-                        } else {
-                            htmlBody = result.toString().substring(0, 100000);
-                        }
-                    } catch (e) {
-                        console.log('No se pudo descargar parte:', textPart.part, e.message);
-                    }
-                }
-                
-                // Buscar adjuntos en toda la estructura
-                const findAttachments = (node) => {
-                    if (!node) return;
+                    
+                    // Procesar hijos
                     if (node.childNodes) {
                         for (const child of node.childNodes) {
-                            if (child.disposition === 'attachment' || (child.type === 'application' && !child.parameters?.name?.endsWith('.html'))) {
-                                attachments.push({
-                                    filename: child.dispositionParameters?.filename || child.parameters?.name || 'adjunto',
-                                    contentType: child.type + '/' + (child.subtype || 'octet-stream'),
-                                    size: child.size || 0,
-                                    partId: child.part
-                                });
-                            }
-                            findAttachments(child);
+                            await processPart(child, currentPath);
                         }
                     }
                 };
-                findAttachments(struct);
+                
+                await processPart(struct);
             }
             
-            // Si no se pudo obtener cuerpo, usar el sobre
+            // Si no se obtuvo HTML, usar texto
             if (!body && !htmlBody) {
-                body = msg.envelope.subject || '(Sin contenido)';
+                body = '(Sin contenido)';
             }
 
             messages.push({
@@ -140,14 +133,37 @@ app.post('/api/messages', async (req, res) => {
                 date: msg.envelope.date || new Date().toISOString(),
                 body: body,
                 htmlBody: htmlBody,
-                hasAttachments: attachments.length > 0,
-                attachments: attachments
+                hasAttachments: hasAttachments,
+                attachments: attachments,
+                isRead: isRead,
+                isFlagged: isFlagged
             });
         }
         await client.logout();
         res.json({ success: true, messages });
     } catch (error) {
         console.error('Error en /api/messages:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/api/download-attachment', async (req, res) => {
+    const { email, password, host, port, secure, folder, uid, partId } = req.body;
+    const client = new ImapFlow({
+        host: host || 'imap.gmail.com',
+        port: port || 993,
+        secure: secure !== undefined ? secure : true,
+        auth: { user: email, pass: password },
+        tls: insecureTls
+    });
+    try {
+        await client.connect();
+        await client.mailboxOpen(folder || 'INBOX');
+        const result = await client.download(parseInt(uid), partId, { uid: true });
+        await client.logout();
+        res.json({ success: true, data: result.toString('base64') });
+    } catch (error) {
+        console.error('Error en /api/download-attachment:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });

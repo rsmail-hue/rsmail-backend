@@ -15,7 +15,6 @@ app.get('/ping', (req, res) => {
     res.json({ alive: true, time: new Date().toISOString() });
 });
 
-// ------------------- IMAP: CARPETAS -------------------
 app.post('/api/folders', async (req, res) => {
     const { email, password, host, port, secure } = req.body;
     console.log('Peticion recibida en /api/folders', email);
@@ -45,7 +44,6 @@ app.post('/api/folders', async (req, res) => {
     }
 });
 
-// ------------------- IMAP: MENSAJES -------------------
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, secure, folder } = req.body;
     console.log('Peticion recibida en /api/messages', email);
@@ -66,10 +64,9 @@ app.post('/api/messages', async (req, res) => {
         for await (const msg of client.fetch('1:*', { envelope: true, bodyStructure: true })) {
             messages.push({
                 uid: msg.uid,
-                subject: msg.envelope.subject || '(Sin asunto)',
-                from: (msg.envelope.from && msg.envelope.from[0]) ? msg.envelope.from[0].address : email,
-                to: (msg.envelope.to && msg.envelope.to[0]) ? msg.envelope.to[0].address : '',
-                date: msg.envelope.date || new Date().toISOString()
+                subject: msg.envelope.subject,
+                from: msg.envelope.from[0].address,
+                date: msg.envelope.date
             });
         }
         await client.logout();
@@ -80,11 +77,10 @@ app.post('/api/messages', async (req, res) => {
     }
 });
 
-// ------------------- MOVER MENSAJE -------------------
 app.post('/api/move-message', async (req, res) => {
     const { email, password, host, port, secure, uid, fromFolder, toFolder } = req.body;
     if (!uid || !fromFolder || !toFolder) {
-        return res.status(400).json({ success: false, error: 'Faltan parametros' });
+        return res.status(400).json({ success: false, error: 'Faltan parametros (uid, fromFolder, toFolder)' });
     }
 
     const client = new ImapFlow({
@@ -107,177 +103,87 @@ app.post('/api/move-message', async (req, res) => {
     }
 });
 
-// ------------------- GUARDAR EN ENVIADOS -------------------
-app.post('/api/append-sent', async (req, res) => {
-    const { email, password, host, port, secure, rawMessage, sentFolderName } = req.body;
-    if (!rawMessage) {
-        return res.status(400).json({ success: false, error: 'Falta rawMessage' });
-    }
+
+
+// ------------------- IMAP: MENSAJES -------------------
+app.post('/api/messages', async (req, res) => {
+    const { email, password, host, port, secure, folder } = req.body;
+    console.log('Peticion recibida en /api/messages', email);
 
     const client = new ImapFlow({
         host: host || 'imap.gmail.com',
         port: port || 993,
         secure: secure !== undefined ? secure : true,
         auth: { user: email, pass: password },
+        logger: false,
         tls: insecureTls
     });
 
     try {
         await client.connect();
-        const folder = sentFolderName || 'Sent';
-        await client.mailboxOpen(folder);
-        await client.append(folder, rawMessage, ['\\Seen']);
-        await client.logout();
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Error en /api/append-sent:', error.message);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
+        await client.mailboxOpen(folder || 'INBOX');
+        const messages = [];
+        for await (const msg of client.fetch('1:*', { 
+            envelope: true, 
+            bodyStructure: true,
+            bodyParts: ['HEADER', 'TEXT', '1', '1.1', '1.2', '2', '2.1', '2.2']
+        })) {
+            // Extraer cuerpo del mensaje
+            let body = '';
+            let htmlBody = '';
+            let attachments = [];
+            
+            // Intentar obtener cuerpo texto plano
+            try {
+                const textPart = await client.download(msg.uid, '1', { uid: true });
+                body = textPart.toString();
+            } catch (e) {
+                try {
+                    const textPart = await client.download(msg.uid, 'TEXT', { uid: true });
+                    body = textPart.toString();
+                } catch (e2) {
+                    body = '(No se pudo cargar el contenido)';
+                }
+            }
+            
+            // Intentar obtener cuerpo HTML
+            try {
+                const htmlPart = await client.download(msg.uid, '2', { uid: true });
+                htmlBody = htmlPart.toString();
+            } catch (e) {
+                htmlBody = '';
+            }
+            
+            // Detectar adjuntos de la estructura
+            if (msg.bodyStructure && msg.bodyStructure.childNodes) {
+                for (const node of msg.bodyStructure.childNodes) {
+                    if (node.disposition === 'attachment' || node.type === 'application') {
+                        attachments.push({
+                            filename: node.dispositionParameters?.filename || node.parameters?.name || 'adjunto',
+                            contentType: node.type + '/' + (node.subtype || 'octet-stream'),
+                            size: node.size || 0,
+                            partId: node.part
+                        });
+                    }
+                }
+            }
 
-// ------------------- ELIMINAR MENSAJE -------------------
-app.post('/api/delete-message', async (req, res) => {
-    const { email, password, host, port, secure, uid, folder } = req.body;
-    if (!uid || !folder) {
-        return res.status(400).json({ success: false, error: 'Faltan parametros' });
-    }
-
-    const client = new ImapFlow({
-        host: host || 'imap.gmail.com',
-        port: port || 993,
-        secure: secure !== undefined ? secure : true,
-        auth: { user: email, pass: password },
-        tls: insecureTls
-    });
-
-    try {
-        await client.connect();
-        await client.mailboxOpen(folder);
-        await client.messageDelete(uid, { uid: true });
-        await client.expunge();
-        await client.logout();
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Error en /api/delete-message:', error.message);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// ------------------- CREAR CARPETA -------------------
-app.post('/api/create-folder', async (req, res) => {
-    const { email, password, host, port, secure, folderName } = req.body;
-    if (!folderName) {
-        return res.status(400).json({ success: false, error: 'Falta el nombre de la carpeta' });
-    }
-
-    const client = new ImapFlow({
-        host: host || 'imap.gmail.com',
-        port: port || 993,
-        secure: secure !== undefined ? secure : true,
-        auth: { user: email, pass: password },
-        tls: insecureTls
-    });
-
-    try {
-        await client.connect();
-        await client.mailboxCreate(folderName);
-        await client.logout();
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Error en /api/create-folder:', error.message);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// ------------------- BORRAR CARPETA -------------------
-app.post('/api/delete-folder', async (req, res) => {
-    const { email, password, host, port, secure, folderName } = req.body;
-    if (!folderName) {
-        return res.status(400).json({ success: false, error: 'Falta el nombre de la carpeta' });
-    }
-
-    const client = new ImapFlow({
-        host: host || 'imap.gmail.com',
-        port: port || 993,
-        secure: secure !== undefined ? secure : true,
-        auth: { user: email, pass: password },
-        tls: insecureTls
-    });
-
-    try {
-        await client.connect();
-        await client.mailboxDelete(folderName);
-        await client.logout();
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Error en /api/delete-folder:', error.message);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log('Backend de correo corriendo en puerto ' + PORT);
-});
-
-// ------------------- MARCAR COMO LEÍDO/NO LEÍDO -------------------
-app.post('/api/toggle-read', async (req, res) => {
-    const { email, password, host, port, secure, uid, folder, read } = req.body;
-    if (uid === undefined || folder === undefined) {
-        return res.status(400).json({ success: false, error: 'Faltan parametros' });
-    }
-
-    const client = new ImapFlow({
-        host: host || 'imap.gmail.com',
-        port: port || 993,
-        secure: secure !== undefined ? secure : true,
-        auth: { user: email, pass: password },
-        tls: insecureTls
-    });
-
-    try {
-        await client.connect();
-        await client.mailboxOpen(folder);
-        if (read) {
-            await client.messageFlagsAdd(uid, ['\\\\Seen'], { uid: true });
-        } else {
-            await client.messageFlagsRemove(uid, ['\\\\Seen'], { uid: true });
+            messages.push({
+                uid: msg.uid,
+                subject: msg.envelope.subject || '(Sin asunto)',
+                from: (msg.envelope.from && msg.envelope.from[0]) ? msg.envelope.from[0].address : email,
+                to: (msg.envelope.to && msg.envelope.to[0]) ? msg.envelope.to[0].address : '',
+                date: msg.envelope.date || new Date().toISOString(),
+                body: body.substring(0, 50000), // Limitar a 50KB
+                htmlBody: htmlBody ? htmlBody.substring(0, 50000) : '',
+                hasAttachments: attachments.length > 0,
+                attachments: attachments
+            });
         }
         await client.logout();
-        res.json({ success: true });
+        res.json({ success: true, messages });
     } catch (error) {
-        console.error('Error en /api/toggle-read:', error.message);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// ------------------- MARCAR COMO IMPORTANTE -------------------
-app.post('/api/toggle-flagged', async (req, res) => {
-    const { email, password, host, port, secure, uid, folder, flagged } = req.body;
-    if (uid === undefined || folder === undefined) {
-        return res.status(400).json({ success: false, error: 'Faltan parametros' });
-    }
-
-    const client = new ImapFlow({
-        host: host || 'imap.gmail.com',
-        port: port || 993,
-        secure: secure !== undefined ? secure : true,
-        auth: { user: email, pass: password },
-        tls: insecureTls
-    });
-
-    try {
-        await client.connect();
-        await client.mailboxOpen(folder);
-        if (flagged) {
-            await client.messageFlagsAdd(uid, ['\\\\Flagged'], { uid: true });
-        } else {
-            await client.messageFlagsRemove(uid, ['\\\\Flagged'], { uid: true });
-        }
-        await client.logout();
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Error en /api/toggle-flagged:', error.message);
+        console.error('Error en /api/messages:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });

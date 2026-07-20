@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const { ImapFlow } = require('imapflow');
 const cors = require('cors');
 
@@ -65,7 +65,7 @@ app.post('/api/messages', async (req, res) => {
             messages.push({
                 uid: msg.uid,
                 subject: msg.envelope.subject,
-                from: (msg.envelope.from?.[0]?.address || email),
+                from: msg.envelope.from[0].address,
                 date: msg.envelope.date
             });
         }
@@ -105,65 +105,6 @@ app.post('/api/move-message', async (req, res) => {
 
 
 
-app.post('/api/append-sent', async (req, res) => {
-    const { email, password, host, port, secure, rawMessage, sentFolderName } = req.body;
-    if (!rawMessage) {
-        return res.status(400).json({ success: false, error: 'Falta el contenido del mensaje (rawMessage)' });
-    }
-
-    const client = new ImapFlow({
-        host: host || 'imap.gmail.com',
-        port: port || 993,
-        secure: secure !== undefined ? secure : true,
-        auth: { user: email, pass: password },
-        tls: insecureTls
-    });
-
-    try {
-        await client.connect();
-        const folder = sentFolderName || 'Sent';
-        await client.mailboxOpen(folder);
-        await client.append(folder, rawMessage, ['\\Seen']);
-        await client.logout();
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Error en /api/append-sent:', error.message);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-app.post('/api/delete-message', async (req, res) => {
-    const { email, password, host, port, secure, uid, folder } = req.body;
-    if (!uid || !folder) {
-        return res.status(400).json({ success: false, error: 'Faltan parametros (uid, folder)' });
-    }
-
-    const client = new ImapFlow({
-        host: host || 'imap.gmail.com',
-        port: port || 993,
-        secure: secure !== undefined ? secure : true,
-        auth: { user: email, pass: password },
-        tls: insecureTls
-    });
-
-    try {
-        await client.connect();
-        await client.mailboxOpen(folder);
-        await client.messageDelete(uid, { uid: true });
-        await client.expunge();
-        await client.logout();
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Error en /api/delete-message:', error.message);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log('Backend de correo corriendo en puerto ' + PORT);
-});
-
 // ------------------- CREAR CARPETA -------------------
 app.post('/api/create-folder', async (req, res) => {
     const { email, password, host, port, secure, folderName } = req.body;
@@ -181,7 +122,7 @@ app.post('/api/create-folder', async (req, res) => {
 
     try {
         await client.connect();
-        await client.createMailbox(folderName);
+        await client.mailboxCreate(folderName);
         await client.logout();
         res.json({ success: true });
     } catch (error) {
@@ -207,7 +148,7 @@ app.post('/api/delete-folder', async (req, res) => {
 
     try {
         await client.connect();
-        await client.deleteMailbox(folderName);
+        await client.mailboxDelete(folderName);
         await client.logout();
         res.json({ success: true });
     } catch (error) {

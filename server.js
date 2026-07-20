@@ -57,12 +57,7 @@ app.post('/api/messages', async (req, res) => {
         await client.connect();
         await client.mailboxOpen(folder || 'INBOX');
         const messages = [];
-        for await (const msg of client.fetch('1:*', { 
-            envelope: true, 
-            bodyStructure: true, 
-            flags: true,
-            bodyParts: ['HEADER', 'TEXT']
-        })) {
+        for await (const msg of client.fetch('1:*', { envelope: true, bodyStructure: true, flags: true })) {
             let body = '';
             let htmlBody = '';
             let attachments = [];
@@ -75,14 +70,12 @@ app.post('/api/messages', async (req, res) => {
                 isFlagged = msg.flags.has('\\Flagged');
             }
             
-            // Intentar obtener el texto del mensaje
-            if (msg.bodyParts && msg.bodyParts.get('TEXT')) {
-                body = msg.bodyParts.get('TEXT').toString().substring(0, 100000);
-            }
-            
-            // Si no hay texto, intentar obtener el header completo
-            if (!body && msg.bodyParts && msg.bodyParts.get('HEADER')) {
-                body = msg.bodyParts.get('HEADER').toString().substring(0, 100000);
+            // Intentar descargar el texto del mensaje
+            try {
+                const result = await client.download(msg.uid, 'BODY[TEXT]', { uid: true });
+                body = result.toString().substring(0, 100000);
+            } catch (e) {
+                body = msg.envelope.subject || '(Sin contenido)';
             }
             
             // Buscar adjuntos en la estructura
@@ -107,10 +100,6 @@ app.post('/api/messages', async (req, res) => {
                 };
                 findAttachments(msg.bodyStructure);
             }
-            
-            if (!body) {
-                body = msg.envelope.subject || '(Sin contenido)';
-            }
 
             messages.push({
                 uid: msg.uid,
@@ -130,27 +119,6 @@ app.post('/api/messages', async (req, res) => {
         res.json({ success: true, messages });
     } catch (error) {
         console.error('Error en /api/messages:', error.message);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-app.post('/api/download-attachment', async (req, res) => {
-    const { email, password, host, port, secure, folder, uid, partId } = req.body;
-    const client = new ImapFlow({
-        host: host || 'imap.gmail.com',
-        port: port || 993,
-        secure: secure !== undefined ? secure : true,
-        auth: { user: email, pass: password },
-        tls: insecureTls
-    });
-    try {
-        await client.connect();
-        await client.mailboxOpen(folder || 'INBOX');
-        const result = await client.download(parseInt(uid), partId, { uid: true });
-        await client.logout();
-        res.json({ success: true, data: result.toString('base64') });
-    } catch (error) {
-        console.error('Error en /api/download-attachment:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });

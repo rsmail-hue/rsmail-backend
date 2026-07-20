@@ -125,36 +125,27 @@ app.post('/api/messages', async (req, res) => {
         const messages = [];
         for await (const msg of client.fetch('1:*', { 
             envelope: true, 
-            bodyStructure: true,
-            bodyParts: ['HEADER', 'TEXT', '1', '1.1', '1.2', '2', '2.1', '2.2']
+            bodyStructure: true
         })) {
-            // Extraer cuerpo del mensaje
-            let body = '';
+            let body = '(No se pudo cargar el contenido)';
             let htmlBody = '';
             let attachments = [];
             
-            // Intentar obtener cuerpo texto plano
             try {
                 const textPart = await client.download(msg.uid, '1', { uid: true });
-                body = textPart.toString();
+                body = textPart.toString().substring(0, 50000);
             } catch (e) {
                 try {
                     const textPart = await client.download(msg.uid, 'TEXT', { uid: true });
-                    body = textPart.toString();
-                } catch (e2) {
-                    body = '(No se pudo cargar el contenido)';
-                }
+                    body = textPart.toString().substring(0, 50000);
+                } catch (e2) {}
             }
             
-            // Intentar obtener cuerpo HTML
             try {
                 const htmlPart = await client.download(msg.uid, '2', { uid: true });
-                htmlBody = htmlPart.toString();
-            } catch (e) {
-                htmlBody = '';
-            }
+                htmlBody = htmlPart.toString().substring(0, 50000);
+            } catch (e) {}
             
-            // Detectar adjuntos de la estructura
             if (msg.bodyStructure && msg.bodyStructure.childNodes) {
                 for (const node of msg.bodyStructure.childNodes) {
                     if (node.disposition === 'attachment' || node.type === 'application') {
@@ -174,8 +165,8 @@ app.post('/api/messages', async (req, res) => {
                 from: (msg.envelope.from && msg.envelope.from[0]) ? msg.envelope.from[0].address : email,
                 to: (msg.envelope.to && msg.envelope.to[0]) ? msg.envelope.to[0].address : '',
                 date: msg.envelope.date || new Date().toISOString(),
-                body: body.substring(0, 50000), // Limitar a 50KB
-                htmlBody: htmlBody ? htmlBody.substring(0, 50000) : '',
+                body: body,
+                htmlBody: htmlBody,
                 hasAttachments: attachments.length > 0,
                 attachments: attachments
             });

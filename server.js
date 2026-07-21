@@ -57,16 +57,75 @@ app.post('/api/messages', async (req, res) => {
         await client.connect();
         await client.mailboxOpen(folder || 'INBOX');
         const messages = [];
-        for await (const msg of client.fetch('1:*', { envelope: true, bodyStructure: true, flags: true })) {
+        for await (const msg of client.fetch('1:*', { 
+            envelope: true, 
+            bodyStructure: true, 
+            flags: true,
+            bodyParts: ['1']
+        })) {
+            let body = '';
+            let htmlBody = '';
+            let hasAttachments = false;
+            let attachments = [];
+            
+            // Intentar obtener el texto de la parte 1
+            if (msg.bodyParts && msg.bodyParts.get('1')) {
+                body = msg.bodyParts.get('1').toString().substring(0, 100000);
+            }
+            
+            // Si no se obtuvo, intentar descargar BODY[]
+            if (!body) {
+                try {
+                    const result = await client.download(msg.uid, 'BODY[]', { uid: true });
+                    body = result.toString().substring(0, 100000);
+                } catch (e) {
+                    body = '';
+                }
+            }
+            
+            // Si sigue vacío, intentar solo TEXT
+            if (!body) {
+                try {
+                    const result = await client.download(msg.uid, 'TEXT', { uid: true });
+                    body = result.toString().substring(0, 100000);
+                } catch (e) {
+                    body = msg.envelope.subject || '';
+                }
+            }
+            
+            // Buscar adjuntos
+            if (msg.bodyStructure) {
+                const findAttachments = (node) => {
+                    if (!node) return;
+                    if (node.childNodes) {
+                        for (const child of node.childNodes) {
+                            if (child.disposition === 'attachment' || 
+                                (child.type === 'application' && child.parameters && child.parameters.name)) {
+                                hasAttachments = true;
+                                attachments.push({
+                                    filename: child.dispositionParameters?.filename || child.parameters?.name || 'adjunto',
+                                    contentType: child.type + '/' + (child.subtype || 'octet-stream'),
+                                    size: child.size || 0,
+                                    partId: child.part
+                                });
+                            }
+                            findAttachments(child);
+                        }
+                    }
+                };
+                findAttachments(msg.bodyStructure);
+            }
+
             messages.push({
                 uid: msg.uid,
                 subject: msg.envelope.subject || '(Sin asunto)',
                 from: (msg.envelope.from && msg.envelope.from[0]) ? msg.envelope.from[0].address : email,
                 to: (msg.envelope.to && msg.envelope.to[0]) ? msg.envelope.to[0].address : '',
                 date: msg.envelope.date || new Date().toISOString(),
-                body: '',
-                hasAttachments: false,
-                attachments: []
+                body: body,
+                htmlBody: htmlBody,
+                hasAttachments: hasAttachments,
+                attachments: attachments
             });
         }
         await client.logout();

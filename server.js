@@ -61,7 +61,7 @@ app.post('/api/messages', async (req, res) => {
             envelope: true, 
             bodyStructure: true, 
             flags: true,
-            bodyParts: ['1']
+            source: true
         })) {
             let body = '';
             let htmlBody = '';
@@ -69,8 +69,8 @@ app.post('/api/messages', async (req, res) => {
             let attachments = [];
             
             // Intentar obtener el texto de la parte 1
-            if (msg.bodyParts && msg.bodyParts.get('1')) {
-                body = msg.bodyParts.get('1').toString().substring(0, 100000);
+            if (msg.source) {
+                body = msg.source.toString().substring(0, 100000);
             }
             
             // Si no se obtuvo, intentar descargar BODY[]
@@ -300,3 +300,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log('Backend de correo corriendo en puerto ' + PORT);
 });
+

@@ -1,4 +1,5 @@
 ﻿const express = require('express');
+const quotedPrintable = require('quoted-printable');
 const { ImapFlow } = require('imapflow');
 const cors = require('cors');
 
@@ -324,4 +325,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log('Backend de correo corriendo en puerto ' + PORT);
 });
+
 

@@ -24,7 +24,6 @@ app.post('/api/folders', async (req, res) => {
         secure: secure !== undefined ? secure : true,
         auth: { user: email, pass: password },
         logger: false,
-        connectionTimeout: 30000,
         tls: insecureTls
     });
     try {
@@ -43,6 +42,7 @@ app.post('/api/folders', async (req, res) => {
     }
 });
 
+// Endpoint rápido sin cuerpo (solo envelope)
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, secure, folder } = req.body;
     console.log('Peticion recibida en /api/messages', email);
@@ -52,45 +52,54 @@ app.post('/api/messages', async (req, res) => {
         secure: secure !== undefined ? secure : true,
         auth: { user: email, pass: password },
         logger: false,
-        connectionTimeout: 30000,
         tls: insecureTls
     });
     try {
         await client.connect();
         await client.mailboxOpen(folder || 'INBOX');
         const messages = [];
-        for await (const msg of client.fetch(${Math.min(50, 678)}, { 
-            envelope: true, 
-            source: true,
-            flags: true
-        })) {
-            let body = '';
-            let hasAttachments = false;
-            let attachments = [];
-            
-            // Obtener el cuerpo del mensaje desde source
-            if (msg.source) {
-                body = msg.source.toString().substring(0, 100000);
-            } else {
-                body = msg.envelope.subject || '';
-            }
-
+        for await (const msg of client.fetch('1:*', { envelope: true })) {
             messages.push({
                 uid: msg.uid,
                 subject: msg.envelope.subject || '(Sin asunto)',
                 from: (msg.envelope.from && msg.envelope.from[0]) ? msg.envelope.from[0].address : email,
                 to: (msg.envelope.to && msg.envelope.to[0]) ? msg.envelope.to[0].address : '',
                 date: msg.envelope.date || new Date().toISOString(),
-                body: body,
-                htmlBody: '',
-                hasAttachments: hasAttachments,
-                attachments: attachments
+                body: '',
+                hasAttachments: false,
+                attachments: []
             });
         }
         await client.logout();
         res.json({ success: true, messages });
     } catch (error) {
         console.error('Error en /api/messages:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Endpoint para descargar UN SOLO mensaje completo (cuando el usuario lo abre)
+app.post('/api/message-detail', async (req, res) => {
+    const { email, password, host, port, secure, folder, uid } = req.body;
+    const client = new ImapFlow({
+        host: host || 'imap.gmail.com',
+        port: port || 993,
+        secure: secure !== undefined ? secure : true,
+        auth: { user: email, pass: password },
+        tls: insecureTls
+    });
+    try {
+        await client.connect();
+        await client.mailboxOpen(folder || 'INBOX');
+        const msg = await client.fetchOne(uid.toString(), { source: true, envelope: true }, { uid: true });
+        await client.logout();
+        if (msg && msg.source) {
+            res.json({ success: true, body: msg.source.toString().substring(0, 200000) });
+        } else {
+            res.json({ success: true, body: '' });
+        }
+    } catch (error) {
+        console.error('Error en /api/message-detail:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -259,4 +268,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log('Backend de correo corriendo en puerto ' + PORT);
 });
-

@@ -46,14 +46,18 @@ app.post('/api/message-detail', async (req, res) => {
         const msg = await client.fetchOne(String(uid), { source: true }, { uid: true });
         await client.logout();
         let html = '';
+        let text = '';
         if (msg && msg.source) {
             const src = msg.source.toString();
+            
+            // Buscar boundary multipart
             const bm = src.match(/boundary="([^"]+)"/) || src.match(/boundary=([^\s;]+)/);
             if (bm) {
                 const boundary = bm[1].replace(/"/g, '');
                 const parts = src.split('--' + boundary);
                 for (const p of parts) {
-                    if (p.includes('text/html')) {
+                    // Buscar HTML
+                    if (!html && p.includes('Content-Type: text/html')) {
                         const idx = p.indexOf('\r\n\r\n');
                         if (idx > -1) {
                             html = p.substring(idx + 4).replace(/--\s*$/, '').trim();
@@ -63,9 +67,52 @@ app.post('/api/message-detail', async (req, res) => {
                             }
                         }
                     }
+                    // Buscar texto plano (si no hay HTML)
+                    if (!html && !text && p.includes('Content-Type: text/plain')) {
+                        const idx = p.indexOf('\r\n\r\n');
+                        if (idx > -1) {
+                            text = p.substring(idx + 4).replace(/--\s*$/, '').trim();
+                            if (p.includes('quoted-printable')) {
+                                try { text = quotedPrintable.decode(text); }
+                                catch(ex) { text = text.replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (m,c) => String.fromCharCode(parseInt(c,16))); }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Mensaje no multipart: ver si es HTML o texto
+                const headerEnd = src.indexOf('\r\n\r\n');
+                if (headerEnd > -1) {
+                    const bodyPart = src.substring(headerEnd + 4).trim();
+                    if (src.includes('Content-Type: text/html')) {
+                        html = bodyPart;
+                        if (src.includes('quoted-printable')) {
+                            try { html = quotedPrintable.decode(html); }
+                            catch(ex) { html = html.replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (m,c) => String.fromCharCode(parseInt(c,16))); }
+                        }
+                    } else {
+                        text = bodyPart;
+                        if (src.includes('quoted-printable')) {
+                            try { text = quotedPrintable.decode(text); }
+                            catch(ex) { text = text.replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (m,c) => String.fromCharCode(parseInt(c,16))); }
+                        }
+                    }
                 }
             }
         }
+        
+        // Si no hay HTML, convertir texto a HTML b?sico
+        if (!html && text) {
+            html = '<div style="white-space: pre-wrap; font-family: sans-serif;">' + 
+                   text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>') + 
+                   '</div>';
+        }
+        
+        // Si a?n no hay nada, devolver el mensaje completo como texto
+        if (!html && msg && msg.source) {
+            html = '<pre>' + msg.source.toString().substring(0, 5000).replace(/</g, '&lt;') + '</pre>';
+        }
+        
         res.json({ success: true, htmlBody: html });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });

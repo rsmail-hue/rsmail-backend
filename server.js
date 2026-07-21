@@ -59,61 +59,18 @@ app.post('/api/messages', async (req, res) => {
         const messages = [];
         for await (const msg of client.fetch('1:*', { 
             envelope: true, 
-            bodyStructure: true, 
-            flags: true,
-            source: true
+            source: true,
+            flags: true
         })) {
             let body = '';
-            let htmlBody = '';
             let hasAttachments = false;
             let attachments = [];
             
-            // Intentar obtener el texto de la parte 1
+            // Obtener el cuerpo del mensaje desde source
             if (msg.source) {
                 body = msg.source.toString().substring(0, 100000);
-            }
-            
-            // Si no se obtuvo, intentar descargar BODY[]
-            if (!body) {
-                try {
-                    const result = await client.download(msg.uid, 'BODY[]', { uid: true });
-                    body = result.toString().substring(0, 100000);
-                } catch (e) {
-                    body = '';
-                }
-            }
-            
-            // Si sigue vacío, intentar solo TEXT
-            if (!body) {
-                try {
-                    const result = await client.download(msg.uid, 'TEXT', { uid: true });
-                    body = result.toString().substring(0, 100000);
-                } catch (e) {
-                    body = msg.envelope.subject || '';
-                }
-            }
-            
-            // Buscar adjuntos
-            if (msg.bodyStructure) {
-                const findAttachments = (node) => {
-                    if (!node) return;
-                    if (node.childNodes) {
-                        for (const child of node.childNodes) {
-                            if (child.disposition === 'attachment' || 
-                                (child.type === 'application' && child.parameters && child.parameters.name)) {
-                                hasAttachments = true;
-                                attachments.push({
-                                    filename: child.dispositionParameters?.filename || child.parameters?.name || 'adjunto',
-                                    contentType: child.type + '/' + (child.subtype || 'octet-stream'),
-                                    size: child.size || 0,
-                                    partId: child.part
-                                });
-                            }
-                            findAttachments(child);
-                        }
-                    }
-                };
-                findAttachments(msg.bodyStructure);
+            } else {
+                body = msg.envelope.subject || '';
             }
 
             messages.push({
@@ -123,7 +80,7 @@ app.post('/api/messages', async (req, res) => {
                 to: (msg.envelope.to && msg.envelope.to[0]) ? msg.envelope.to[0].address : '',
                 date: msg.envelope.date || new Date().toISOString(),
                 body: body,
-                htmlBody: htmlBody,
+                htmlBody: '',
                 hasAttachments: hasAttachments,
                 attachments: attachments
             });
@@ -300,4 +257,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log('Backend de correo corriendo en puerto ' + PORT);
 });
-

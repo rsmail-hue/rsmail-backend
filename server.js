@@ -24,6 +24,7 @@ app.post('/api/folders', async (req, res) => {
         secure: secure !== undefined ? secure : true,
         auth: { user: email, pass: password },
         logger: false,
+        connectionTimeout: 30000,
         tls: insecureTls
     });
     try {
@@ -51,13 +52,14 @@ app.post('/api/messages', async (req, res) => {
         secure: secure !== undefined ? secure : true,
         auth: { user: email, pass: password },
         logger: false,
+        connectionTimeout: 30000,
         tls: insecureTls
     });
     try {
         await client.connect();
         await client.mailboxOpen(folder || 'INBOX');
         const messages = [];
-        for await (const msg of client.fetch('1:*', { 
+        for await (const msg of client.fetch(${Math.min(50, 678)}, { 
             envelope: true, 
             source: true,
             flags: true
@@ -257,3 +259,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log('Backend de correo corriendo en puerto ' + PORT);
 });
+

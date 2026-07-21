@@ -10,7 +10,6 @@
     "cors": "^2.8.5",
     "express": "^4.18.2",
     "imapflow": "^1.4.7",
-    "quoted-printable": "^1.0.1",
-    "utf8": "^3.0.0"
+    "quoted-printable": "^1.0.1"
   }
 }

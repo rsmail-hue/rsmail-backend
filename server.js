@@ -42,7 +42,6 @@ app.post('/api/folders', async (req, res) => {
     }
 });
 
-// Endpoint rápido sin cuerpo (solo envelope)
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, secure, folder } = req.body;
     console.log('Peticion recibida en /api/messages', email);
@@ -58,7 +57,7 @@ app.post('/api/messages', async (req, res) => {
         await client.connect();
         await client.mailboxOpen(folder || 'INBOX');
         const messages = [];
-        for await (const msg of client.fetch('1:*', { envelope: true })) {
+        for await (const msg of client.fetch('1:*', { envelope: true, flags: true })) {
             messages.push({
                 uid: msg.uid,
                 subject: msg.envelope.subject || '(Sin asunto)',
@@ -78,7 +77,6 @@ app.post('/api/messages', async (req, res) => {
     }
 });
 
-// Endpoint para descargar UN SOLO mensaje completo (cuando el usuario lo abre)
 app.post('/api/message-detail', async (req, res) => {
     const { email, password, host, port, secure, folder, uid } = req.body;
     const client = new ImapFlow({
@@ -91,13 +89,71 @@ app.post('/api/message-detail', async (req, res) => {
     try {
         await client.connect();
         await client.mailboxOpen(folder || 'INBOX');
-        const msg = await client.fetchOne(uid.toString(), { source: true, envelope: true }, { uid: true });
+        const msg = await client.fetchOne(uid.toString(), { 
+            source: true, 
+            envelope: true,
+            bodyStructure: true 
+        }, { uid: true });
         await client.logout();
+        
+        let body = '';
+        let htmlBody = '';
+        let hasAttachments = false;
+        let attachments = [];
+        
         if (msg && msg.source) {
-            res.json({ success: true, body: msg.source.toString().substring(0, 200000) });
-        } else {
-            res.json({ success: true, body: '' });
+            const fullSource = msg.source.toString();
+            
+            // Detectar si es multipart
+            if (fullSource.includes('Content-Type: multipart/')) {
+                // Extraer partes
+                const boundaryMatch = fullSource.match(/boundary="([^"]+)"/);
+                if (boundaryMatch) {
+                    const boundary = boundaryMatch[1];
+                    const parts = fullSource.split('--' + boundary);
+                    
+                    for (const part of parts) {
+                        if (part.includes('Content-Type: text/html')) {
+                            const htmlStart = part.indexOf('\r\n\r\n');
+                            if (htmlStart !== -1) {
+                                htmlBody = part.substring(htmlStart + 4).trim();
+                            }
+                        } else if (part.includes('Content-Type: text/plain') && !htmlBody) {
+                            const textStart = part.indexOf('\r\n\r\n');
+                            if (textStart !== -1) {
+                                body = part.substring(textStart + 4).trim();
+                            }
+                        } else if (part.includes('Content-Disposition: attachment')) {
+                            hasAttachments = true;
+                            const nameMatch = part.match(/filename="([^"]+)"/);
+                            attachments.push({
+                                filename: nameMatch ? nameMatch[1] : 'adjunto',
+                                size: 0
+                            });
+                        }
+                    }
+                }
+            } else {
+                // Mensaje simple (no multipart)
+                const parts = fullSource.split('\r\n\r\n');
+                if (parts.length > 1) {
+                    body = parts.slice(1).join('\r\n\r\n').substring(0, 200000);
+                }
+            }
         }
+        
+        // Si no hay HTML, usar texto plano
+        if (!htmlBody && body) {
+            htmlBody = body.replace(/\n/g, '<br>');
+        }
+        
+        res.json({ 
+            success: true, 
+            body: body,
+            htmlBody: htmlBody,
+            hasAttachments: hasAttachments,
+            attachments: attachments
+        });
     } catch (error) {
         console.error('Error en /api/message-detail:', error.message);
         res.status(500).json({ success: false, error: error.message });
@@ -268,4 +324,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log('Backend de correo corriendo en puerto ' + PORT);
 });
-

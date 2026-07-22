@@ -37,7 +37,7 @@ app.post('/api/messages', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ------------------- MESSAGE-DETAIL (obtenci?n robusta + conversi?n a HTML) -------------------
+// ------------------- MESSAGE-DETAIL (HTML limpio, sin doble-escape) -------------------
 app.post('/api/message-detail', async (req, res) => {
     try {
         const { email, password, host, port, secure, folder, uid } = req.body;
@@ -59,7 +59,7 @@ app.post('/api/message-detail', async (req, res) => {
 
         const src = msg?.source?.toString() || '';
 
-        // 1. Intentar extraer HTML real desde la estructura (si existe)
+        // 1. Extraer HTML real desde la estructura (si existe) ? SIN ESCAPAR
         if (msg && msg.bodyStructure) {
             const findHtmlPart = (node) => {
                 if (!node) return null;
@@ -82,7 +82,7 @@ app.post('/api/message-detail', async (req, res) => {
                     } else if (htmlPart.encoding === 'base64') {
                         raw = Buffer.from(raw, 'base64').toString('utf-8');
                     }
-                    html = raw.substring(0, 200000);
+                    html = raw.substring(0, 200000);  // ? HTML limpio, sin escapes
                 } catch (e) {}
             }
         }
@@ -112,7 +112,6 @@ app.post('/api/message-detail', async (req, res) => {
                     }
                 }
             } else {
-                // Mensaje no multipart
                 const headerEnd = src.indexOf('\r\n\r\n');
                 if (headerEnd > -1) {
                     plainText = src.substring(headerEnd + 4).trim();
@@ -120,12 +119,7 @@ app.post('/api/message-detail', async (req, res) => {
             }
         }
 
-        // 3. Fallback final: usar source completo si no hay nada
-        if (!html && !plainText && src) {
-            plainText = src.substring(0, 100000);
-        }
-
-        // 4. Si no hay HTML, convertir texto plano en HTML enriquecido
+        // 3. Si no hay HTML, convertir texto plano en HTML enriquecido (sin doble-escape)
         if (!html && plainText) {
             let escaped = plainText
                 .replace(/&/g, '&amp;')
@@ -144,7 +138,7 @@ app.post('/api/message-detail', async (req, res) => {
                    '</div>';
         }
 
-        // 5. Si todo fall?, mostrar un mensaje gen?rico
+        // 4. Fallback gen?rico
         if (!html) {
             html = '<p>No se pudo extraer contenido del mensaje.</p>';
         }

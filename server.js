@@ -37,7 +37,7 @@ app.post('/api/messages', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ------------------- MESSAGE-DETAIL (HTML como prioridad, luego texto enriquecido) -------------------
+// ------------------- MESSAGE-DETAIL (b?squeda recursiva profunda) -------------------
 app.post('/api/message-detail', async (req, res) => {
     try {
         const { email, password, host, port, secure, folder, uid } = req.body;
@@ -57,14 +57,21 @@ app.post('/api/message-detail', async (req, res) => {
             if (msg.envelope.cc) cc = msg.envelope.cc.map(a => a.address).join(', ');
         }
 
-        const src = msg?.source?.toString() || '';
-
-        // 1. Intentar obtener HTML de la estructura (si existe)
+        // 1. Buscar HTML recursivamente en toda la estructura (incluyendo sub?sub?partes)
         if (msg && msg.bodyStructure) {
             const findHtmlPart = (node) => {
                 if (!node) return null;
+                // Si esta parte es HTML (sin importar el nivel)
                 if (node.type === 'text' && node.subtype === 'html') return node;
+                // Buscar en hijos (multipart/alternative, multipart/related, etc.)
                 if (node.childNodes) {
+                    for (const child of node.childNodes) {
+                        const found = findHtmlPart(child);
+                        if (found) return found;
+                    }
+                }
+                // Tambi?n buscar en sub?partes de un attachment (por ejemplo, multipart/alternative dentro de inline)
+                if (node.type === 'message' && node.childNodes) {
                     for (const child of node.childNodes) {
                         const found = findHtmlPart(child);
                         if (found) return found;
@@ -88,13 +95,13 @@ app.post('/api/message-detail', async (req, res) => {
         }
 
         // 2. Si no hay HTML, extraer del source manualmente (prioridad HTML, luego texto)
+        const src = msg?.source?.toString() || '';
         if (!html && src) {
             const bm = src.match(/boundary="([^"]+)"/) || src.match(/boundary=([^\s;]+)/);
             if (bm) {
                 const boundary = bm[1].replace(/"/g, '');
                 const parts = src.split('--' + boundary);
                 for (const part of parts) {
-                    // Buscar HTML
                     if (!html && part.includes('Content-Type: text/html')) {
                         const idx = part.indexOf('\r\n\r\n');
                         if (idx > -1) {
@@ -105,7 +112,6 @@ app.post('/api/message-detail', async (req, res) => {
                             html = raw.substring(0, 200000);
                         }
                     }
-                    // Texto plano (solo si no hay HTML)
                     if (!html && !plainText && part.includes('Content-Type: text/plain')) {
                         const idx = part.indexOf('\r\n\r\n');
                         if (idx > -1) {
@@ -114,7 +120,6 @@ app.post('/api/message-detail', async (req, res) => {
                     }
                 }
             } else {
-                // Mensaje no multipart: extraer cuerpo despu?s de headers
                 const headerEnd = src.indexOf('\r\n\r\n');
                 if (headerEnd > -1) {
                     plainText = src.substring(headerEnd + 4).trim();
@@ -122,24 +127,22 @@ app.post('/api/message-detail', async (req, res) => {
             }
         }
 
-        // 3. Si no se obtuvo texto plano, usar el source completo limpiando headers
-        if (!plainText && !html && src) {
+        // 3. Si a?n no hay texto plano, usar el source completo limpiando headers
+        if (!html && !plainText && src) {
             const headerEnd = src.indexOf('\r\n\r\n');
-            plainText = headerEnd > -1 ? src.substring(headerEnd + 4).trim() : src;
+            plainText = headerEnd > -1 ? src.substring(headerEnd + 4).trim() : src.substring(0, 50000);
         }
 
-        // 4. Si no hay HTML, convertir texto plano en HTML enriquecido
+        // 4. Convertir texto plano en HTML enriquecido (con p?rrafos y enlaces)
         if (!html && plainText) {
             let escaped = plainText
                 .replace(/&/g, '&amp;')
                 .replace(/</g, '&lt;')
                 .replace(/>/g, '&gt;');
-            // Convertir URLs en enlaces
             escaped = escaped.replace(
                 /(https?:\/\/[^\s<>"]+)/gi,
                 '<a href="" style="color: #0066cc; word-break: break-all;"></a>'
             );
-            // Convertir saltos de l?nea dobles en p?rrafos
             escaped = escaped
                 .split(/\r?\n\r?\n/)
                 .map(para => '<p style="margin: 0 0 1em; line-height: 1.5;">' + para.replace(/\n/g, '<br>') + '</p>')

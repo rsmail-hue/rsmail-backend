@@ -37,7 +37,7 @@ app.post('/api/messages', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ------------------- MESSAGE-DETAIL (b?squeda recursiva profunda) -------------------
+// ------------------- MESSAGE-DETAIL (obtenci?n robusta + conversi?n a HTML) -------------------
 app.post('/api/message-detail', async (req, res) => {
     try {
         const { email, password, host, port, secure, folder, uid } = req.body;
@@ -57,21 +57,14 @@ app.post('/api/message-detail', async (req, res) => {
             if (msg.envelope.cc) cc = msg.envelope.cc.map(a => a.address).join(', ');
         }
 
-        // 1. Buscar HTML recursivamente en toda la estructura (incluyendo sub?sub?partes)
+        const src = msg?.source?.toString() || '';
+
+        // 1. Intentar extraer HTML real desde la estructura (si existe)
         if (msg && msg.bodyStructure) {
             const findHtmlPart = (node) => {
                 if (!node) return null;
-                // Si esta parte es HTML (sin importar el nivel)
                 if (node.type === 'text' && node.subtype === 'html') return node;
-                // Buscar en hijos (multipart/alternative, multipart/related, etc.)
                 if (node.childNodes) {
-                    for (const child of node.childNodes) {
-                        const found = findHtmlPart(child);
-                        if (found) return found;
-                    }
-                }
-                // Tambi?n buscar en sub?partes de un attachment (por ejemplo, multipart/alternative dentro de inline)
-                if (node.type === 'message' && node.childNodes) {
                     for (const child of node.childNodes) {
                         const found = findHtmlPart(child);
                         if (found) return found;
@@ -94,8 +87,7 @@ app.post('/api/message-detail', async (req, res) => {
             }
         }
 
-        // 2. Si no hay HTML, extraer del source manualmente (prioridad HTML, luego texto)
-        const src = msg?.source?.toString() || '';
+        // 2. Si no hay HTML, extraer del source (prioridad HTML, luego texto)
         if (!html && src) {
             const bm = src.match(/boundary="([^"]+)"/) || src.match(/boundary=([^\s;]+)/);
             if (bm) {
@@ -120,6 +112,7 @@ app.post('/api/message-detail', async (req, res) => {
                     }
                 }
             } else {
+                // Mensaje no multipart
                 const headerEnd = src.indexOf('\r\n\r\n');
                 if (headerEnd > -1) {
                     plainText = src.substring(headerEnd + 4).trim();
@@ -127,13 +120,12 @@ app.post('/api/message-detail', async (req, res) => {
             }
         }
 
-        // 3. Si a?n no hay texto plano, usar el source completo limpiando headers
+        // 3. Fallback final: usar source completo si no hay nada
         if (!html && !plainText && src) {
-            const headerEnd = src.indexOf('\r\n\r\n');
-            plainText = headerEnd > -1 ? src.substring(headerEnd + 4).trim() : src.substring(0, 50000);
+            plainText = src.substring(0, 100000);
         }
 
-        // 4. Convertir texto plano en HTML enriquecido (con p?rrafos y enlaces)
+        // 4. Si no hay HTML, convertir texto plano en HTML enriquecido
         if (!html && plainText) {
             let escaped = plainText
                 .replace(/&/g, '&amp;')
@@ -150,6 +142,11 @@ app.post('/api/message-detail', async (req, res) => {
             html = '<div style="font-family: -apple-system, Roboto, sans-serif; font-size: 16px; max-width: 100%; word-wrap: break-word;">' +
                    escaped +
                    '</div>';
+        }
+
+        // 5. Si todo fall?, mostrar un mensaje gen?rico
+        if (!html) {
+            html = '<p>No se pudo extraer contenido del mensaje.</p>';
         }
 
         res.json({ success: true, htmlBody: html, body: plainText, to: to, cc: cc });

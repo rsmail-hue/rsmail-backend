@@ -37,7 +37,7 @@ app.post('/api/messages', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ------------------- MESSAGE-DETAIL MEJORADO (con fallback a texto plano) -------------------
+// ------------------- MESSAGE-DETAIL MEJORADO (con enlaces y p?rrafos) -------------------
 app.post('/api/message-detail', async (req, res) => {
     try {
         const { email, password, host, port, secure, folder, uid } = req.body;
@@ -57,7 +57,7 @@ app.post('/api/message-detail', async (req, res) => {
             if (msg.envelope.cc) cc = msg.envelope.cc.map(a => a.address).join(', ');
         }
 
-        // Intento 1: buscar parte text/html en la estructura
+        // 1. Buscar HTML en la estructura
         if (msg && msg.bodyStructure) {
             const findHtmlPart = (node) => {
                 if (!node) return null;
@@ -85,7 +85,7 @@ app.post('/api/message-detail', async (req, res) => {
             }
         }
 
-        // Intento 2: parsear manualmente el source si no hay HTML
+        // 2. Si no hay HTML, buscar en el source manualmente
         if (!html && msg && msg.source) {
             const src = msg.source.toString();
             const bm = src.match(/boundary="([^"]+)"/) || src.match(/boundary=([^\s;]+)/);
@@ -113,15 +113,30 @@ app.post('/api/message-detail', async (req, res) => {
             }
         }
 
-        // Intento 3: si no hay HTML ni texto plano, usar el source completo como texto
+        // 3. Si a?n no hay HTML ni texto plano, usar el source completo
         if (!html && !plainText && msg && msg.source) {
             plainText = msg.source.toString().substring(0, 100000);
         }
 
-        // Si no hay HTML, convertir texto plano en HTML b?sico
+        // 4. Si no hay HTML, convertir texto plano en HTML enriquecido
         if (!html && plainText) {
-            html = '<div style="white-space: pre-wrap; font-family: sans-serif;">' +
-                   plainText.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>') +
+            // Escapar entidades HTML
+            let escaped = plainText
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+            // Convertir URLs en enlaces
+            escaped = escaped.replace(
+                /(https?:\/\/[^\s<>"]+)/gi,
+                '<a href="" style="color: #0066cc;"></a>'
+            );
+            // Convertir saltos de l?nea en p?rrafos
+            escaped = escaped
+                .split(/\r?\n\r?\n/)
+                .map(para => '<p style="margin: 0 0 1em; line-height: 1.5;">' + para.replace(/\n/g, '<br>') + '</p>')
+                .join('');
+            html = '<div style="font-family: -apple-system, Roboto, sans-serif; font-size: 16px; max-width: 100%; word-wrap: break-word;">' +
+                   escaped +
                    '</div>';
         }
 
@@ -129,7 +144,7 @@ app.post('/api/message-detail', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ------------------- RESTO DE ENDPOINTS (sin cambios) -------------------
+// ------------------- RESTO DE ENDPOINTS -------------------
 app.post('/api/move-message', async (req, res) => {
     try {
         const { email, password, host, port, secure, uid, fromFolder, toFolder } = req.body;

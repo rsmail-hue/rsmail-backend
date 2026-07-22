@@ -37,7 +37,7 @@ app.post('/api/messages', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ------------------- MESSAGE-DETAIL MEJORADO (con enlaces y p?rrafos) -------------------
+// ------------------- MESSAGE-DETAIL (OBTENCI?N ROBUSTA + CONVERSI?N A HTML ENRIQUECIDO) -------------------
 app.post('/api/message-detail', async (req, res) => {
     try {
         const { email, password, host, port, secure, folder, uid } = req.body;
@@ -57,7 +57,23 @@ app.post('/api/message-detail', async (req, res) => {
             if (msg.envelope.cc) cc = msg.envelope.cc.map(a => a.address).join(', ');
         }
 
-        // 1. Buscar HTML en la estructura
+        // 1. Obtener el texto plano del mensaje (siempre como fallback)
+        if (msg && msg.source) {
+            const src = msg.source.toString();
+            const plainMatch = src.match(/Content-Type: text\/plain.*?\r\n\r\n([\s\S]*?)(?:\r\n--|$)/i);
+            if (plainMatch) {
+                plainText = plainMatch[1].trim();
+                if (src.includes('quoted-printable')) {
+                    try { plainText = quotedPrintable.decode(plainText); }
+                    catch(ex) { plainText = plainText.replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (m,c) => String.fromCharCode(parseInt(c,16))); }
+                }
+            }
+            if (!plainText) {
+                plainText = src.substring(0, 100000);
+            }
+        }
+
+        // 2. Intentar extraer HTML real (si existe)
         if (msg && msg.bodyStructure) {
             const findHtmlPart = (node) => {
                 if (!node) return null;
@@ -85,52 +101,16 @@ app.post('/api/message-detail', async (req, res) => {
             }
         }
 
-        // 2. Si no hay HTML, buscar en el source manualmente
-        if (!html && msg && msg.source) {
-            const src = msg.source.toString();
-            const bm = src.match(/boundary="([^"]+)"/) || src.match(/boundary=([^\s;]+)/);
-            if (bm) {
-                const boundary = bm[1].replace(/"/g, '');
-                const parts = src.split('--' + boundary);
-                for (const part of parts) {
-                    if (part.includes('Content-Type: text/html')) {
-                        const idx = part.indexOf('\r\n\r\n');
-                        if (idx > -1) {
-                            let raw = part.substring(idx + 4).replace(/--\s*$/, '').trim();
-                            if (part.includes('quoted-printable')) {
-                                try { raw = quotedPrintable.decode(raw); } catch(ex) { raw = raw.replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (m,c) => String.fromCharCode(parseInt(c,16))); }
-                            }
-                            html = raw.substring(0, 200000);
-                        }
-                    }
-                    if (!plainText && part.includes('Content-Type: text/plain')) {
-                        const idx = part.indexOf('\r\n\r\n');
-                        if (idx > -1) {
-                            plainText = part.substring(idx + 4).replace(/--\s*$/, '').trim();
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Si a?n no hay HTML ni texto plano, usar el source completo
-        if (!html && !plainText && msg && msg.source) {
-            plainText = msg.source.toString().substring(0, 100000);
-        }
-
-        // 4. Si no hay HTML, convertir texto plano en HTML enriquecido
+        // 3. Si no hay HTML, convertir el texto plano en HTML enriquecido
         if (!html && plainText) {
-            // Escapar entidades HTML
             let escaped = plainText
                 .replace(/&/g, '&amp;')
                 .replace(/</g, '&lt;')
                 .replace(/>/g, '&gt;');
-            // Convertir URLs en enlaces
             escaped = escaped.replace(
                 /(https?:\/\/[^\s<>"]+)/gi,
-                '<a href="" style="color: #0066cc;"></a>'
+                '<a href="" style="color: #0066cc; word-break: break-all;"></a>'
             );
-            // Convertir saltos de l?nea en p?rrafos
             escaped = escaped
                 .split(/\r?\n\r?\n/)
                 .map(para => '<p style="margin: 0 0 1em; line-height: 1.5;">' + para.replace(/\n/g, '<br>') + '</p>')
@@ -144,7 +124,7 @@ app.post('/api/message-detail', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ------------------- RESTO DE ENDPOINTS -------------------
+// ------------------- RESTO DE ENDPOINTS (sin cambios) -------------------
 app.post('/api/move-message', async (req, res) => {
     try {
         const { email, password, host, port, secure, uid, fromFolder, toFolder } = req.body;

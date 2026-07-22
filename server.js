@@ -37,7 +37,7 @@ app.post('/api/messages', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ------------------- MESSAGE-DETAIL MEJORADO -------------------
+// ------------------- MESSAGE-DETAIL MEJORADO (con fallback a texto plano) -------------------
 app.post('/api/message-detail', async (req, res) => {
     try {
         const { email, password, host, port, secure, folder, uid } = req.body;
@@ -57,8 +57,8 @@ app.post('/api/message-detail', async (req, res) => {
             if (msg.envelope.cc) cc = msg.envelope.cc.map(a => a.address).join(', ');
         }
 
+        // Intento 1: buscar parte text/html en la estructura
         if (msg && msg.bodyStructure) {
-            // Funci?n recursiva para encontrar la parte text/html
             const findHtmlPart = (node) => {
                 if (!node) return null;
                 if (node.type === 'text' && node.subtype === 'html') return node;
@@ -80,12 +80,12 @@ app.post('/api/message-detail', async (req, res) => {
                     } else if (htmlPart.encoding === 'base64') {
                         raw = Buffer.from(raw, 'base64').toString('utf-8');
                     }
-                    html = raw.substring(0, 200000); // l?mite 200KB
-                } catch (e) { /* no se pudo descargar */ }
+                    html = raw.substring(0, 200000);
+                } catch (e) {}
             }
         }
 
-        // Si no se encontr? HTML con la estructura, intentar con el source
+        // Intento 2: parsear manualmente el source si no hay HTML
         if (!html && msg && msg.source) {
             const src = msg.source.toString();
             const bm = src.match(/boundary="([^"]+)"/) || src.match(/boundary=([^\s;]+)/);
@@ -103,7 +103,6 @@ app.post('/api/message-detail', async (req, res) => {
                             html = raw.substring(0, 200000);
                         }
                     }
-                    // Extraer texto plano como fallback
                     if (!plainText && part.includes('Content-Type: text/plain')) {
                         const idx = part.indexOf('\r\n\r\n');
                         if (idx > -1) {
@@ -114,7 +113,12 @@ app.post('/api/message-detail', async (req, res) => {
             }
         }
 
-        // Si a?n no hay HTML, convertir texto plano en HTML b?sico
+        // Intento 3: si no hay HTML ni texto plano, usar el source completo como texto
+        if (!html && !plainText && msg && msg.source) {
+            plainText = msg.source.toString().substring(0, 100000);
+        }
+
+        // Si no hay HTML, convertir texto plano en HTML b?sico
         if (!html && plainText) {
             html = '<div style="white-space: pre-wrap; font-family: sans-serif;">' +
                    plainText.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>') +
@@ -125,7 +129,7 @@ app.post('/api/message-detail', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ------------------- RESTO DE ENDPOINTS -------------------
+// ------------------- RESTO DE ENDPOINTS (sin cambios) -------------------
 app.post('/api/move-message', async (req, res) => {
     try {
         const { email, password, host, port, secure, uid, fromFolder, toFolder } = req.body;

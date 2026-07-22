@@ -37,14 +37,14 @@ app.post('/api/messages', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ---------- NUEVO message-detail mejorado ----------
+// ------------------- MESSAGE-DETAIL MEJORADO -------------------
 app.post('/api/message-detail', async (req, res) => {
     try {
         const { email, password, host, port, secure, folder, uid } = req.body;
         const client = new ImapFlow({ host: host || 'imap.gmail.com', port: port || 993, secure: secure !== undefined ? secure : true, auth: { user: email, pass: password }, tls: insecureTls });
         await client.connect();
         await client.mailboxOpen(folder || 'INBOX');
-        const msg = await client.fetchOne(String(uid), { source: true, envelope: true }, { uid: true });
+        const msg = await client.fetchOne(String(uid), { source: true, envelope: true, bodyStructure: true }, { uid: true });
         await client.logout();
 
         let html = '';
@@ -57,70 +57,64 @@ app.post('/api/message-detail', async (req, res) => {
             if (msg.envelope.cc) cc = msg.envelope.cc.map(a => a.address).join(', ');
         }
 
-        if (msg && msg.source) {
-            const full = msg.source.toString();
-            // Funci?n recursiva para extraer la parte text/html
-            const extractHtml = (part) => {
-                if (!part) return null;
-                // Si esta parte es text/html
-                if (part.type === 'text' && part.subtype === 'html') {
-                    return part;
-                }
-                // Si es multipart, buscar en sus hijos
-                if (part.childNodes) {
-                    for (const child of part.childNodes) {
-                        const found = extractHtml(child);
+        if (msg && msg.bodyStructure) {
+            // Funci?n recursiva para encontrar la parte text/html
+            const findHtmlPart = (node) => {
+                if (!node) return null;
+                if (node.type === 'text' && node.subtype === 'html') return node;
+                if (node.childNodes) {
+                    for (const child of node.childNodes) {
+                        const found = findHtmlPart(child);
                         if (found) return found;
                     }
                 }
-                // Tambi?n buscar en partes con disposition inline
                 return null;
             };
-            if (msg.bodyStructure) {
-                const htmlPart = extractHtml(msg.bodyStructure);
-                if (htmlPart && htmlPart.part) {
-                    try {
-                        const { data } = await client.download(msg.uid, htmlPart.part, { uid: true });
-                        let raw = data.toString();
-                        // Decodificar si es necesario
-                        if (htmlPart.encoding === 'quoted-printable') {
-                            raw = quotedPrintable.decode(raw);
-                        } else if (htmlPart.encoding === 'base64') {
-                            raw = Buffer.from(raw, 'base64').toString('utf-8');
-                        }
-                        html = raw;
-                    } catch (e) { /* no se pudo descargar esa parte */ }
-                }
+            const htmlPart = findHtmlPart(msg.bodyStructure);
+            if (htmlPart && htmlPart.part) {
+                try {
+                    const { data } = await client.download(msg.uid, htmlPart.part, { uid: true });
+                    let raw = data.toString();
+                    if (htmlPart.encoding === 'quoted-printable') {
+                        raw = quotedPrintable.decode(raw);
+                    } else if (htmlPart.encoding === 'base64') {
+                        raw = Buffer.from(raw, 'base64').toString('utf-8');
+                    }
+                    html = raw.substring(0, 200000); // l?mite 200KB
+                } catch (e) { /* no se pudo descargar */ }
             }
-            // Si no se encontr? HTML con la estructura, intentar parseando manualmente el source
-            if (!html) {
-                const bm = full.match(/boundary="([^"]+)"/) || full.match(/boundary=([^\s;]+)/);
-                if (bm) {
-                    const boundary = bm[1].replace(/"/g, '');
-                    const parts = full.split('--' + boundary);
-                    for (const part of parts) {
-                        if (part.includes('Content-Type: text/html')) {
-                            const idx = part.indexOf('\r\n\r\n');
-                            if (idx > -1) {
-                                let raw = part.substring(idx + 4).replace(/--\s*$/, '').trim();
-                                if (part.includes('quoted-printable')) {
-                                    try { raw = quotedPrintable.decode(raw); }
-                                    catch(ex) { raw = raw.replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (m,c) => String.fromCharCode(parseInt(c,16))); }
-                                }
-                                html = raw;
+        }
+
+        // Si no se encontr? HTML con la estructura, intentar con el source
+        if (!html && msg && msg.source) {
+            const src = msg.source.toString();
+            const bm = src.match(/boundary="([^"]+)"/) || src.match(/boundary=([^\s;]+)/);
+            if (bm) {
+                const boundary = bm[1].replace(/"/g, '');
+                const parts = src.split('--' + boundary);
+                for (const part of parts) {
+                    if (part.includes('Content-Type: text/html')) {
+                        const idx = part.indexOf('\r\n\r\n');
+                        if (idx > -1) {
+                            let raw = part.substring(idx + 4).replace(/--\s*$/, '').trim();
+                            if (part.includes('quoted-printable')) {
+                                try { raw = quotedPrintable.decode(raw); } catch(ex) { raw = raw.replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (m,c) => String.fromCharCode(parseInt(c,16))); }
                             }
+                            html = raw.substring(0, 200000);
+                        }
+                    }
+                    // Extraer texto plano como fallback
+                    if (!plainText && part.includes('Content-Type: text/plain')) {
+                        const idx = part.indexOf('\r\n\r\n');
+                        if (idx > -1) {
+                            plainText = part.substring(idx + 4).replace(/--\s*$/, '').trim();
                         }
                     }
                 }
             }
-            // Extraer texto plano como fallback
-            const plainPart = full.match(/Content-Type: text\/plain.*?\r\n\r\n([\s\S]*?)(?:\r\n--|$)/i);
-            if (plainPart) {
-                plainText = plainPart[1].trim();
-            }
         }
 
-        // Si no hay HTML, convertir texto plano en HTML b?sico
+        // Si a?n no hay HTML, convertir texto plano en HTML b?sico
         if (!html && plainText) {
             html = '<div style="white-space: pre-wrap; font-family: sans-serif;">' +
                    plainText.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>') +
@@ -131,7 +125,90 @@ app.post('/api/message-detail', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ... (el resto de endpoints se mantienen igual, no los modifiques)
+// ------------------- RESTO DE ENDPOINTS -------------------
+app.post('/api/move-message', async (req, res) => {
+    try {
+        const { email, password, host, port, secure, uid, fromFolder, toFolder } = req.body;
+        const client = new ImapFlow({ host: host || 'imap.gmail.com', port: port || 993, secure: secure !== undefined ? secure : true, auth: { user: email, pass: password }, tls: insecureTls });
+        await client.connect();
+        await client.mailboxOpen(fromFolder);
+        await client.messageMove(uid, toFolder, { uid: true });
+        await client.logout();
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Backend OK'));
+app.post('/api/append-sent', async (req, res) => {
+    try {
+        const { email, password, host, port, secure, rawMessage, sentFolderName } = req.body;
+        const client = new ImapFlow({ host: host || 'imap.gmail.com', port: port || 993, secure: secure !== undefined ? secure : true, auth: { user: email, pass: password }, tls: insecureTls });
+        await client.connect();
+        const folder = sentFolderName || 'Sent';
+        await client.mailboxOpen(folder);
+        await client.append(folder, rawMessage, ['\\Seen']);
+        await client.logout();
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/delete-message', async (req, res) => {
+    try {
+        const { email, password, host, port, secure, uid, folder } = req.body;
+        const client = new ImapFlow({ host: host || 'imap.gmail.com', port: port || 993, secure: secure !== undefined ? secure : true, auth: { user: email, pass: password }, tls: insecureTls });
+        await client.connect();
+        await client.mailboxOpen(folder);
+        await client.messageDelete(uid, { uid: true });
+        await client.logout();
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/toggle-read', async (req, res) => {
+    try {
+        const { email, password, host, port, secure, uid, folder, read } = req.body;
+        const client = new ImapFlow({ host: host || 'imap.gmail.com', port: port || 993, secure: secure !== undefined ? secure : true, auth: { user: email, pass: password }, tls: insecureTls });
+        await client.connect();
+        await client.mailboxOpen(folder);
+        if (read) await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true });
+        else await client.messageFlagsRemove(uid, ['\\Seen'], { uid: true });
+        await client.logout();
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/toggle-flagged', async (req, res) => {
+    try {
+        const { email, password, host, port, secure, uid, folder, flagged } = req.body;
+        const client = new ImapFlow({ host: host || 'imap.gmail.com', port: port || 993, secure: secure !== undefined ? secure : true, auth: { user: email, pass: password }, tls: insecureTls });
+        await client.connect();
+        await client.mailboxOpen(folder);
+        if (flagged) await client.messageFlagsAdd(uid, ['\\Flagged'], { uid: true });
+        else await client.messageFlagsRemove(uid, ['\\Flagged'], { uid: true });
+        await client.logout();
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/create-folder', async (req, res) => {
+    try {
+        const { email, password, host, port, secure, folderName } = req.body;
+        const client = new ImapFlow({ host: host || 'imap.gmail.com', port: port || 993, secure: secure !== undefined ? secure : true, auth: { user: email, pass: password }, tls: insecureTls });
+        await client.connect();
+        await client.mailboxCreate(folderName);
+        await client.logout();
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/delete-folder', async (req, res) => {
+    try {
+        const { email, password, host, port, secure, folderName } = req.body;
+        const client = new ImapFlow({ host: host || 'imap.gmail.com', port: port || 993, secure: secure !== undefined ? secure : true, auth: { user: email, pass: password }, tls: insecureTls });
+        await client.connect();
+        await client.mailboxDelete(folderName);
+        await client.logout();
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.listen(process.env.PORT || 3000, () => console.log('Backend OK'));

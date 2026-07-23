@@ -2,6 +2,7 @@ const express = require('express');
 const { ImapFlow } = require('imapflow');
 const cors = require('cors');
 const quotedPrintable = require('quoted-printable');
+const { unescape } = require('html-escaper');  // <-- nueva dependencia
 
 const app = express();
 app.use(cors());
@@ -22,7 +23,6 @@ app.post('/api/folders', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ------------------- MENSAJES (con detecci?n de adjuntos) -------------------
 app.post('/api/messages', async (req, res) => {
     try {
         const { email, password, host, port, secure, folder } = req.body;
@@ -37,27 +37,19 @@ app.post('/api/messages', async (req, res) => {
                     if (!node) return;
                     if (node.disposition === 'attachment' || 
                         (node.type === 'application' && node.parameters && node.parameters.name) ||
-                        node.type === 'image') {
-                        hasAttachments = true;
-                    }
+                        node.type === 'image') hasAttachments = true;
                     if (node.childNodes) node.childNodes.forEach(checkAttachments);
                 };
                 checkAttachments(m.bodyStructure);
             }
-            msgs.push({ 
-                uid: m.uid, 
-                subject: m.envelope.subject || '', 
-                from: m.envelope.from?.[0]?.address || email, 
-                date: m.envelope.date,
-                hasAttachments: hasAttachments 
-            });
+            msgs.push({ uid: m.uid, subject: m.envelope.subject || '', from: m.envelope.from?.[0]?.address || email, date: m.envelope.date, hasAttachments });
         }
         await client.logout();
         res.json({ success: true, messages: msgs });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ------------------- MESSAGE-DETAIL (HTML + ADJUNTOS) -------------------
+// ------------------- MESSAGE-DETAIL (con desescapado HTML) -------------------
 app.post('/api/message-detail', async (req, res) => {
     try {
         const { email, password, host, port, secure, folder, uid } = req.body;
@@ -80,15 +72,10 @@ app.post('/api/message-detail', async (req, res) => {
 
         const src = msg?.source?.toString() || '';
 
-        // Funci?n para decodificar QP
+        // Decodificar QP
         const decodeQP = (text) => {
-            try {
-                return quotedPrintable.decode(text);
-            } catch (e) {
-                return text
-                    .replace(/=\r?\n/g, '')
-                    .replace(/=([0-9A-Fa-f]{2})/g, (m, c) => String.fromCharCode(parseInt(c, 16)));
-            }
+            try { return quotedPrintable.decode(text); }
+            catch (e) { return text.replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (m, c) => String.fromCharCode(parseInt(c, 16))); }
         };
 
         // Extraer adjuntos y HTML recursivamente
@@ -109,11 +96,8 @@ app.post('/api/message-detail', async (req, res) => {
                 try {
                     const { data } = await client.download(msg.uid, htmlPart.part, { uid: true });
                     let raw = data.toString();
-                    if (htmlPart.encoding === 'quoted-printable') {
-                        raw = decodeQP(raw);
-                    } else if (htmlPart.encoding === 'base64') {
-                        raw = Buffer.from(raw, 'base64').toString('utf-8');
-                    }
+                    if (htmlPart.encoding === 'quoted-printable') raw = decodeQP(raw);
+                    else if (htmlPart.encoding === 'base64') raw = Buffer.from(raw, 'base64').toString('utf-8');
                     html = raw.substring(0, 200000);
                 } catch (e) {}
             }
@@ -147,9 +131,7 @@ app.post('/api/message-detail', async (req, res) => {
                         const idx = part.indexOf('\r\n\r\n');
                         if (idx > -1) {
                             let raw = part.substring(idx + 4).replace(/--\s*$/, '').trim();
-                            if (part.includes('quoted-printable')) {
-                                raw = decodeQP(raw);
-                            }
+                            if (part.includes('quoted-printable')) raw = decodeQP(raw);
                             html = raw.substring(0, 200000);
                         }
                     }
@@ -157,9 +139,7 @@ app.post('/api/message-detail', async (req, res) => {
                         const idx = part.indexOf('\r\n\r\n');
                         if (idx > -1) {
                             let text = part.substring(idx + 4).replace(/--\s*$/, '').trim();
-                            if (part.includes('quoted-printable')) {
-                                text = decodeQP(text);
-                            }
+                            if (part.includes('quoted-printable')) text = decodeQP(text);
                             plainText = text;
                         }
                     }
@@ -168,63 +148,39 @@ app.post('/api/message-detail', async (req, res) => {
                 const headerEnd = src.indexOf('\r\n\r\n');
                 if (headerEnd > -1) {
                     let body = src.substring(headerEnd + 4).trim();
-                    if (src.includes('quoted-printable')) {
-                        body = decodeQP(body);
-                    }
+                    if (src.includes('quoted-printable')) body = decodeQP(body);
                     plainText = body;
                 }
             }
         }
 
-        // Convertir texto plano en HTML si no hay HTML real
-        if (!html && plainText) {
-            if (/<(!DOCTYPE|html|head|body|div|table|style|script|p|br|hr|img|a|meta|link)/i.test(plainText)) {
-                html = plainText.substring(0, 200000);
-            } else {
-                let escaped = plainText
-                    .replace(/&/g, '&amp;')
-                    .replace(/</g, '&lt;')
-                    .replace(/>/g, '&gt;');
-                escaped = escaped.replace(
-                    /(https?:\/\/[^\s<>"]+)/gi,
-                    '<a href="" style="color: #0066cc; word-break: break-all;"></a>'
-                );
-                escaped = escaped
-                    .split(/\r?\n\r?\n/)
-                    .map(para => '<p style="margin: 0 0 1em; line-height: 1.5;">' + para.replace(/\n/g, '<br>') + '</p>')
-                    .join('');
-                html = '<div style="font-family: -apple-system, Roboto, sans-serif; font-size: 16px; max-width: 100%; word-wrap: break-word;">' +
-                       escaped +
-                       '</div>';
+        // Procesar HTML o texto
+        if (html) {
+            // Si el HTML contiene entidades (&lt;, &gt;, etc.), las desescapamos
+            if (/&lt;|&gt;|&amp;|&#?\w+;/.test(html)) {
+                html = unescape(html);
             }
+        } else if (plainText) {
+            // Si el texto plano ya parece HTML, lo usamos directamente
+            if (/<(!DOCTYPE|html|head|body|div|table|style|script|p|br|hr|img|a|meta|link)/i.test(plainText)) {
+                html = plainText;
+                if (/&lt;|&gt;|&amp;|&#?\w+;/.test(html)) html = unescape(html);
+            } else {
+                // Convertir texto plano a HTML enriquecido
+                let escaped = plainText.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                escaped = escaped.replace(/(https?:\/\/[^\s<>"]+)/gi, '<a href="" style="color: #0066cc; word-break: break-all;"></a>');
+                escaped = escaped.split(/\r?\n\r?\n/).map(para => '<p style="margin: 0 0 1em; line-height: 1.5;">' + para.replace(/\n/g, '<br>') + '</p>').join('');
+                html = '<div style="font-family: -apple-system, Roboto, sans-serif; font-size: 16px; max-width: 100%; word-wrap: break-word;">' + escaped + '</div>';
+            }
+        } else {
+            html = '<p>No se pudo extraer contenido.</p>';
         }
 
-        if (!html) html = '<p>No se pudo extraer contenido.</p>';
-
-        res.json({ success: true, htmlBody: html, body: plainText, to: to, cc: cc, attachments: attachments });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ------------------- DESCARGA DE ADJUNTOS -------------------
-app.post('/api/download-attachment', async (req, res) => {
-    try {
-        const { email, password, host, port, secure, folder, uid, partId } = req.body;
-        const client = new ImapFlow({ host: host || 'imap.gmail.com', port: port || 993, secure: secure !== undefined ? secure : true, auth: { user: email, pass: password }, tls: insecureTls });
-        await client.connect();
-        await client.mailboxOpen(folder || 'INBOX');
-        const { data } = await client.download(parseInt(uid), partId, { uid: true });
-        await client.logout();
-        res.json({ success: true, data: data.toString('base64') });
+        res.json({ success: true, htmlBody: html, body: plainText, to: to, cc: cc, attachments });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ------------------- RESTO DE ENDPOINTS (sin cambios) -------------------
-app.post('/api/move-message', async (req, res) => { /* ... mismo c?digo ... */ });
-app.post('/api/append-sent', async (req, res) => { /* ... */ });
-app.post('/api/delete-message', async (req, res) => { /* ... */ });
-app.post('/api/toggle-read', async (req, res) => { /* ... */ });
-app.post('/api/toggle-flagged', async (req, res) => { /* ... */ });
-app.post('/api/create-folder', async (req, res) => { /* ... */ });
-app.post('/api/delete-folder', async (req, res) => { /* ... */ });
+// ... (mant?n los que ya ten?as)
 
 app.listen(process.env.PORT || 3000, () => console.log('Backend OK'));

@@ -22,6 +22,7 @@ app.post('/api/folders', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ------------------- MENSAJES (con detecci?n de adjuntos) -------------------
 app.post('/api/messages', async (req, res) => {
     try {
         const { email, password, host, port, secure, folder } = req.body;
@@ -29,15 +30,34 @@ app.post('/api/messages', async (req, res) => {
         await client.connect();
         await client.mailboxOpen(folder || 'INBOX');
         const msgs = [];
-        for await (const m of client.fetch('1:*', { envelope: true })) {
-            msgs.push({ uid: m.uid, subject: m.envelope.subject || '', from: m.envelope.from?.[0]?.address || email, date: m.envelope.date });
+        for await (const m of client.fetch('1:*', { envelope: true, bodyStructure: true })) {
+            let hasAttachments = false;
+            if (m.bodyStructure) {
+                const checkAttachments = (node) => {
+                    if (!node) return;
+                    if (node.disposition === 'attachment' || 
+                        (node.type === 'application' && node.parameters && node.parameters.name) ||
+                        node.type === 'image') {
+                        hasAttachments = true;
+                    }
+                    if (node.childNodes) node.childNodes.forEach(checkAttachments);
+                };
+                checkAttachments(m.bodyStructure);
+            }
+            msgs.push({ 
+                uid: m.uid, 
+                subject: m.envelope.subject || '', 
+                from: m.envelope.from?.[0]?.address || email, 
+                date: m.envelope.date,
+                hasAttachments: hasAttachments 
+            });
         }
         await client.logout();
         res.json({ success: true, messages: msgs });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ------------------- MESSAGE-DETAIL (decodificaci?n QP + detecci?n HTML) -------------------
+// ------------------- MESSAGE-DETAIL (HTML + ADJUNTOS) -------------------
 app.post('/api/message-detail', async (req, res) => {
     try {
         const { email, password, host, port, secure, folder, uid } = req.body;
@@ -51,6 +71,7 @@ app.post('/api/message-detail', async (req, res) => {
         let plainText = '';
         let to = '';
         let cc = '';
+        let attachments = [];
 
         if (msg && msg.envelope) {
             if (msg.envelope.to) to = msg.envelope.to.map(a => a.address).join(', ');
@@ -59,19 +80,18 @@ app.post('/api/message-detail', async (req, res) => {
 
         const src = msg?.source?.toString() || '';
 
-        // Funci?n para decodificar quoted-printable de forma agresiva (incluyendo =3D, =22, etc.)
+        // Funci?n para decodificar QP
         const decodeQP = (text) => {
             try {
                 return quotedPrintable.decode(text);
             } catch (e) {
-                // Fallback manual
                 return text
-                    .replace(/=\r?\n/g, '')                     // quitar saltos suaves
+                    .replace(/=\r?\n/g, '')
                     .replace(/=([0-9A-Fa-f]{2})/g, (m, c) => String.fromCharCode(parseInt(c, 16)));
             }
         };
 
-        // 1. Extraer HTML desde la estructura (si existe)
+        // Extraer adjuntos y HTML recursivamente
         if (msg && msg.bodyStructure) {
             const findHtmlPart = (node) => {
                 if (!node) return null;
@@ -97,9 +117,26 @@ app.post('/api/message-detail', async (req, res) => {
                     html = raw.substring(0, 200000);
                 } catch (e) {}
             }
+
+            // Extraer adjuntos
+            const extractAttachments = (node) => {
+                if (!node) return;
+                if (node.disposition === 'attachment' || 
+                    (node.type === 'application' && node.parameters && node.parameters.name) ||
+                    (node.type === 'image' && node.disposition === 'attachment')) {
+                    attachments.push({
+                        filename: node.dispositionParameters?.filename || node.parameters?.name || 'adjunto',
+                        contentType: node.type + '/' + (node.subtype || 'octet-stream'),
+                        size: node.size || 0,
+                        partId: node.part
+                    });
+                }
+                if (node.childNodes) node.childNodes.forEach(extractAttachments);
+            };
+            extractAttachments(msg.bodyStructure);
         }
 
-        // 2. Si no hay HTML, extraer del source (prioridad HTML, luego texto)
+        // Si no hay HTML, extraer del source
         if (!html && src) {
             const bm = src.match(/boundary="([^"]+)"/) || src.match(/boundary=([^\s;]+)/);
             if (bm) {
@@ -139,13 +176,11 @@ app.post('/api/message-detail', async (req, res) => {
             }
         }
 
-        // 3. Si no tenemos HTML, decidir si el texto plano es en realidad HTML (porque contiene <!DOCTYPE o tags)
+        // Convertir texto plano en HTML si no hay HTML real
         if (!html && plainText) {
-            // Si el texto plano ya contiene marcado HTML, lo usamos directamente
             if (/<(!DOCTYPE|html|head|body|div|table|style|script|p|br|hr|img|a|meta|link)/i.test(plainText)) {
                 html = plainText.substring(0, 200000);
             } else {
-                // Convertir texto plano normal en HTML enriquecido
                 let escaped = plainText
                     .replace(/&/g, '&amp;')
                     .replace(/</g, '&lt;')
@@ -164,22 +199,32 @@ app.post('/api/message-detail', async (req, res) => {
             }
         }
 
-        // 4. Fallback gen?rico
-        if (!html) {
-            html = '<p>No se pudo extraer contenido del mensaje.</p>';
-        }
+        if (!html) html = '<p>No se pudo extraer contenido.</p>';
 
-        res.json({ success: true, htmlBody: html, body: plainText, to: to, cc: cc });
+        res.json({ success: true, htmlBody: html, body: plainText, to: to, cc: cc, attachments: attachments });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ------------------- RESTO DE ENDPOINTS -------------------
-app.post('/api/move-message', async (req, res) => { /* igual que antes */ });
-app.post('/api/append-sent', async (req, res) => { /* igual */ });
-app.post('/api/delete-message', async (req, res) => { /* igual */ });
-app.post('/api/toggle-read', async (req, res) => { /* igual */ });
-app.post('/api/toggle-flagged', async (req, res) => { /* igual */ });
-app.post('/api/create-folder', async (req, res) => { /* igual */ });
-app.post('/api/delete-folder', async (req, res) => { /* igual */ });
+// ------------------- DESCARGA DE ADJUNTOS -------------------
+app.post('/api/download-attachment', async (req, res) => {
+    try {
+        const { email, password, host, port, secure, folder, uid, partId } = req.body;
+        const client = new ImapFlow({ host: host || 'imap.gmail.com', port: port || 993, secure: secure !== undefined ? secure : true, auth: { user: email, pass: password }, tls: insecureTls });
+        await client.connect();
+        await client.mailboxOpen(folder || 'INBOX');
+        const { data } = await client.download(parseInt(uid), partId, { uid: true });
+        await client.logout();
+        res.json({ success: true, data: data.toString('base64') });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ------------------- RESTO DE ENDPOINTS (sin cambios) -------------------
+app.post('/api/move-message', async (req, res) => { /* ... mismo c?digo ... */ });
+app.post('/api/append-sent', async (req, res) => { /* ... */ });
+app.post('/api/delete-message', async (req, res) => { /* ... */ });
+app.post('/api/toggle-read', async (req, res) => { /* ... */ });
+app.post('/api/toggle-flagged', async (req, res) => { /* ... */ });
+app.post('/api/create-folder', async (req, res) => { /* ... */ });
+app.post('/api/delete-folder', async (req, res) => { /* ... */ });
 
 app.listen(process.env.PORT || 3000, () => console.log('Backend OK'));

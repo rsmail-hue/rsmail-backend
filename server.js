@@ -2,7 +2,7 @@ const express = require('express');
 const { ImapFlow } = require('imapflow');
 const cors = require('cors');
 const quotedPrintable = require('quoted-printable');
-const { unescape } = require('html-escaper');  // <-- nueva dependencia
+const { unescape } = require('html-escaper');
 
 const app = express();
 app.use(cors());
@@ -49,7 +49,7 @@ app.post('/api/messages', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ------------------- MESSAGE-DETAIL (con desescapado HTML) -------------------
+// ------------------- MESSAGE-DETAIL (decodificaci?n universal) -------------------
 app.post('/api/message-detail', async (req, res) => {
     try {
         const { email, password, host, port, secure, folder, uid } = req.body;
@@ -72,18 +72,25 @@ app.post('/api/message-detail', async (req, res) => {
 
         const src = msg?.source?.toString() || '';
 
-        // Decodificar QP
+        // Decodificar quoted-printable (robusto)
         const decodeQP = (text) => {
             try { return quotedPrintable.decode(text); }
             catch (e) { return text.replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (m, c) => String.fromCharCode(parseInt(c, 16))); }
         };
 
-        // Extraer adjuntos y HTML recursivamente
+        // 1. Extraer HTML real desde la estructura (b?squeda recursiva)
         if (msg && msg.bodyStructure) {
             const findHtmlPart = (node) => {
                 if (!node) return null;
                 if (node.type === 'text' && node.subtype === 'html') return node;
                 if (node.childNodes) {
+                    for (const child of node.childNodes) {
+                        const found = findHtmlPart(child);
+                        if (found) return found;
+                    }
+                }
+                // Buscar dentro de mensajes anidados (message/rfc822)
+                if (node.type === 'message' && node.childNodes) {
                     for (const child of node.childNodes) {
                         const found = findHtmlPart(child);
                         if (found) return found;
@@ -120,7 +127,7 @@ app.post('/api/message-detail', async (req, res) => {
             extractAttachments(msg.bodyStructure);
         }
 
-        // Si no hay HTML, extraer del source
+        // 2. Si no hay HTML, extraer del source manualmente
         if (!html && src) {
             const bm = src.match(/boundary="([^"]+)"/) || src.match(/boundary=([^\s;]+)/);
             if (bm) {
@@ -132,6 +139,7 @@ app.post('/api/message-detail', async (req, res) => {
                         if (idx > -1) {
                             let raw = part.substring(idx + 4).replace(/--\s*$/, '').trim();
                             if (part.includes('quoted-printable')) raw = decodeQP(raw);
+                            else if (part.includes('base64')) raw = Buffer.from(raw, 'base64').toString('utf-8');
                             html = raw.substring(0, 200000);
                         }
                     }
@@ -154,14 +162,14 @@ app.post('/api/message-detail', async (req, res) => {
             }
         }
 
-        // Procesar HTML o texto
+        // 3. Desescapar entidades HTML SIEMPRE (incluso si ya hab?a HTML)
         if (html) {
-            // Si el HTML contiene entidades (&lt;, &gt;, etc.), las desescapamos
+            // Si contiene entidades HTML conocidas, desescapamos
             if (/&lt;|&gt;|&amp;|&#?\w+;/.test(html)) {
                 html = unescape(html);
             }
         } else if (plainText) {
-            // Si el texto plano ya parece HTML, lo usamos directamente
+            // Si el texto plano parece HTML (contiene tags o entidades), lo tratamos como HTML y desescapamos
             if (/<(!DOCTYPE|html|head|body|div|table|style|script|p|br|hr|img|a|meta|link)/i.test(plainText)) {
                 html = plainText;
                 if (/&lt;|&gt;|&amp;|&#?\w+;/.test(html)) html = unescape(html);
@@ -181,6 +189,6 @@ app.post('/api/message-detail', async (req, res) => {
 });
 
 // ------------------- RESTO DE ENDPOINTS (sin cambios) -------------------
-// ... (mant?n los que ya ten?as)
+// ... (mant?n los que ya ten?as: move, append, delete, toggle, folders, etc.)
 
 app.listen(process.env.PORT || 3000, () => console.log('Backend OK'));

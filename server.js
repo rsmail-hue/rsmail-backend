@@ -37,7 +37,7 @@ app.post('/api/messages', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ------------------- MESSAGE-DETAIL (HTML limpio, sin doble-escape) -------------------
+// ------------------- MESSAGE-DETAIL (detecci?n de HTML y entrega sin modificar) -------------------
 app.post('/api/message-detail', async (req, res) => {
     try {
         const { email, password, host, port, secure, folder, uid } = req.body;
@@ -59,7 +59,7 @@ app.post('/api/message-detail', async (req, res) => {
 
         const src = msg?.source?.toString() || '';
 
-        // 1. Extraer HTML real desde la estructura (si existe) ? SIN ESCAPAR
+        // 1. Extraer HTML real desde la estructura (si existe)
         if (msg && msg.bodyStructure) {
             const findHtmlPart = (node) => {
                 if (!node) return null;
@@ -82,7 +82,8 @@ app.post('/api/message-detail', async (req, res) => {
                     } else if (htmlPart.encoding === 'base64') {
                         raw = Buffer.from(raw, 'base64').toString('utf-8');
                     }
-                    html = raw.substring(0, 200000);  // ? HTML limpio, sin escapes
+                    // Si encontramos HTML, lo usamos directamente
+                    html = raw.substring(0, 200000);
                 } catch (e) {}
             }
         }
@@ -119,23 +120,30 @@ app.post('/api/message-detail', async (req, res) => {
             }
         }
 
-        // 3. Si no hay HTML, convertir texto plano en HTML enriquecido (sin doble-escape)
+        // 3. Si no tenemos HTML todav?a, pero tenemos texto plano que ya parece HTML (contiene tags o entidades), lo usamos directamente
         if (!html && plainText) {
-            let escaped = plainText
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;');
-            escaped = escaped.replace(
-                /(https?:\/\/[^\s<>"]+)/gi,
-                '<a href="" style="color: #0066cc; word-break: break-all;"></a>'
-            );
-            escaped = escaped
-                .split(/\r?\n\r?\n/)
-                .map(para => '<p style="margin: 0 0 1em; line-height: 1.5;">' + para.replace(/\n/g, '<br>') + '</p>')
-                .join('');
-            html = '<div style="font-family: -apple-system, Roboto, sans-serif; font-size: 16px; max-width: 100%; word-wrap: break-word;">' +
-                   escaped +
-                   '</div>';
+            const hasHtmlEntities = /&lt;|&gt;|&amp;|&#\d+;|<\/?[a-zA-Z]+/.test(plainText);
+            if (hasHtmlEntities) {
+                // El texto ya contiene marcado HTML o entidades; lo tratamos como HTML limpio
+                html = plainText.substring(0, 200000);
+            } else {
+                // Convertir texto plano normal en HTML enriquecido (escapando caracteres especiales)
+                let escaped = plainText
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;');
+                escaped = escaped.replace(
+                    /(https?:\/\/[^\s<>"]+)/gi,
+                    '<a href="" style="color: #0066cc; word-break: break-all;"></a>'
+                );
+                escaped = escaped
+                    .split(/\r?\n\r?\n/)
+                    .map(para => '<p style="margin: 0 0 1em; line-height: 1.5;">' + para.replace(/\n/g, '<br>') + '</p>')
+                    .join('');
+                html = '<div style="font-family: -apple-system, Roboto, sans-serif; font-size: 16px; max-width: 100%; word-wrap: break-word;">' +
+                       escaped +
+                       '</div>';
+            }
         }
 
         // 4. Fallback gen?rico

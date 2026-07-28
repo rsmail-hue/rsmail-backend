@@ -1,137 +1,109 @@
 const express = require('express');
-const Imap = require('imap');
+const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
 const cors = require('cors');
+const Imap = require('imap');
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
+const insecureTls = {
+    rejectUnauthorized: false,
+    checkServerIdentity: () => undefined
+};
+
 // ------------------------------------------------------------
-//  PING (para verificar que el backend está vivo)
+//  PING
 // ------------------------------------------------------------
 app.get('/ping', (req, res) => {
     res.json({ alive: true, time: new Date().toISOString() });
 });
 
 // ------------------------------------------------------------
-//  OBTENER CARPETAS (usando Imap)
+//  OBTENER CARPETAS (ImapFlow)
 // ------------------------------------------------------------
 app.post('/api/folders', async (req, res) => {
     const { email, password, host, port, secure } = req.body;
-
-    if (!email || !password) {
-        return res.status(400).json({ error: 'Faltan credenciales' });
-    }
-
-    const imap = new Imap({
-        user: email,
-        password: password,
+    const client = new ImapFlow({
         host: host || 'imap.gmail.com',
         port: port || 993,
-        tls: secure !== undefined ? secure : true,
-        tlsOptions: { rejectUnauthorized: false }
+        secure: secure !== undefined ? secure : true,
+        auth: { user: email, pass: password },
+        logger: false,
+        tls: insecureTls
     });
-
-    imap.once('ready', () => {
-        imap.getBoxes((err, boxes) => {
-            imap.end();
-            if (err) {
-                console.error('Error al obtener carpetas:', err);
-                return res.status(500).json({ error: 'Error al obtener carpetas' });
-            }
-            const folders = Object.keys(boxes).map(name => ({
-                name: name,
-                path: name,
-                specialUse: boxes[name].specialUse
-            }));
-            res.json({ success: true, folders });
-        });
-    });
-
-    imap.once('error', (err) => {
-        console.error('IMAP error:', err);
-        res.status(500).json({ error: 'Error de conexión IMAP: ' + err.message });
-    });
-
-    imap.connect();
+    try {
+        await client.connect();
+        const mailboxes = await client.list();
+        await client.logout();
+        const folders = mailboxes.map(mbox => ({
+            name: mbox.name,
+            path: mbox.path,
+            specialUse: mbox.specialUse
+        }));
+        res.json({ success: true, folders });
+    } catch (error) {
+        console.error('Error /api/folders:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
 });
 
 // ------------------------------------------------------------
-//  OBTENER LISTA DE MENSAJES (usando Imap)
+//  OBTENER MENSAJES (ImapFlow)
 // ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, secure, folder } = req.body;
-
-    if (!email || !password) {
-        return res.status(400).json({ error: 'Faltan credenciales' });
-    }
-
-    const imap = new Imap({
-        user: email,
-        password: password,
+    const client = new ImapFlow({
         host: host || 'imap.gmail.com',
         port: port || 993,
-        tls: secure !== undefined ? secure : true,
-        tlsOptions: { rejectUnauthorized: false }
+        secure: secure !== undefined ? secure : true,
+        auth: { user: email, pass: password },
+        logger: false,
+        tls: insecureTls
     });
-
-    imap.once('ready', () => {
-        imap.openBox(folder || 'INBOX', true, (err, box) => {
-            if (err) {
-                imap.end();
-                console.error('Error al abrir carpeta:', err);
-                return res.status(500).json({ error: 'Error al abrir carpeta' });
+    try {
+        await client.connect();
+        await client.mailboxOpen(folder || 'INBOX');
+        const messages = [];
+        for await (const msg of client.fetch('1:*', { envelope: true, bodyStructure: true })) {
+            let hasAttachments = false;
+            if (msg.bodyStructure) {
+                const checkAttachments = (node) => {
+                    if (!node) return;
+                    if (node.disposition === 'attachment' ||
+                        (node.type === 'application' && node.parameters && node.parameters.name) ||
+                        node.type === 'image') {
+                        hasAttachments = true;
+                    }
+                    if (node.childNodes) node.childNodes.forEach(checkAttachments);
+                };
+                checkAttachments(msg.bodyStructure);
             }
-
-            const messages = [];
-            const fetch = imap.fetch('1:*', { bodies: '', struct: true });
-
-            fetch.on('message', (msg, seqno) => {
-                const message = { uid: 0, subject: '', from: '', date: '', hasAttachments: false };
-
-                msg.on('attributes', (attrs) => {
-                    message.uid = attrs.uid;
-                    message.subject = attrs.subject || '(Sin asunto)';
-                    message.from = attrs.from ? attrs.from[0].address : email;
-                    message.date = attrs.date || new Date();
-                    message.hasAttachments = attrs.struct ? attrs.struct.some(node => node.disposition === 'attachment') : false;
-                });
-
-                msg.once('end', () => {
-                    messages.push(message);
-                });
+            messages.push({
+                uid: msg.uid,
+                subject: msg.envelope.subject || '(Sin asunto)',
+                from: msg.envelope.from?.[0]?.address || email,
+                date: msg.envelope.date || new Date(),
+                hasAttachments: hasAttachments
             });
-
-            fetch.once('end', () => {
-                imap.end();
-                res.json({ success: true, messages });
-            });
-
-            fetch.once('error', (fetchErr) => {
-                imap.end();
-                console.error('Fetch error:', fetchErr);
-                res.status(500).json({ error: 'Error al obtener mensajes' });
-            });
-        });
-    });
-
-    imap.once('error', (err) => {
-        console.error('IMAP error:', err);
-        res.status(500).json({ error: 'Error de conexión IMAP: ' + err.message });
-    });
-
-    imap.connect();
+        }
+        await client.logout();
+        res.json({ success: true, messages });
+    } catch (error) {
+        console.error('Error /api/messages:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
 });
 
 // ------------------------------------------------------------
-//  DETALLE DE MENSAJE (con imap y mailparser - ¡LA CLAVE!)
+//  DETALLE DE MENSAJE (usando imap + mailparser con Promesas)
 // ------------------------------------------------------------
 app.post('/api/message-detail', async (req, res) => {
     const { email, password, host, port, secure, folder, uid } = req.body;
 
     if (!email || !password || !uid) {
-        return res.status(400).json({ error: 'Faltan parámetros requeridos (email, password, uid)' });
+        return res.status(400).json({ error: 'Faltan parámetros requeridos' });
     }
 
     const imap = new Imap({
@@ -151,15 +123,12 @@ app.post('/api/message-detail', async (req, res) => {
                 return res.status(500).json({ error: 'Error abriendo la carpeta' });
             }
 
-            // Buscar el mensaje por su UID
             const fetch = imap.fetch([parseInt(uid)], { bodies: '' });
 
             fetch.on('message', (msg) => {
                 msg.on('body', (stream, info) => {
-                    // 🔥 Parsear el stream completo con mailparser usando Promesas
                     simpleParser(stream)
                         .then((parsed) => {
-                            // Buscar HTML -> Texto en HTML -> Texto plano -> Mensaje de respaldo
                             let htmlContent = parsed.html || parsed.textAsHtml;
                             if (!htmlContent && parsed.text) {
                                 htmlContent = `<pre style="font-family: sans-serif; white-space: pre-wrap;">${parsed.text}</pre>`;
@@ -168,7 +137,7 @@ app.post('/api/message-detail', async (req, res) => {
                                 htmlContent = '<p>(Este correo no contiene texto en el cuerpo)</p>';
                             }
 
-                            // Procesar imágenes inline (cid:) si existen
+                            // Procesar imágenes inline
                             if (parsed.attachments && parsed.attachments.length > 0) {
                                 parsed.attachments.forEach((att) => {
                                     if (att.contentId && att.related) {
@@ -178,7 +147,24 @@ app.post('/api/message-detail', async (req, res) => {
                                 });
                             }
 
-                            // Mapear adjuntos
+                            // Manejar to y cc (pueden ser objeto o array)
+                            let to = '';
+                            let cc = '';
+                            if (parsed.to) {
+                                if (Array.isArray(parsed.to)) {
+                                    to = parsed.to.map(a => a.address).join(', ');
+                                } else {
+                                    to = parsed.to.address || parsed.to.text || '';
+                                }
+                            }
+                            if (parsed.cc) {
+                                if (Array.isArray(parsed.cc)) {
+                                    cc = parsed.cc.map(a => a.address).join(', ');
+                                } else {
+                                    cc = parsed.cc.address || parsed.cc.text || '';
+                                }
+                            }
+
                             const attachmentsList = (parsed.attachments || []).map((att) => ({
                                 filename: att.filename || 'adjunto',
                                 size: att.size || 0,
@@ -186,13 +172,12 @@ app.post('/api/message-detail', async (req, res) => {
                                 partId: att.contentId || att.filename || ''
                             }));
 
-                            // Responder a Flutter
                             res.json({
                                 success: true,
                                 subject: parsed.subject || '',
                                 from: parsed.from ? parsed.from.text : '',
-                                to: parsed.to ? parsed.to.text : '',
-                                cc: parsed.cc ? parsed.cc.text : '',
+                                to: to,
+                                cc: cc,
                                 htmlBody: htmlContent,
                                 body: parsed.text || '',
                                 attachments: attachmentsList
@@ -225,17 +210,8 @@ app.post('/api/message-detail', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  RESTO DE ENDPOINTS (move, append, delete, toggle, etc.)
-//  (Se mantienen igual que antes, pero usando ImapFlow para simplicidad)
-//  Si quieres, también puedes pasarlos a Imap, pero no es necesario
-//  porque solo el detail necesita el stream completo.
+//  MOVER MENSAJE
 // ------------------------------------------------------------
-const { ImapFlow } = require('imapflow');
-const insecureTls = {
-    rejectUnauthorized: false,
-    checkServerIdentity: () => undefined
-};
-
 app.post('/api/move-message', async (req, res) => {
     const { email, password, host, port, secure, uid, fromFolder, toFolder } = req.body;
     if (!uid || !fromFolder || !toFolder) {
@@ -261,6 +237,9 @@ app.post('/api/move-message', async (req, res) => {
     }
 });
 
+// ------------------------------------------------------------
+//  GUARDAR EN ENVIADOS
+// ------------------------------------------------------------
 app.post('/api/append-sent', async (req, res) => {
     const { email, password, host, port, secure, rawMessage, sentFolderName } = req.body;
     if (!rawMessage) {
@@ -287,6 +266,9 @@ app.post('/api/append-sent', async (req, res) => {
     }
 });
 
+// ------------------------------------------------------------
+//  ELIMINAR MENSAJE
+// ------------------------------------------------------------
 app.post('/api/delete-message', async (req, res) => {
     const { email, password, host, port, secure, uid, folder } = req.body;
     if (!uid || !folder) {
@@ -313,6 +295,9 @@ app.post('/api/delete-message', async (req, res) => {
     }
 });
 
+// ------------------------------------------------------------
+//  MARCAR LEÍDO (corregido)
+// ------------------------------------------------------------
 app.post('/api/toggle-read', async (req, res) => {
     const { email, password, host, port, secure, uid, folder, read } = req.body;
     if (uid == null || !folder) {
@@ -330,9 +315,9 @@ app.post('/api/toggle-read', async (req, res) => {
         await client.connect();
         await client.mailboxOpen(folder);
         if (read) {
-            await client.messageSet(String(uid), ['\\Seen'], { uid: true });
+            await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true });
         } else {
-            await client.messageUnset(String(uid), ['\\Seen'], { uid: true });
+            await client.messageFlagsRemove(uid, ['\\Seen'], { uid: true });
         }
         await client.logout();
         res.json({ success: true });
@@ -342,6 +327,9 @@ app.post('/api/toggle-read', async (req, res) => {
     }
 });
 
+// ------------------------------------------------------------
+//  MARCAR IMPORTANTE (corregido)
+// ------------------------------------------------------------
 app.post('/api/toggle-flagged', async (req, res) => {
     const { email, password, host, port, secure, uid, folder, flagged } = req.body;
     if (uid == null || !folder) {
@@ -359,9 +347,9 @@ app.post('/api/toggle-flagged', async (req, res) => {
         await client.connect();
         await client.mailboxOpen(folder);
         if (flagged) {
-            await client.messageSet(String(uid), ['\\Flagged'], { uid: true });
+            await client.messageFlagsAdd(uid, ['\\Flagged'], { uid: true });
         } else {
-            await client.messageUnset(String(uid), ['\\Flagged'], { uid: true });
+            await client.messageFlagsRemove(uid, ['\\Flagged'], { uid: true });
         }
         await client.logout();
         res.json({ success: true });
@@ -371,6 +359,9 @@ app.post('/api/toggle-flagged', async (req, res) => {
     }
 });
 
+// ------------------------------------------------------------
+//  CREAR CARPETA
+// ------------------------------------------------------------
 app.post('/api/create-folder', async (req, res) => {
     const { email, password, host, port, secure, folderName } = req.body;
     if (!folderName) {
@@ -395,6 +386,9 @@ app.post('/api/create-folder', async (req, res) => {
     }
 });
 
+// ------------------------------------------------------------
+//  BORRAR CARPETA
+// ------------------------------------------------------------
 app.post('/api/delete-folder', async (req, res) => {
     const { email, password, host, port, secure, folderName } = req.body;
     if (!folderName) {
@@ -419,6 +413,9 @@ app.post('/api/delete-folder', async (req, res) => {
     }
 });
 
+// ------------------------------------------------------------
+//  DESCARGAR ADJUNTO
+// ------------------------------------------------------------
 app.post('/api/download-attachment', async (req, res) => {
     const { email, password, host, port, secure, folder, uid, partId } = req.body;
     if (!uid || !folder || !partId) {

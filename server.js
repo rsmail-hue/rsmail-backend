@@ -7,18 +7,12 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// Configuración TLS que ignora certificados y nombres de host
-const insecureTls = {
-    rejectUnauthorized: false,
-    checkServerIdentity: () => undefined
-};
+const insecureTls = { rejectUnauthorized: false, checkServerIdentity: () => undefined };
 
 // ------------------------------------------------------------
 //  PING
 // ------------------------------------------------------------
-app.get('/ping', (req, res) => {
-    res.json({ alive: true, time: new Date().toISOString() });
-});
+app.get('/ping', (req, res) => res.json({ alive: true, time: new Date().toISOString() }));
 
 // ------------------------------------------------------------
 //  OBTENER CARPETAS
@@ -97,7 +91,7 @@ app.post('/api/messages', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  DETALLE DE MENSAJE (mejorado con logs y fallback)
+//  DETALLE DE MENSAJE (con imágenes inline en base64)
 // ------------------------------------------------------------
 app.post('/api/message-detail', async (req, res) => {
     const { email, password, host, port, secure, folder, uid } = req.body;
@@ -112,15 +106,17 @@ app.post('/api/message-detail', async (req, res) => {
     try {
         await client.connect();
         await client.mailboxOpen(folder || 'INBOX');
-        
-        // 🔥 FORZAR descarga del mensaje completo con source: true
-        const msg = await client.fetchOne(String(uid), { 
-            source: true, 
-            envelope: true, 
-            bodyStructure: true 
+
+        const msg = await client.fetchOne(String(uid), {
+            source: true,
+            envelope: true,
+            bodyStructure: true
         }, { uid: true });
-        
         await client.logout();
+
+        if (!msg || !msg.source) {
+            return res.status(500).json({ success: false, error: 'No se pudo obtener el mensaje' });
+        }
 
         let html = '';
         let plainText = '';
@@ -128,27 +124,9 @@ app.post('/api/message-detail', async (req, res) => {
         let cc = '';
         let attachments = [];
 
-        // VERIFICAR que msg.source existe
-        if (!msg || !msg.source) {
-            console.error(`❌ Mensaje UID ${uid}: sin fuente (source)`);
-            return res.status(500).json({ 
-                success: false, 
-                error: 'No se pudo obtener el contenido del mensaje' 
-            });
-        }
-
-        console.log(`✅ Mensaje UID ${uid}: fuente obtenida, tamaño ${msg.source.length} bytes`);
-
-        // INTENTAR parsear con mailparser
         try {
             const parsed = await simpleParser(msg.source);
-            
-            console.log(`  📄 ¿Tiene HTML? ${!!parsed.html}`);
-            console.log(`  📄 ¿Tiene texto? ${!!parsed.text}`);
-            if (parsed.html) {
-                console.log(`  📄 HTML (primeros 200 chars): ${parsed.html.substring(0, 200)}`);
-            }
-            
+
             if (parsed.html) {
                 html = parsed.html;
             } else if (parsed.text) {
@@ -160,55 +138,69 @@ app.post('/api/message-detail', async (req, res) => {
                     .replace(/\r?\n/g, '<br>');
                 html = '<div style="font-family: -apple-system, Roboto, sans-serif; font-size: 16px; max-width: 100%; word-wrap: break-word;">' + html + '</div>';
             }
-            
-            if (parsed.to) to = parsed.to.map(a => a.address).join(', ');
-            if (parsed.cc) cc = parsed.cc.map(a => a.address).join(', ');
-            
+
+            // ---------- PROCESAR IMÁGENES INLINE (cid) ----------
             if (parsed.attachments) {
-                attachments = parsed.attachments.map(a => ({
-                    filename: a.filename || 'adjunto',
-                    contentType: a.contentType || 'application/octet-stream',
-                    size: a.size || 0,
-                    partId: a.partId || ''
-                }));
-            }
-        } catch (parseError) {
-            console.error(`❌ Error al parsear con mailparser: ${parseError.message}`);
-            // 🔥 FALLBACK: extraer HTML manualmente del source
-            try {
-                const sourceStr = msg.source.toString('utf-8');
-                // Buscar parte text/html
-                const htmlMatch = sourceStr.match(/Content-Type: text\/html[\s\S]*?\r\n\r\n([\s\S]*?)(?=\r\n--|$)/);
-                if (htmlMatch) {
-                    html = htmlMatch[1].trim();
-                    console.log(`  ✅ Fallback: HTML extraído manualmente (${html.length} bytes)`);
-                } else {
-                    // Buscar parte text/plain
-                    const textMatch = sourceStr.match(/Content-Type: text\/plain[\s\S]*?\r\n\r\n([\s\S]*?)(?=\r\n--|$)/);
-                    if (textMatch) {
-                        plainText = textMatch[1].trim();
-                        html = plainText.replace(/\n/g, '<br>');
-                        console.log(`  ✅ Fallback: texto plano extraído manualmente (${plainText.length} bytes)`);
+                for (const att of parsed.attachments) {
+                    // Solo si es imagen y tiene Content-ID
+                    if (att.contentType && att.contentType.startsWith('image/') && att.cid) {
+                        const base64 = att.content.toString('base64');
+                        const cid = att.cid.replace(/[<>]/g, '');
+                        // Reemplazar todas las ocurrencias de src="cid:..." en el HTML
+                        const regex = new RegExp(`src="cid:${cid}"`, 'g');
+                        html = html.replace(regex, `src="data:${att.contentType};base64,${base64}"`);
                     }
                 }
-            } catch (fallbackError) {
-                console.error(`❌ Fallback también falló: ${fallbackError.message}`);
+                // Adjuntos normales (no imágenes inline)
+                for (const att of parsed.attachments) {
+                    if (!att.contentType.startsWith('image/') || !att.cid) {
+                        attachments.push({
+                            filename: att.filename || 'adjunto',
+                            contentType: att.contentType || 'application/octet-stream',
+                            size: att.size || 0,
+                            partId: att.partId || ''
+                        });
+                    }
+                }
+            }
+
+            if (parsed.to) to = parsed.to.map(a => a.address).join(', ');
+            if (parsed.cc) cc = parsed.cc.map(a => a.address).join(', ');
+
+        } catch (parseError) {
+            console.error('Error mailparser:', parseError.message);
+            // Fallback manual
+            const sourceStr = msg.source.toString('utf-8');
+            const htmlMatch = sourceStr.match(/Content-Type: text\/html[\s\S]*?\r\n\r\n([\s\S]*?)(?=\r\n--|$)/);
+            if (htmlMatch) {
+                html = htmlMatch[1].trim();
+            } else {
+                const textMatch = sourceStr.match(/Content-Type: text\/plain[\s\S]*?\r\n\r\n([\s\S]*?)(?=\r\n--|$)/);
+                if (textMatch) {
+                    plainText = textMatch[1].trim();
+                    html = plainText.replace(/\n/g, '<br>');
+                }
             }
         }
 
-        if (!html) {
-            html = '<p>No se pudo extraer contenido del mensaje.</p>';
-        }
+        if (!html) html = '<p>No se pudo extraer contenido del mensaje.</p>';
 
-        res.json({ success: true, htmlBody: html, body: plainText, to, cc, attachments });
+        res.json({
+            success: true,
+            htmlBody: html,
+            body: plainText,
+            to,
+            cc,
+            attachments
+        });
     } catch (error) {
-        console.error('❌ Error /api/message-detail:', error.message);
+        console.error('Error /api/message-detail:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
 // ------------------------------------------------------------
-//  ENDPOINT DE DEPURACIÓN PARA VER HTML CRUDO
+//  ENDPOINT DE DEPURACIÓN (opcional)
 // ------------------------------------------------------------
 app.post('/api/debug-html', async (req, res) => {
     const { email, password, host, port, secure, folder, uid } = req.body;
@@ -227,12 +219,11 @@ app.post('/api/debug-html', async (req, res) => {
         await client.logout();
         if (msg && msg.source) {
             const sourceStr = msg.source.toString('utf-8');
-            // Extraemos solo la parte HTML para depurar
             const htmlMatch = sourceStr.match(/Content-Type: text\/html[\s\S]*?\r\n\r\n([\s\S]*?)(?=\r\n--|$)/);
             const htmlPart = htmlMatch ? htmlMatch[1] : 'No se encontró parte HTML';
-            res.json({ 
-                success: true, 
-                raw: sourceStr.substring(0, 1000), 
+            res.json({
+                success: true,
+                raw: sourceStr.substring(0, 1000),
                 htmlPart: htmlPart.substring(0, 500),
                 fullHtml: htmlPart
             });
@@ -246,7 +237,7 @@ app.post('/api/debug-html', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  MOVER MENSAJE
+//  RESTO DE ENDPOINTS (move, append, delete, toggle, etc.)
 // ------------------------------------------------------------
 app.post('/api/move-message', async (req, res) => {
     const { email, password, host, port, secure, uid, fromFolder, toFolder } = req.body;
@@ -273,9 +264,6 @@ app.post('/api/move-message', async (req, res) => {
     }
 });
 
-// ------------------------------------------------------------
-//  GUARDAR EN ENVIADOS (APPEND)
-// ------------------------------------------------------------
 app.post('/api/append-sent', async (req, res) => {
     const { email, password, host, port, secure, rawMessage, sentFolderName } = req.body;
     if (!rawMessage) {
@@ -302,9 +290,6 @@ app.post('/api/append-sent', async (req, res) => {
     }
 });
 
-// ------------------------------------------------------------
-//  ELIMINAR MENSAJE (PERMANENTE)
-// ------------------------------------------------------------
 app.post('/api/delete-message', async (req, res) => {
     const { email, password, host, port, secure, uid, folder } = req.body;
     if (!uid || !folder) {
@@ -331,9 +316,6 @@ app.post('/api/delete-message', async (req, res) => {
     }
 });
 
-// ------------------------------------------------------------
-//  MARCAR LEÍDO / NO LEÍDO
-// ------------------------------------------------------------
 app.post('/api/toggle-read', async (req, res) => {
     const { email, password, host, port, secure, uid, folder, read } = req.body;
     if (uid == null || !folder) {
@@ -363,9 +345,6 @@ app.post('/api/toggle-read', async (req, res) => {
     }
 });
 
-// ------------------------------------------------------------
-//  MARCAR / DESMARCAR IMPORTANTE (FLAGGED)
-// ------------------------------------------------------------
 app.post('/api/toggle-flagged', async (req, res) => {
     const { email, password, host, port, secure, uid, folder, flagged } = req.body;
     if (uid == null || !folder) {
@@ -395,9 +374,6 @@ app.post('/api/toggle-flagged', async (req, res) => {
     }
 });
 
-// ------------------------------------------------------------
-//  CREAR CARPETA
-// ------------------------------------------------------------
 app.post('/api/create-folder', async (req, res) => {
     const { email, password, host, port, secure, folderName } = req.body;
     if (!folderName) {
@@ -422,9 +398,6 @@ app.post('/api/create-folder', async (req, res) => {
     }
 });
 
-// ------------------------------------------------------------
-//  BORRAR CARPETA
-// ------------------------------------------------------------
 app.post('/api/delete-folder', async (req, res) => {
     const { email, password, host, port, secure, folderName } = req.body;
     if (!folderName) {
@@ -449,9 +422,6 @@ app.post('/api/delete-folder', async (req, res) => {
     }
 });
 
-// ------------------------------------------------------------
-//  DESCARGAR ADJUNTO (por partId)
-// ------------------------------------------------------------
 app.post('/api/download-attachment', async (req, res) => {
     const { email, password, host, port, secure, folder, uid, partId } = req.body;
     if (!uid || !folder || !partId) {

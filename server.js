@@ -7,12 +7,17 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-const insecureTls = { rejectUnauthorized: false, checkServerIdentity: () => undefined };
+const insecureTls = {
+    rejectUnauthorized: false,
+    checkServerIdentity: () => undefined
+};
 
 // ------------------------------------------------------------
 //  PING
 // ------------------------------------------------------------
-app.get('/ping', (req, res) => res.json({ alive: true, time: new Date().toISOString() }));
+app.get('/ping', (req, res) => {
+    res.json({ alive: true, time: new Date().toISOString() });
+});
 
 // ------------------------------------------------------------
 //  OBTENER CARPETAS
@@ -91,7 +96,7 @@ app.post('/api/messages', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  DETALLE DE MENSAJE (con imágenes inline en base64)
+//  DETALLE DE MENSAJE (CON DESESCAPADO Y SOPORTE PARA IMÁGENES INLINE)
 // ------------------------------------------------------------
 app.post('/api/message-detail', async (req, res) => {
     const { email, password, host, port, secure, folder, uid } = req.body;
@@ -127,26 +132,22 @@ app.post('/api/message-detail', async (req, res) => {
         try {
             const parsed = await simpleParser(msg.source);
 
+            // Extraer HTML o texto plano
             if (parsed.html) {
                 html = parsed.html;
             } else if (parsed.text) {
-                const text = parsed.text;
-                html = text
-                    .replace(/&/g, '&amp;')
-                    .replace(/</g, '&lt;')
-                    .replace(/>/g, '&gt;')
-                    .replace(/\r?\n/g, '<br>');
-                html = '<div style="font-family: -apple-system, Roboto, sans-serif; font-size: 16px; max-width: 100%; word-wrap: break-word;">' + html + '</div>';
+                plainText = parsed.text;
+                html = plainText.replace(/\n/g, '<br>');
+                html = '<div style="font-family: sans-serif; font-size: 16px;">' + html + '</div>';
             }
 
-            // ---------- PROCESAR IMÁGENES INLINE (cid) ----------
+            // Convertir imágenes inline (cid) a base64
             if (parsed.attachments) {
                 for (const att of parsed.attachments) {
-                    // Solo si es imagen y tiene Content-ID
                     if (att.contentType && att.contentType.startsWith('image/') && att.cid) {
                         const base64 = att.content.toString('base64');
                         const cid = att.cid.replace(/[<>]/g, '');
-                        // Reemplazar todas las ocurrencias de src="cid:..." en el HTML
+                        // Reemplazar src="cid:..." por src="data:image/...;base64,..."
                         const regex = new RegExp(`src="cid:${cid}"`, 'g');
                         html = html.replace(regex, `src="data:${att.contentType};base64,${base64}"`);
                     }
@@ -169,7 +170,7 @@ app.post('/api/message-detail', async (req, res) => {
 
         } catch (parseError) {
             console.error('Error mailparser:', parseError.message);
-            // Fallback manual
+            // Fallback: extraer HTML manualmente
             const sourceStr = msg.source.toString('utf-8');
             const htmlMatch = sourceStr.match(/Content-Type: text\/html[\s\S]*?\r\n\r\n([\s\S]*?)(?=\r\n--|$)/);
             if (htmlMatch) {
@@ -183,7 +184,27 @@ app.post('/api/message-detail', async (req, res) => {
             }
         }
 
-        if (!html) html = '<p>No se pudo extraer contenido del mensaje.</p>';
+        // Desescapar secuencias Unicode en el HTML
+        try {
+            // Reemplazar \u003c por <, \u003e por >, \u0026 por &, etc.
+            html = html
+                .replace(/\\u003c/g, '<')
+                .replace(/\\u003e/g, '>')
+                .replace(/\\u0026/g, '&')
+                .replace(/\\u0022/g, '"')
+                .replace(/\\u0027/g, "'")
+                .replace(/\\n/g, '\n')
+                .replace(/\\r/g, '\r')
+                .replace(/\\t/g, '\t')
+                .replace(/\\\//g, '/');
+        } catch (e) {
+            console.error('Error desescapando HTML:', e.message);
+        }
+
+        // Si no hay HTML, mensaje por defecto
+        if (!html) {
+            html = '<p>No se pudo extraer contenido del mensaje.</p>';
+        }
 
         res.json({
             success: true,

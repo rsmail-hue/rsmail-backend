@@ -96,7 +96,7 @@ app.post('/api/messages', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  DETALLE DE MENSAJE (CON DESESCAPADO Y SOPORTE PARA IMÁGENES INLINE)
+//  DETALLE DE MENSAJE (mejorado con mailparser y soporte inline)
 // ------------------------------------------------------------
 app.post('/api/message-detail', async (req, res) => {
     const { email, password, host, port, secure, folder, uid } = req.body;
@@ -108,112 +108,75 @@ app.post('/api/message-detail', async (req, res) => {
         logger: false,
         tls: insecureTls
     });
+
     try {
         await client.connect();
         await client.mailboxOpen(folder || 'INBOX');
 
+        // Obtener mensaje completo con source
         const msg = await client.fetchOne(String(uid), {
             source: true,
             envelope: true,
             bodyStructure: true
         }, { uid: true });
+
         await client.logout();
 
         if (!msg || !msg.source) {
             return res.status(500).json({ success: false, error: 'No se pudo obtener el mensaje' });
         }
 
-        let html = '';
-        let plainText = '';
-        let to = '';
-        let cc = '';
-        let attachments = [];
+        // parsear directamente el Buffer con mailparser
+        const parsed = await simpleParser(msg.source);
 
-        try {
-            const parsed = await simpleParser(msg.source);
+        let htmlContent = parsed.html || parsed.textAsHtml || parsed.text || '';
 
-            // Extraer HTML o texto plano
-            if (parsed.html) {
-                html = parsed.html;
-            } else if (parsed.text) {
-                plainText = parsed.text;
-                html = plainText.replace(/\n/g, '<br>');
-                html = '<div style="font-family: sans-serif; font-size: 16px;">' + html + '</div>';
-            }
+        // Si no hay contenido, mensaje por defecto
+        if (!htmlContent) {
+            htmlContent = '<p>No se pudo extraer contenido del mensaje.</p>';
+        }
 
-            // Convertir imágenes inline (cid) a base64
-            if (parsed.attachments) {
-                for (const att of parsed.attachments) {
-                    if (att.contentType && att.contentType.startsWith('image/') && att.cid) {
-                        const base64 = att.content.toString('base64');
-                        const cid = att.cid.replace(/[<>]/g, '');
-                        // Reemplazar src="cid:..." por src="data:image/...;base64,..."
-                        const regex = new RegExp(`src="cid:${cid}"`, 'g');
-                        html = html.replace(regex, `src="data:${att.contentType};base64,${base64}"`);
-                    }
-                }
-                // Adjuntos normales (no imágenes inline)
-                for (const att of parsed.attachments) {
-                    if (!att.contentType.startsWith('image/') || !att.cid) {
-                        attachments.push({
-                            filename: att.filename || 'adjunto',
-                            contentType: att.contentType || 'application/octet-stream',
-                            size: att.size || 0,
-                            partId: att.partId || ''
-                        });
-                    }
-                }
-            }
-
-            if (parsed.to) to = parsed.to.map(a => a.address).join(', ');
-            if (parsed.cc) cc = parsed.cc.map(a => a.address).join(', ');
-
-        } catch (parseError) {
-            console.error('Error mailparser:', parseError.message);
-            // Fallback: extraer HTML manualmente
-            const sourceStr = msg.source.toString('utf-8');
-            const htmlMatch = sourceStr.match(/Content-Type: text\/html[\s\S]*?\r\n\r\n([\s\S]*?)(?=\r\n--|$)/);
-            if (htmlMatch) {
-                html = htmlMatch[1].trim();
-            } else {
-                const textMatch = sourceStr.match(/Content-Type: text\/plain[\s\S]*?\r\n\r\n([\s\S]*?)(?=\r\n--|$)/);
-                if (textMatch) {
-                    plainText = textMatch[1].trim();
-                    html = plainText.replace(/\n/g, '<br>');
+        // Convertir imágenes inline (cid) a base64
+        if (parsed.attachments && parsed.attachments.length > 0) {
+            for (const att of parsed.attachments) {
+                if (att.contentId && att.related) {
+                    const contentId = att.contentId.replace(/[<>]/g, '');
+                    const base64Src = `data:${att.contentType};base64,${att.content.toString('base64')}`;
+                    // Reemplazar src="cid:..." por base64
+                    const regex = new RegExp(`src="cid:${contentId}"`, 'g');
+                    htmlContent = htmlContent.replace(regex, `src="${base64Src}"`);
                 }
             }
         }
 
-        // Desescapar secuencias Unicode en el HTML
-        try {
-            // Reemplazar \u003c por <, \u003e por >, \u0026 por &, etc.
-            html = html
-                .replace(/\\u003c/g, '<')
-                .replace(/\\u003e/g, '>')
-                .replace(/\\u0026/g, '&')
-                .replace(/\\u0022/g, '"')
-                .replace(/\\u0027/g, "'")
-                .replace(/\\n/g, '\n')
-                .replace(/\\r/g, '\r')
-                .replace(/\\t/g, '\t')
-                .replace(/\\\//g, '/');
-        } catch (e) {
-            console.error('Error desescapando HTML:', e.message);
-        }
+        // Extraer destinatarios
+        const to = parsed.to ? parsed.to.map(a => a.address).join(', ') : '';
+        const cc = parsed.cc ? parsed.cc.map(a => a.address).join(', ') : '';
 
-        // Si no hay HTML, mensaje por defecto
-        if (!html) {
-            html = '<p>No se pudo extraer contenido del mensaje.</p>';
+        // Adjuntos que no son inline
+        const attachments = [];
+        if (parsed.attachments) {
+            for (const att of parsed.attachments) {
+                if (!att.related || !att.contentId) {
+                    attachments.push({
+                        filename: att.filename || 'adjunto',
+                        contentType: att.contentType || 'application/octet-stream',
+                        size: att.size || 0,
+                        partId: att.contentId || ''
+                    });
+                }
+            }
         }
 
         res.json({
             success: true,
-            htmlBody: html,
-            body: plainText,
+            htmlBody: htmlContent,
+            body: parsed.text || '',
             to,
             cc,
             attachments
         });
+
     } catch (error) {
         console.error('Error /api/message-detail:', error.message);
         res.status(500).json({ success: false, error: error.message });
@@ -260,6 +223,7 @@ app.post('/api/debug-html', async (req, res) => {
 // ------------------------------------------------------------
 //  RESTO DE ENDPOINTS (move, append, delete, toggle, etc.)
 // ------------------------------------------------------------
+// (Mantén el resto de tus endpoints como estaban, sin cambios)
 app.post('/api/move-message', async (req, res) => {
     const { email, password, host, port, secure, uid, fromFolder, toFolder } = req.body;
     if (!uid || !fromFolder || !toFolder) {

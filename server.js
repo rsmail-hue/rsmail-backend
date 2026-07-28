@@ -12,12 +12,7 @@ const insecureTls = {
     checkServerIdentity: () => undefined
 };
 
-// ------------------------------------------------------------
-//  PING
-// ------------------------------------------------------------
-app.get('/ping', (req, res) => {
-    res.json({ alive: true, time: new Date().toISOString() });
-});
+app.get('/ping', (req, res) => res.json({ alive: true, time: new Date().toISOString() }));
 
 // ------------------------------------------------------------
 //  OBTENER CARPETAS
@@ -96,7 +91,7 @@ app.post('/api/messages', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  DETALLE DE MENSAJE (mejorado con mailparser y soporte inline)
+//  DETALLE DE MENSAJE (CON mailparser y FALLBACK a texto plano)
 // ------------------------------------------------------------
 app.post('/api/message-detail', async (req, res) => {
     const { email, password, host, port, secure, folder, uid } = req.body;
@@ -108,75 +103,73 @@ app.post('/api/message-detail', async (req, res) => {
         logger: false,
         tls: insecureTls
     });
-
     try {
         await client.connect();
         await client.mailboxOpen(folder || 'INBOX');
 
-        // Obtener mensaje completo con source
         const msg = await client.fetchOne(String(uid), {
             source: true,
             envelope: true,
             bodyStructure: true
         }, { uid: true });
-
         await client.logout();
 
         if (!msg || !msg.source) {
             return res.status(500).json({ success: false, error: 'No se pudo obtener el mensaje' });
         }
 
-        // parsear directamente el Buffer con mailparser
         const parsed = await simpleParser(msg.source);
 
-        let htmlContent = parsed.html || parsed.textAsHtml || parsed.text || '';
+        let htmlContent = '';
+        let plainText = '';
+        let to = '';
+        let cc = '';
+        let attachments = [];
 
-        // Si no hay contenido, mensaje por defecto
-        if (!htmlContent) {
+        // Extraer HTML o texto plano
+        if (parsed.html) {
+            htmlContent = parsed.html;
+        } else if (parsed.text) {
+            plainText = parsed.text;
+            // Envolver texto plano en <pre> para preservar formato
+            htmlContent = `<pre style="font-family: monospace; white-space: pre-wrap; word-wrap: break-word;">${parsed.text}</pre>`;
+        } else {
             htmlContent = '<p>No se pudo extraer contenido del mensaje.</p>';
         }
 
         // Convertir imágenes inline (cid) a base64
         if (parsed.attachments && parsed.attachments.length > 0) {
             for (const att of parsed.attachments) {
-                if (att.contentId && att.related) {
-                    const contentId = att.contentId.replace(/[<>]/g, '');
-                    const base64Src = `data:${att.contentType};base64,${att.content.toString('base64')}`;
-                    // Reemplazar src="cid:..." por base64
-                    const regex = new RegExp(`src="cid:${contentId}"`, 'g');
-                    htmlContent = htmlContent.replace(regex, `src="${base64Src}"`);
+                if (att.contentId && att.contentType && att.contentType.startsWith('image/')) {
+                    const base64 = att.content.toString('base64');
+                    const cid = att.contentId.replace(/[<>]/g, '');
+                    htmlContent = htmlContent.replace(new RegExp(`cid:${cid}`, 'g'), `data:${att.contentType};base64,${base64}`);
                 }
             }
-        }
-
-        // Extraer destinatarios
-        const to = parsed.to ? parsed.to.map(a => a.address).join(', ') : '';
-        const cc = parsed.cc ? parsed.cc.map(a => a.address).join(', ') : '';
-
-        // Adjuntos que no son inline
-        const attachments = [];
-        if (parsed.attachments) {
+            // Adjuntos normales (no imágenes inline)
             for (const att of parsed.attachments) {
-                if (!att.related || !att.contentId) {
+                if (!att.contentId || !att.contentType.startsWith('image/')) {
                     attachments.push({
                         filename: att.filename || 'adjunto',
                         contentType: att.contentType || 'application/octet-stream',
                         size: att.size || 0,
-                        partId: att.contentId || ''
+                        partId: att.contentId || att.partId || ''
                     });
                 }
             }
         }
 
+        if (parsed.to) to = parsed.to.map(a => a.address).join(', ');
+        if (parsed.cc) cc = parsed.cc.map(a => a.address).join(', ');
+
         res.json({
             success: true,
             htmlBody: htmlContent,
-            body: parsed.text || '',
+            body: plainText,
             to,
             cc,
             attachments
         });
-
     } catch (error) {
         console.error('Error /api/message-detail:', error.message);
         res.status(500).json({ success: false, error: error.message });
@@ -184,50 +177,12 @@ app.post('/api/message-detail', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  ENDPOINT DE DEPURACIÓN (opcional)
+// RESTO DE ENDPOINTS (move, append, delete, toggle, etc.)
 // ------------------------------------------------------------
-app.post('/api/debug-html', async (req, res) => {
-    const { email, password, host, port, secure, folder, uid } = req.body;
-    const client = new ImapFlow({
-        host: host || 'imap.gmail.com',
-        port: port || 993,
-        secure: secure !== undefined ? secure : true,
-        auth: { user: email, pass: password },
-        logger: false,
-        tls: insecureTls
-    });
-    try {
-        await client.connect();
-        await client.mailboxOpen(folder || 'INBOX');
-        const msg = await client.fetchOne(String(uid), { source: true }, { uid: true });
-        await client.logout();
-        if (msg && msg.source) {
-            const sourceStr = msg.source.toString('utf-8');
-            const htmlMatch = sourceStr.match(/Content-Type: text\/html[\s\S]*?\r\n\r\n([\s\S]*?)(?=\r\n--|$)/);
-            const htmlPart = htmlMatch ? htmlMatch[1] : 'No se encontró parte HTML';
-            res.json({
-                success: true,
-                raw: sourceStr.substring(0, 1000),
-                htmlPart: htmlPart.substring(0, 500),
-                fullHtml: htmlPart
-            });
-        } else {
-            res.json({ success: false, error: 'No se pudo obtener el mensaje' });
-        }
-    } catch (error) {
-        console.error('Error /api/debug-html:', error.message);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// ------------------------------------------------------------
-//  RESTO DE ENDPOINTS (move, append, delete, toggle, etc.)
-// ------------------------------------------------------------
-// (Mantén el resto de tus endpoints como estaban, sin cambios)
 app.post('/api/move-message', async (req, res) => {
     const { email, password, host, port, secure, uid, fromFolder, toFolder } = req.body;
     if (!uid || !fromFolder || !toFolder) {
-        return res.status(400).json({ success: false, error: 'Faltan parámetros (uid, fromFolder, toFolder)' });
+        return res.status(400).json({ success: false, error: 'Faltan parámetros' });
     }
     const client = new ImapFlow({
         host: host || 'imap.gmail.com',
@@ -433,9 +388,6 @@ app.post('/api/download-attachment', async (req, res) => {
     }
 });
 
-// ------------------------------------------------------------
-//  INICIAR SERVIDOR
-// ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`✅ Backend de RSMAIL corriendo en puerto ${PORT}`);

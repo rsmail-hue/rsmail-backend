@@ -630,10 +630,60 @@ app.post('/api/move-message', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  GUARDAR EN ENVIADOS (compatibilidad)
+//  GUARDAR EN ENVIADOS (para envíos locales desde la app)
 // ------------------------------------------------------------
-app.post('/api/append-sent', async (req, res) => {
-    res.json({ success: true, message: 'Deprecado: usar /api/send-email' });
+app.post('/api/save-to-sent', async (req, res) => {
+    const { email, password, host, rawMessage } = req.body;
+
+    if (!email || !password || !rawMessage) {
+        return res.status(400).json({ success: false, error: 'Faltan email, password o rawMessage' });
+    }
+
+    const domain = email.split('@')[1];
+    const imapHost = host || `mail.${domain}`;
+
+    const imap = new Imap({
+        user: email,
+        password: password,
+        host: imapHost,
+        port: 993,
+        tls: true,
+        tlsOptions: { rejectUnauthorized: false }
+    });
+
+    imap.once('ready', () => {
+        imap.getBoxes((err, boxes) => {
+            if (err) {
+                imap.end();
+                return res.status(500).json({ success: false, error: 'Error obteniendo carpetas' });
+            }
+
+            const sentFolder = findSentFolder(boxes) || 'INBOX.Sent';
+
+            imap.openBox(sentFolder, false, (openErr) => {
+                if (openErr) {
+                    imap.end();
+                    return res.status(500).json({ success: false, error: 'Error abriendo carpeta Enviados' });
+                }
+
+                imap.append(rawMessage, { mailbox: sentFolder, flags: ['\\Seen'] }, (appendErr) => {
+                    imap.end();
+                    if (appendErr) {
+                        return res.status(500).json({ success: false, error: 'Error al guardar: ' + appendErr.message });
+                    }
+                    return res.json({ success: true, message: 'Guardado en Enviados correctamente' });
+                });
+            });
+        });
+    });
+
+    imap.once('error', (err) => {
+        if (!res.headersSent) {
+            res.status(500).json({ success: false, error: 'Error IMAP: ' + err.message });
+        }
+    });
+
+    imap.connect();
 });
 
 // ------------------------------------------------------------

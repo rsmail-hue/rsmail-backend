@@ -20,104 +20,144 @@ const insecureTls = {
 let transporterCache = {};
 
 // ============================================================
-//  ENVIAR CORREO + GUARDAR EN ENVIADOS (IMAP APPEND)
+//  ENVIAR CORREO + GUARDAR EN ENVIADOS (CORREGIDO)
 // ============================================================
 app.post('/api/send-email', async (req, res) => {
     let { email, password, smtpHost, smtpPort, secure, imapHost, to, subject, body, cc, bcc } = req.body;
 
     const domain = email.split('@')[1];
-    // Normalizar hosts
     if (!smtpHost || smtpHost.includes('smtp.')) smtpHost = `mail.${domain}`;
     if (!imapHost) imapHost = `mail.${domain}`;
 
     console.log(`📨 Enviando correo desde ${email} a ${to}`);
-    console.log(`📨 SMTP Host: ${smtpHost}, IMAP Host: ${imapHost}`);
 
-    try {
-        // 1️⃣ ENVIAR POR SMTP
-        if (!transporterCache[email]) {
-            transporterCache[email] = nodemailer.createTransport({
+    // 1️⃣ Intentar SMTP en puertos 587 (STARTTLS) y 465 (SSL)
+    const portsToTry = smtpPort ? [smtpPort] : [587, 465];
+    let sendError = null;
+
+    for (const port of portsToTry) {
+        try {
+            const transporter = nodemailer.createTransport({
                 host: smtpHost,
-                port: smtpPort || 465,
-                secure: secure !== undefined ? secure : true,
-                pool: true,
-                maxConnections: 5,
+                port: port,
+                secure: port === 465,        // true solo para 465
                 auth: { user: email, pass: password },
-                tls: { rejectUnauthorized: false }
+                tls: { rejectUnauthorized: false },
+                connectionTimeout: 10000,
+                greetingTimeout: 10000,
+                socketTimeout: 10000,
             });
+
+            const info = await transporter.sendMail({
+                from: email,
+                to: to,
+                cc: cc || undefined,
+                bcc: bcc || undefined,
+                subject: subject,
+                html: body,
+            });
+
+            console.log(`✅ Correo enviado por puerto ${port}: ${info.messageId}`);
+            sendError = null;
+            break; // Éxito, salir del bucle
+        } catch (err) {
+            console.log(`❌ Puerto ${port} falló: ${err.message}`);
+            sendError = err;
         }
+    }
 
-        const mailOptions = {
-            from: email,
-            to: to,
-            cc: cc || undefined,
-            bcc: bcc || undefined,
-            subject: subject,
-            html: body,
-        };
+    if (sendError) {
+        return res.status(500).json({ success: false, error: 'Error SMTP: ' + sendError.message });
+    }
 
-        // Enviar en segundo plano para no bloquear
-        transporterCache[email].sendMail(mailOptions)
-            .then(info => console.log(`✅ Correo enviado: ${info.messageId}`))
-            .catch(err => console.error(`❌ Error SMTP: ${err.message}`));
+    // 2️⃣ Guardar copia en Enviados (usando la carpeta real del servidor)
+    const imap = new Imap({
+        user: email,
+        password: password,
+        host: imapHost,
+        port: 993,
+        tls: true,
+        tlsOptions: { rejectUnauthorized: false },
+    });
 
-        // 2️⃣ GUARDAR COPIA EN ENVIADOS VÍA IMAP
-        const imap = new Imap({
-            user: email,
-            password: password,
-            host: imapHost,
-            port: 993,
-            tls: true,
-            tlsOptions: { rejectUnauthorized: false }
-        });
+    imap.once('ready', () => {
+        imap.getBoxes((err, boxes) => {
+            if (err) {
+                console.error('Error obteniendo carpetas:', err);
+                imap.end();
+                return;
+            }
 
-        imap.once('ready', () => {
-            // Intentar carpeta 'Sent' o 'INBOX.Sent'
-            const sentFolder = 'Sent';
-            imap.openBox(sentFolder, false, (err) => {
-                if (err) {
-                    console.log('⚠️ Carpeta "Sent" no encontrada, probando "INBOX.Sent"...');
-                    imap.openBox('INBOX.Sent', false, (err2) => {
-                        if (err2) {
-                            console.log('⚠️ No se pudo abrir carpeta de Enviados, se omite guardado.');
-                            imap.end();
-                            return;
-                        }
-                        guardarEnviados(imap, email, to, subject, body);
-                    });
-                } else {
-                    guardarEnviados(imap, email, to, subject, body);
+            const sentFolder = findSentFolder(boxes);
+            console.log(`📂 Carpeta Enviados detectada: ${sentFolder || 'ninguna, se omite guardado'}`);
+
+            if (!sentFolder) {
+                imap.end();
+                return;
+            }
+
+            imap.openBox(sentFolder, false, (openErr) => {
+                if (openErr) {
+                    console.error('Error abriendo carpeta Enviados:', openErr);
+                    imap.end();
+                    return;
                 }
+
+                const rawMessage = [
+                    `From: ${email}`,
+                    `To: ${to}`,
+                    `Subject: ${subject}`,
+                    `Content-Type: text/html; charset=utf-8`,
+                    '',
+                    body
+                ].join('\r\n');
+
+                imap.append(rawMessage, { mailbox: sentFolder, flags: ['\\Seen'] }, (appendErr) => {
+                    if (appendErr) console.error('Error al guardar en Enviados:', appendErr);
+                    else console.log('✅ Copia guardada en Enviados');
+                    imap.end();
+                });
             });
         });
+    });
 
-        imap.once('error', (err) => {
-            console.error('❌ Error IMAP (guardar enviados):', err.message);
-            imap.end();
-        });
-
-        imap.connect();
-
-        // 3️⃣ RESPONDER INMEDIATAMENTE
-        return res.json({
-            success: true,
-            message: 'Correo aceptado para envío',
-            queued: true
-        });
-    } catch (error) {
-        console.error('❌ Error al encolar correo:', error);
-        return res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// Función auxiliar para guardar en enviados
-function guardarEnviados(imap, email, to, subject, body) {
-    const rawMessage = `From: ${email}\r\nTo: ${to}\r\nSubject: ${subject}\r\nContent-Type: text/html; charset=utf-8\r\n\r\n${body}`;
-    imap.append(rawMessage, { mailbox: 'Sent', flags: ['\\Seen'] }, (err) => {
-        if (err) console.error('❌ Error append a Sent:', err);
-        else console.log('✅ Copia guardada en Enviados');
+    imap.once('error', (err) => {
+        console.error('Error IMAP al guardar en Sent:', err.message);
         imap.end();
     });
+
+    imap.connect();
+
+    // Responder inmediatamente (el guardado en Enviados es en segundo plano)
+    return res.json({ success: true, message: 'Correo enviado correctamente' });
+});
+
+// ------------------------------------------------------------
+//  FUNCIÓN AUXILIAR: buscar carpeta de enviados
+// ------------------------------------------------------------
+function findSentFolder(boxes) {
+    const patterns = [/^sent$/i, /enviado/i, /inbox\.sent/i];
+
+    function search(boxObj, prefix = '') {
+        for (const key in boxObj) {
+            const fullPath = prefix ? `${prefix}${boxObj[key].delimiter}${key}` : key;
+            // Atributos IMAP (\Sent)
+            if (boxObj[key].attribs && boxObj[key].attribs.map(a => a.toLowerCase()).includes('\\sent')) {
+                return fullPath;
+            }
+            // Coincidencia por nombre
+            for (const reg of patterns) {
+                if (reg.test(key) || reg.test(fullPath)) return fullPath;
+            }
+            if (boxObj[key].children) {
+                const found = search(boxObj[key].children, fullPath);
+                if (found) return found;
+            }
+        }
+        return null;
+    }
+
+    return search(boxes);
 }
 
 // ============================================================
@@ -284,7 +324,6 @@ app.post('/api/messages', async (req, res) => {
                 return res.json({ success: true, messages: [], total: 0 });
             }
 
-            // 🔥 Obtener los UIDs más recientes (los últimos `limit` mensajes)
             const end = total - (page - 1) * limit;
             const start = Math.max(1, end - limit + 1);
 
@@ -314,7 +353,7 @@ app.post('/api/messages', async (req, res) => {
                                 subject: parsed.subject || '(Sin asunto)',
                                 from: parsed.from ? parsed.from.text : '',
                                 date: parsed.date ? parsed.date.toISOString() : new Date().toISOString(),
-                                hasAttachments: false // Podríamos mejorarlo
+                                hasAttachments: false
                             });
                             count++;
                         }
@@ -324,7 +363,6 @@ app.post('/api/messages', async (req, res) => {
 
             fetch.once('end', () => {
                 imap.end();
-                // 🔥 Ordenar por fecha descendente (más reciente primero)
                 messages.sort((a, b) => new Date(b.date) - new Date(a.date));
                 res.json({ success: true, messages, total });
             });
@@ -346,7 +384,7 @@ app.post('/api/messages', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  DETALLE DE MENSAJE (con imap nativo)
+//  DETALLE DE MENSAJE
 // ------------------------------------------------------------
 app.post('/api/message-detail', async (req, res) => {
     const { email, password, host, port, secure, folder, uid } = req.body;
@@ -492,7 +530,7 @@ app.post('/api/message-detail', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  DESCUBRIR CARPETAS
+//  DESCUBRIR CARPETAS ESTÁNDAR
 // ------------------------------------------------------------
 app.post('/api/discover-folders', async (req, res) => {
     const { email, password, host, port, secure } = req.body;
@@ -533,7 +571,7 @@ app.post('/api/discover-folders', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  MOVER MENSAJE (Optimistic Delete en frontend, aquí solo ejecuta)
+//  MOVER MENSAJE
 // ------------------------------------------------------------
 app.post('/api/move-message', async (req, res) => {
     const { email, password, host, port, secure, uid, fromFolder, toFolder } = req.body;
@@ -592,10 +630,9 @@ app.post('/api/move-message', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  GUARDAR EN ENVIADOS (ya no se usa desde frontend, pero se mantiene por compatibilidad)
+//  GUARDAR EN ENVIADOS (compatibilidad)
 // ------------------------------------------------------------
 app.post('/api/append-sent', async (req, res) => {
-    // Este endpoint ya no se necesita, pero se deja por si acaso.
     res.json({ success: true, message: 'Deprecado: usar /api/send-email' });
 });
 

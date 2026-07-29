@@ -141,7 +141,6 @@ app.post('/api/message-detail', async (req, res) => {
 
     let responded = false;
 
-    // ✅ CORREGIDO: usar let en lugar de const
     let sendResponse = (data) => {
         if (!responded) {
             responded = true;
@@ -252,7 +251,6 @@ app.post('/api/message-detail', async (req, res) => {
         }
     }, 60000);
 
-    // ✅ CORREGIDO: reasignar sendResponse (ahora es let)
     const originalSend = sendResponse;
     sendResponse = (data) => {
         clearTimeout(timeout);
@@ -267,45 +265,167 @@ app.post('/api/message-detail', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  RESTO DE ENDPOINTS (move, append, delete, toggle, etc.)
+//  DESCUBRIR CARPETAS ESTÁNDAR (Papelera, Spam, Enviados, Borradores)
+// ------------------------------------------------------------
+app.post('/api/discover-folders', async (req, res) => {
+    const { email, password, host, port, secure } = req.body;
+    const client = createImapClient(email, password, host, port, secure);
+
+    try {
+        await client.connect();
+        const mailboxes = await client.list();
+        await client.logout();
+
+        const folderNames = mailboxes.map(m => m.name || m.path);
+
+        const findFolder = (candidates) => {
+            for (const cand of candidates) {
+                const found = folderNames.find(f =>
+                    f.toLowerCase() === cand.toLowerCase() ||
+                    f.toLowerCase().includes(cand.toLowerCase())
+                );
+                if (found) return found;
+            }
+            return null;
+        };
+
+        const result = {
+            trash: findFolder(['Trash', 'Deleted Items', 'Papelera', 'Deleted', 'INBOX.Trash', 'INBOX.Deleted']),
+            spam: findFolder(['Spam', 'Junk', 'Junk Email', 'Correo no deseado', 'INBOX.Spam', 'INBOX.Junk']),
+            sent: findFolder(['Sent', 'Sent Items', 'Enviados', 'INBOX.Sent']),
+            drafts: findFolder(['Drafts', 'Borradores', 'INBOX.Drafts']),
+            all: folderNames
+        };
+
+        console.log('📂 Carpetas descubiertas:', result);
+        res.json({ success: true, folders: result });
+    } catch (error) {
+        console.error('❌ Error /api/discover-folders:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ------------------------------------------------------------
+//  MOVER MENSAJE (con logs y verificación de carpetas)
 // ------------------------------------------------------------
 app.post('/api/move-message', async (req, res) => {
     const { email, password, host, port, secure, uid, fromFolder, toFolder } = req.body;
+
+    console.log(`📤 Mover mensaje UID ${uid} de "${fromFolder}" a "${toFolder}"`);
+
     if (!uid || !fromFolder || !toFolder) {
         return res.status(400).json({ success: false, error: 'Faltan parámetros' });
     }
+
     const client = createImapClient(email, password, host, port, secure);
     try {
         await client.connect();
-        await client.mailboxOpen(fromFolder);
+
+        // Verificar que la carpeta destino existe
+        const mailboxes = await client.list();
+        const folderExists = mailboxes.some(m => m.path === toFolder || m.name === toFolder);
+
+        if (!folderExists) {
+            console.log(`⚠️ La carpeta "${toFolder}" no existe. Intentando crear...`);
+            try {
+                await client.mailboxCreate(toFolder);
+                console.log(`✅ Carpeta "${toFolder}" creada.`);
+            } catch (createError) {
+                console.error(`❌ No se pudo crear "${toFolder}":`, createError.message);
+                // Intentar con un nombre alternativo
+                const alternatives = {
+                    'INBOX.Trash': ['Trash', 'Deleted Items', 'Papelera', 'INBOX.Deleted'],
+                    'INBOX.Spam': ['Spam', 'Junk', 'Junk Email', 'INBOX.Junk']
+                };
+                const altFolders = alternatives[toFolder] || [];
+                let found = false;
+                for (const alt of altFolders) {
+                    if (mailboxes.some(m => m.path === alt || m.name === alt)) {
+                        console.log(`✅ Usando carpeta alternativa: "${alt}"`);
+                        await client.messageMove(uid, alt, { uid: true });
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    console.log(`⚠️ Usando INBOX como destino fallback`);
+                    await client.messageMove(uid, 'INBOX', { uid: true });
+                }
+                await client.logout();
+                return res.json({ success: true, warning: 'Carpeta no encontrada, se usó alternativa' });
+            }
+        }
+
+        // Mover el mensaje
         await client.messageMove(uid, toFolder, { uid: true });
         await client.logout();
+        console.log(`✅ Mensaje UID ${uid} movido a "${toFolder}"`);
         res.json({ success: true });
     } catch (error) {
-        console.error('Error /api/move-message:', error.message);
+        console.error('❌ Error /api/move-message:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
+// ------------------------------------------------------------
+//  GUARDAR EN ENVIADOS (con verificación de carpeta)
+// ------------------------------------------------------------
 app.post('/api/append-sent', async (req, res) => {
     const { email, password, host, port, secure, rawMessage, sentFolderName } = req.body;
+
+    console.log(`📤 Guardando en enviados: "${sentFolderName || 'Sent'}"`);
+
     if (!rawMessage) {
         return res.status(400).json({ success: false, error: 'Falta rawMessage' });
     }
+
     const client = createImapClient(email, password, host, port, secure);
     try {
         await client.connect();
-        const folder = sentFolderName || 'Sent';
+
+        let folder = sentFolderName || 'Sent';
+
+        // Verificar si la carpeta existe
+        const mailboxes = await client.list();
+        const folderExists = mailboxes.some(m => m.path === folder || m.name === folder);
+
+        if (!folderExists) {
+            console.log(`⚠️ La carpeta "${folder}" no existe. Intentando alternativas...`);
+            const alternatives = ['Sent Items', 'Enviados', 'INBOX.Sent', 'Sent Mail'];
+            let found = false;
+            for (const alt of alternatives) {
+                if (mailboxes.some(m => m.path === alt || m.name === alt)) {
+                    folder = alt;
+                    found = true;
+                    console.log(`✅ Usando carpeta alternativa: "${folder}"`);
+                    break;
+                }
+            }
+            if (!found) {
+                try {
+                    await client.mailboxCreate(folder);
+                    console.log(`✅ Carpeta "${folder}" creada.`);
+                } catch (createError) {
+                    console.warn(`⚠️ No se pudo crear "${folder}", guardando en INBOX`);
+                    folder = 'INBOX';
+                }
+            }
+        }
+
         await client.mailboxOpen(folder);
         await client.append(folder, rawMessage, ['\\Seen']);
         await client.logout();
+        console.log(`✅ Mensaje guardado en "${folder}"`);
         res.json({ success: true });
     } catch (error) {
-        console.error('Error /api/append-sent:', error.message);
+        console.error('❌ Error /api/append-sent:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
+// ------------------------------------------------------------
+//  ELIMINAR MENSAJE (PERMANENTE)
+// ------------------------------------------------------------
 app.post('/api/delete-message', async (req, res) => {
     const { email, password, host, port, secure, uid, folder } = req.body;
     if (!uid || !folder) {
@@ -325,6 +445,9 @@ app.post('/api/delete-message', async (req, res) => {
     }
 });
 
+// ------------------------------------------------------------
+//  MARCAR LEÍDO / NO LEÍDO
+// ------------------------------------------------------------
 app.post('/api/toggle-read', async (req, res) => {
     const { email, password, host, port, secure, uid, folder, read } = req.body;
     if (uid == null || !folder) {
@@ -347,6 +470,9 @@ app.post('/api/toggle-read', async (req, res) => {
     }
 });
 
+// ------------------------------------------------------------
+//  MARCAR / DESMARCAR IMPORTANTE (FLAGGED)
+// ------------------------------------------------------------
 app.post('/api/toggle-flagged', async (req, res) => {
     const { email, password, host, port, secure, uid, folder, flagged } = req.body;
     if (uid == null || !folder) {
@@ -369,6 +495,9 @@ app.post('/api/toggle-flagged', async (req, res) => {
     }
 });
 
+// ------------------------------------------------------------
+//  CREAR CARPETA
+// ------------------------------------------------------------
 app.post('/api/create-folder', async (req, res) => {
     const { email, password, host, port, secure, folderName } = req.body;
     if (!folderName) {
@@ -386,6 +515,9 @@ app.post('/api/create-folder', async (req, res) => {
     }
 });
 
+// ------------------------------------------------------------
+//  BORRAR CARPETA
+// ------------------------------------------------------------
 app.post('/api/delete-folder', async (req, res) => {
     const { email, password, host, port, secure, folderName } = req.body;
     if (!folderName) {
@@ -403,6 +535,9 @@ app.post('/api/delete-folder', async (req, res) => {
     }
 });
 
+// ------------------------------------------------------------
+//  DESCARGAR ADJUNTO (por partId)
+// ------------------------------------------------------------
 app.post('/api/download-attachment', async (req, res) => {
     const { email, password, host, port, secure, folder, uid, partId } = req.body;
     if (!uid || !folder || !partId) {

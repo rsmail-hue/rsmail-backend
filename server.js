@@ -13,9 +13,16 @@ const insecureTls = {
     checkServerIdentity: () => undefined
 };
 
-// ============================================================
-//  FUNCIÓN DE AYUDA: crear cliente ImapFlow con timeouts
-// ============================================================
+// ------------------------------------------------------------
+//  PING
+// ------------------------------------------------------------
+app.get('/ping', (req, res) => {
+    res.json({ alive: true, time: new Date().toISOString() });
+});
+
+// ------------------------------------------------------------
+//  FUNCIÓN DE AYUDA: crear cliente IMAP con reconexión
+// ------------------------------------------------------------
 function createImapClient(email, password, host, port, secure) {
     return new ImapFlow({
         host: host || 'imap.gmail.com',
@@ -29,127 +36,39 @@ function createImapClient(email, password, host, port, secure) {
     });
 }
 
-// ============================================================
-//  PING
-// ============================================================
-app.get('/ping', (req, res) => {
-    res.json({ alive: true, time: new Date().toISOString() });
-});
-
-// ============================================================
-//  OBTENER CARPETAS (usando imap nativo para mayor fiabilidad)
-// ============================================================
+// ------------------------------------------------------------
+//  OBTENER CARPETAS (con reintentos)
+// ------------------------------------------------------------
 app.post('/api/folders', async (req, res) => {
     const { email, password, host, port, secure } = req.body;
+    const client = createImapClient(email, password, host, port, secure);
 
-    if (!email || !password) {
-        return res.status(400).json({ error: 'Faltan credenciales' });
+    let attempts = 0;
+    while (attempts < 3) {
+        try {
+            await client.connect();
+            const mailboxes = await client.list();
+            await client.logout();
+            const folders = mailboxes.map(mbox => ({
+                name: mbox.name,
+                path: mbox.path,
+                specialUse: mbox.specialUse
+            }));
+            return res.json({ success: true, folders });
+        } catch (error) {
+            attempts++;
+            console.error(`❌ Intento ${attempts} /api/folders falló:`, error.message);
+            if (attempts >= 3) {
+                return res.status(500).json({ success: false, error: error.message });
+            }
+            await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
+        }
     }
-
-    const imap = new Imap({
-        user: email,
-        password: password,
-        host: host || 'imap.gmail.com',
-        port: port || 993,
-        tls: secure !== undefined ? secure : true,
-        tlsOptions: { rejectUnauthorized: false },
-        connTimeout: 60000,
-        keepalive: true
-    });
-
-    let responded = false;
-
-    const sendResponse = (data) => {
-        if (!responded) {
-            responded = true;
-            res.json(data);
-        }
-    };
-
-    const sendError = (msg) => {
-        if (!responded) {
-            responded = true;
-            res.status(500).json({ success: false, error: msg });
-        }
-    };
-
-    imap.once('ready', () => {
-        // Obtener todas las carpetas (incluyendo las que empiezan con INBOX.)
-        imap.getBoxes((err, boxes) => {
-            imap.end();
-            if (err) {
-                console.error('Error al obtener carpetas:', err);
-                return sendError('Error al obtener carpetas: ' + err.message);
-            }
-
-            const folders = [];
-            const processBox = (box, path) => {
-                const name = path || box.name;
-                folders.push({
-                    name: name,
-                    path: name,
-                    specialUse: box.specialUse || []
-                });
-                if (box.children) {
-                    for (const childName in box.children) {
-                        const child = box.children[childName];
-                        const childPath = path ? path + '.' + childName : childName;
-                        processBox(child, childPath);
-                    }
-                }
-            };
-
-            // Procesar la raíz
-            for (const boxName in boxes) {
-                processBox(boxes[boxName], boxName);
-            }
-
-            // Si no hay carpetas, al menos devolver INBOX
-            if (folders.length === 0) {
-                folders.push({
-                    name: 'INBOX',
-                    path: 'INBOX',
-                    specialUse: []
-                });
-            }
-
-            console.log(`📁 Carpetas encontradas: ${folders.length}`);
-            folders.forEach(f => console.log(`  - ${f.path}`));
-
-            sendResponse({ success: true, folders });
-        });
-    });
-
-    imap.once('error', (err) => {
-        console.error('IMAP error:', err);
-        sendError('Error de conexión IMAP: ' + err.message);
-    });
-
-    // Timeout general
-    const timeout = setTimeout(() => {
-        if (!responded) {
-            sendError('Timeout al conectar con el servidor IMAP');
-            imap.end();
-        }
-    }, 30000);
-
-    // Limpiar timeout si se responde antes
-    const originalSend = sendResponse;
-    sendResponse = (data) => {
-        clearTimeout(timeout);
-        originalSend(data);
-    };
-    sendError = (msg) => {
-        clearTimeout(timeout);
-        originalSend({ success: false, error: msg });
-    };
-
-    imap.connect();
 });
 
-// ============================================================
-//  OBTENER LISTA DE MENSAJES (con reintentos)
-// ============================================================
+// ------------------------------------------------------------
+//  OBTENER LISTA DE MENSAJES (con reintentos y límite)
+// ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, secure, folder } = req.body;
     const client = createImapClient(email, password, host, port, secure);
@@ -199,9 +118,9 @@ app.post('/api/messages', async (req, res) => {
     }
 });
 
-// ============================================================
+// ------------------------------------------------------------
 //  DETALLE DE MENSAJE (con imap nativo para stream completo)
-// ============================================================
+// ------------------------------------------------------------
 app.post('/api/message-detail', async (req, res) => {
     const { email, password, host, port, secure, folder, uid } = req.body;
 
@@ -222,14 +141,15 @@ app.post('/api/message-detail', async (req, res) => {
 
     let responded = false;
 
-    const sendResponse = (data) => {
+    // ✅ CORREGIDO: usar let en lugar de const
+    let sendResponse = (data) => {
         if (!responded) {
             responded = true;
             res.json(data);
         }
     };
 
-    const sendError = (msg) => {
+    let sendError = (msg) => {
         if (!responded) {
             responded = true;
             res.status(500).json({ error: msg });
@@ -332,6 +252,7 @@ app.post('/api/message-detail', async (req, res) => {
         }
     }, 60000);
 
+    // ✅ CORREGIDO: reasignar sendResponse (ahora es let)
     const originalSend = sendResponse;
     sendResponse = (data) => {
         clearTimeout(timeout);
@@ -345,9 +266,9 @@ app.post('/api/message-detail', async (req, res) => {
     imap.connect();
 });
 
-// ============================================================
-//  RESTO DE ENDPOINTS (con manejo de errores mejorado)
-// ============================================================
+// ------------------------------------------------------------
+//  RESTO DE ENDPOINTS (move, append, delete, toggle, etc.)
+// ------------------------------------------------------------
 app.post('/api/move-message', async (req, res) => {
     const { email, password, host, port, secure, uid, fromFolder, toFolder } = req.body;
     if (!uid || !fromFolder || !toFolder) {
@@ -504,9 +425,9 @@ app.post('/api/download-attachment', async (req, res) => {
     }
 });
 
-// ============================================================
+// ------------------------------------------------------------
 //  INICIAR SERVIDOR
-// ============================================================
+// ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`✅ Backend de RSMAIL corriendo en puerto ${PORT}`);

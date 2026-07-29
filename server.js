@@ -3,6 +3,7 @@ const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
 const cors = require('cors');
 const Imap = require('imap');
+const nodemailer = require('nodemailer'); // <-- NUEVO
 
 const app = express();
 app.use(cors());
@@ -20,6 +21,64 @@ app.get('/ping', (req, res) => {
     res.json({ alive: true, time: new Date().toISOString() });
 });
 
+// ============================================================
+//  NUEVO: ENVIAR CORREO VÍA BACKEND (usa nodemailer)
+// ============================================================
+app.post('/api/send-email', async (req, res) => {
+    let { email, password, smtpHost, smtpPort, secure, to, subject, body, cc, bcc } = req.body;
+
+    // 🔥 Normalizar host SMTP: si es smtp. o está vacío, usar mail.dominio
+    if (!smtpHost || smtpHost.startsWith('smtp.')) {
+        const domain = email.split('@')[1];
+        if (domain) {
+            smtpHost = `mail.${domain}`;
+            console.log(`📤 Host SMTP normalizado a: ${smtpHost}`);
+        }
+    }
+
+    // Si el puerto no viene, usar 465 por defecto (SSL)
+    if (!smtpPort) smtpPort = 465;
+    // Si secure no viene, usar true (SSL)
+    if (secure === undefined) secure = true;
+
+    console.log(`📤 Enviando correo desde ${email} a ${to} vía ${smtpHost}:${smtpPort}`);
+
+    try {
+        const transporter = nodemailer.createTransport({
+            host: smtpHost,
+            port: smtpPort,
+            secure: secure, // true para 465, false para 587
+            auth: {
+                user: email,
+                pass: password,
+            },
+            tls: {
+                rejectUnauthorized: false, // Ignorar errores de certificado
+            },
+        });
+
+        const mailOptions = {
+            from: email,
+            to: to,
+            cc: cc || undefined,
+            bcc: bcc || undefined,
+            subject: subject,
+            html: body,
+        };
+
+        const info = await transporter.sendMail(mailOptions);
+        console.log('✅ Correo enviado:', info.messageId);
+        res.json({ success: true, messageId: info.messageId });
+    } catch (error) {
+        console.error('❌ Error enviando correo:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ============================================================
+//  RESTO DE ENDPOINTS (IMAP)
+// ============================================================
+
 // ------------------------------------------------------------
 //  FUNCIÓN DE AYUDA: crear cliente IMAP con reconexión
 // ------------------------------------------------------------
@@ -34,18 +93,6 @@ function createImapClient(email, password, host, port, secure) {
         connectionTimeout: 60000,
         socketTimeout: 120000,
     });
-}
-
-// ------------------------------------------------------------
-//  FUNCIÓN PARA NORMALIZAR HOSTS (corrige smtp.dominio -> mail.dominio)
-// ------------------------------------------------------------
-function normalizeHost(email, host) {
-    if (!host) return null;
-    if (host.startsWith('smtp.')) {
-        const domain = email.split('@')[1];
-        if (domain) return `mail.${domain}`;
-    }
-    return host;
 }
 
 // ------------------------------------------------------------
@@ -382,7 +429,6 @@ app.post('/api/move-message', async (req, res) => {
 app.post('/api/append-sent', async (req, res) => {
     const { email, password, host, port, secure, rawMessage, sentFolderName } = req.body;
 
-    // Normalizar host si viene con 'smtp.'
     const normalizedHost = normalizeHost(email, host);
 
     console.log(`📤 Guardando en enviados con host: ${normalizedHost || host}`);
@@ -434,6 +480,16 @@ app.post('/api/append-sent', async (req, res) => {
         res.status(500).json({ success: false, error: error.message });
     }
 });
+
+// Función auxiliar para normalizar host
+function normalizeHost(email, host) {
+    if (!host) return null;
+    if (host.startsWith('smtp.')) {
+        const domain = email.split('@')[1];
+        if (domain) return `mail.${domain}`;
+    }
+    return host;
+}
 
 // ------------------------------------------------------------
 //  ELIMINAR MENSAJE (PERMANENTE)

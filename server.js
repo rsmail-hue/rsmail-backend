@@ -15,7 +15,72 @@ const insecureTls = {
 };
 
 // ============================================================
-//  NUEVO ENDPOINT: /api/login (autenticación IMAP vía backend)
+//  CONNECTION POOL PARA SMTP (reutilizar conexiones)
+// ============================================================
+let transporterCache = {};
+
+// ============================================================
+//  ENVIAR CORREO VÍA BACKEND (con Pooling y respuesta inmediata)
+// ============================================================
+app.post('/api/send-email', async (req, res) => {
+    let { email, password, smtpHost, smtpPort, secure, to, subject, body, cc, bcc } = req.body;
+
+    // Normalizar host SMTP (smtp. -> mail.)
+    if (!smtpHost || smtpHost.includes('smtp.rsmicro.es')) {
+        const domain = email.split('@')[1];
+        smtpHost = `mail.${domain}`;
+    }
+
+    console.log(`📨 Enviando correo desde ${email} a ${to}`);
+    console.log(`📨 SMTP Host: ${smtpHost}, Puerto: ${smtpPort || 465}`);
+
+    try {
+        // 🔥 Reutilizar transporter si ya existe
+        if (!transporterCache[email]) {
+            console.log(`📨 Creando nuevo transporter para ${email}`);
+            transporterCache[email] = nodemailer.createTransport({
+                host: smtpHost,
+                port: smtpPort || 465,
+                secure: secure !== undefined ? secure : true,
+                pool: true,              // 🔥 Mantiene conexión abierta
+                maxConnections: 5,       // 🔥 Permite envíos paralelos
+                auth: { user: email, pass: password },
+                tls: { rejectUnauthorized: false }
+            });
+        }
+
+        const mailOptions = {
+            from: email,
+            to: to,
+            cc: cc || undefined,
+            bcc: bcc || undefined,
+            subject: subject,
+            html: body,
+        };
+
+        // 🔥 Enviar en segundo plano (sin await) para responder inmediato
+        transporterCache[email].sendMail(mailOptions)
+            .then(info => {
+                console.log(`✅ Correo enviado: ${info.messageId}`);
+            })
+            .catch(err => {
+                console.error(`❌ Error enviando correo (en background): ${err.message}`);
+            });
+
+        // 🔥 Responder inmediatamente a Flutter (sin esperar confirmación SMTP)
+        return res.json({
+            success: true,
+            message: 'Correo aceptado para envío',
+            queued: true
+        });
+    } catch (error) {
+        console.error('❌ Error al encolar correo:', error);
+        return res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ============================================================
+//  LOGIN (autenticación IMAP vía backend)
 // ============================================================
 app.post('/api/login', (req, res) => {
     const { email, password } = req.body;
@@ -24,12 +89,10 @@ app.post('/api/login', (req, res) => {
         return res.status(400).json({ success: false, error: 'Email y contraseña requeridos' });
     }
 
-    // Extraer dominio para configurar servidores automáticamente
     const domain = email.split('@')[1];
     let imapHost = 'mail.' + domain;
     let smtpHost = 'mail.' + domain;
 
-    // Proveedores conocidos
     if (domain === 'gmail.com') {
         imapHost = 'imap.gmail.com';
         smtpHost = 'smtp.gmail.com';
@@ -52,7 +115,7 @@ app.post('/api/login', (req, res) => {
         host: imapHost,
         port: 993,
         tls: true,
-        tlsOptions: { rejectUnauthorized: false } // 🔥 Ignorar error de certificado
+        tlsOptions: { rejectUnauthorized: false }
     });
 
     let responded = false;
@@ -88,7 +151,6 @@ app.post('/api/login', (req, res) => {
         imap.end();
     });
 
-    // Timeout
     const timeout = setTimeout(() => {
         if (!responded) {
             responded = true;
@@ -124,49 +186,7 @@ function createImapClient(email, password, host, port, secure) {
 }
 
 // ------------------------------------------------------------
-//  ENVIAR CORREO VÍA BACKEND (nodemailer)
-// ------------------------------------------------------------
-app.post('/api/send-email', async (req, res) => {
-    let { email, password, smtpHost, smtpPort, secure, to, subject, body, cc, bcc } = req.body;
-
-    if (!smtpHost || smtpHost.startsWith('smtp.')) {
-        const domain = email.split('@')[1];
-        if (domain) {
-            smtpHost = `mail.${domain}`;
-            console.log(`📤 Host SMTP normalizado a: ${smtpHost}`);
-        }
-    }
-    if (!smtpPort) smtpPort = 465;
-    if (secure === undefined) secure = true;
-
-    console.log(`📤 Enviando correo desde ${email} a ${to} vía ${smtpHost}:${smtpPort}`);
-
-    try {
-        const transporter = nodemailer.createTransport({
-            host: smtpHost,
-            port: smtpPort,
-            secure: secure,
-            auth: { user: email, pass: password },
-            tls: { rejectUnauthorized: false },
-        });
-        const info = await transporter.sendMail({
-            from: email,
-            to: to,
-            cc: cc || undefined,
-            bcc: bcc || undefined,
-            subject: subject,
-            html: body,
-        });
-        console.log('✅ Correo enviado:', info.messageId);
-        res.json({ success: true, messageId: info.messageId });
-    } catch (error) {
-        console.error('❌ Error enviando correo:', error);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// ------------------------------------------------------------
-//  OBTENER CARPETAS (con reintentos)
+//  OBTENER CARPETAS
 // ------------------------------------------------------------
 app.post('/api/folders', async (req, res) => {
     const { email, password, host, port, secure } = req.body;
@@ -248,7 +268,7 @@ app.post('/api/messages', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  DETALLE DE MENSAJE (con imap nativo)
+//  DETALLE DE MENSAJE
 // ------------------------------------------------------------
 app.post('/api/message-detail', async (req, res) => {
     const { email, password, host, port, secure, folder, uid } = req.body;
@@ -544,7 +564,7 @@ app.post('/api/append-sent', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  ELIMINAR MENSAJE
+//  ELIMINAR MENSAJE (mover a papelera)
 // ------------------------------------------------------------
 app.post('/api/delete-message', async (req, res) => {
     const { email, password, host, port, secure, uid, folder } = req.body;

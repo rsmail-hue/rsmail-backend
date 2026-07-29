@@ -265,7 +265,7 @@ app.post('/api/message-detail', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  DESCUBRIR CARPETAS ESTÁNDAR (Papelera, Spam, Enviados, Borradores)
+//  DESCUBRIR CARPETAS ESTÁNDAR
 // ------------------------------------------------------------
 app.post('/api/discover-folders', async (req, res) => {
     const { email, password, host, port, secure } = req.body;
@@ -321,7 +321,6 @@ app.post('/api/move-message', async (req, res) => {
     try {
         await client.connect();
 
-        // Verificar que la carpeta destino existe
         const mailboxes = await client.list();
         const folderExists = mailboxes.some(m => m.path === toFolder || m.name === toFolder);
 
@@ -332,7 +331,6 @@ app.post('/api/move-message', async (req, res) => {
                 console.log(`✅ Carpeta "${toFolder}" creada.`);
             } catch (createError) {
                 console.error(`❌ No se pudo crear "${toFolder}":`, createError.message);
-                // Intentar con un nombre alternativo
                 const alternatives = {
                     'INBOX.Trash': ['Trash', 'Deleted Items', 'Papelera', 'INBOX.Deleted'],
                     'INBOX.Spam': ['Spam', 'Junk', 'Junk Email', 'INBOX.Junk']
@@ -356,7 +354,6 @@ app.post('/api/move-message', async (req, res) => {
             }
         }
 
-        // Mover el mensaje
         await client.messageMove(uid, toFolder, { uid: true });
         await client.logout();
         console.log(`✅ Mensaje UID ${uid} movido a "${toFolder}"`);
@@ -385,7 +382,6 @@ app.post('/api/append-sent', async (req, res) => {
 
         let folder = sentFolderName || 'Sent';
 
-        // Verificar si la carpeta existe
         const mailboxes = await client.list();
         const folderExists = mailboxes.some(m => m.path === folder || m.name === folder);
 

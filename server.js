@@ -9,9 +9,9 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// ------------------------------------------------------------
+// ============================================================
 //  AUTO-CONFIGURACIÓN DE SERVIDORES
-// ------------------------------------------------------------
+// ============================================================
 function getAutoConfig(email) {
     const domain = email.split('@')[1]?.toLowerCase();
     if (!domain) return null;
@@ -53,7 +53,7 @@ app.post('/api/folders', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  OBTENER MENSAJES (ImapFlow con reverse, siempre recientes primero)
+//  OBTENER MENSAJES (más recientes primero)
 // ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, folder = 'INBOX', limit = 30 } = req.body;
@@ -88,7 +88,7 @@ app.post('/api/message-detail', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  GUARDAR EN ENVIADOS
+//  GUARDAR EN ENVIADOS (usado tras envío desde dispositivo)
 // ------------------------------------------------------------
 app.post('/api/save-to-sent', async (req, res) => {
     const { email, password, host, rawMessage } = req.body;
@@ -110,7 +110,7 @@ app.post('/api/save-to-sent', async (req, res) => {
 function findSentFolder(boxes) { const patterns = [/^sent$/i, /enviado/i, /inbox\.sent/i]; function search(boxObj, prefix = '') { for (const key in boxObj) { const fullPath = prefix ? `${prefix}${boxObj[key].delimiter}${key}` : key; if (boxObj[key].attribs && boxObj[key].attribs.map(a => a.toLowerCase()).includes('\\sent')) return fullPath; for (const reg of patterns) if (reg.test(key) || reg.test(fullPath)) return fullPath; if (boxObj[key].children) { const found = search(boxObj[key].children, fullPath); if (found) return found; } } return null; } return search(boxes); }
 
 // ------------------------------------------------------------
-//  MOVER MENSAJE
+//  MOVER MENSAJE (genérico)
 // ------------------------------------------------------------
 app.post('/api/move-message', async (req, res) => {
     const { email, password, host, port, uid, fromFolder, toFolder } = req.body;
@@ -121,7 +121,7 @@ app.post('/api/move-message', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  RESTO DE ENDPOINTS (delete-message, toggle-read, etc.)
+//  ELIMINAR MENSAJE (permanente)
 // ------------------------------------------------------------
 app.post('/api/delete-message', async (req, res) => {
     const { email, password, host, port, uid, folder } = req.body;
@@ -131,6 +131,9 @@ app.post('/api/delete-message', async (req, res) => {
     try { await client.connect(); await client.messageDelete(uid, { uid: true }); await client.expunge(); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
+// ------------------------------------------------------------
+//  MARCAR LEÍDO / NO LEÍDO
+// ------------------------------------------------------------
 app.post('/api/toggle-read', async (req, res) => {
     const { email, password, host, port, uid, folder, read } = req.body;
     if (uid == null || !folder) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
@@ -139,6 +142,9 @@ app.post('/api/toggle-read', async (req, res) => {
     try { await client.connect(); if (read) await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true }); else await client.messageFlagsRemove(uid, ['\\Seen'], { uid: true }); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
+// ------------------------------------------------------------
+//  MARCAR IMPORTANTE
+// ------------------------------------------------------------
 app.post('/api/toggle-flagged', async (req, res) => {
     const { email, password, host, port, uid, folder, flagged } = req.body;
     if (uid == null || !folder) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
@@ -147,6 +153,9 @@ app.post('/api/toggle-flagged', async (req, res) => {
     try { await client.connect(); if (flagged) await client.messageFlagsAdd(uid, ['\\Flagged'], { uid: true }); else await client.messageFlagsRemove(uid, ['\\Flagged'], { uid: true }); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
+// ------------------------------------------------------------
+//  CREAR / BORRAR CARPETA
+// ------------------------------------------------------------
 app.post('/api/create-folder', async (req, res) => {
     const { email, password, host, port, folderName } = req.body;
     if (!folderName) return res.status(400).json({ success: false, error: 'Falta folderName' });
@@ -163,6 +172,9 @@ app.post('/api/delete-folder', async (req, res) => {
     try { await client.connect(); await client.mailboxDelete(folderName); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
+// ------------------------------------------------------------
+//  DESCARGAR ADJUNTO
+// ------------------------------------------------------------
 app.post('/api/download-attachment', async (req, res) => {
     const { email, password, host, port, folder, uid, partId } = req.body;
     if (!uid || !folder || !partId) return res.status(400).json({ success: false, error: 'Faltan parámetros' });

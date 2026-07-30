@@ -10,7 +10,7 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 // ------------------------------------------------------------
-//  AUTO-CONFIGURACIÓN DE SERVIDORES (Outlook‑like)
+//  AUTO-CONFIGURACIÓN DE SERVIDORES (Outlook-like & Custom)
 // ------------------------------------------------------------
 function getAutoConfig(email) {
     const domain = email.split('@')[1]?.toLowerCase();
@@ -23,26 +23,80 @@ function getAutoConfig(email) {
 }
 
 // ------------------------------------------------------------
-//  LOGIN
+//  MANEJO DE LOGIN Y VERIFICACIÓN (Alias /api/verify y /api/login)
 // ------------------------------------------------------------
-app.post('/api/login', (req, res) => {
-    const { email, password } = req.body;
+const handleAuth = (req, res) => {
+    const { email, password, host, port } = req.body;
     if (!email || !password) return res.status(400).json({ success: false, error: 'Email y contraseña requeridos' });
+
     const auto = getAutoConfig(email);
-    const imap = new Imap({ user: email, password, host: auto.imapHost, port: auto.imapPort, tls: true, tlsOptions: { rejectUnauthorized: false } });
-    let responded = false;
-    imap.once('ready', () => {
-        if (!responded) { responded = true; imap.end(); res.json({ success: true, message: 'Autenticación exitosa', account: { email, password, imapHost: auto.imapHost, imapPort: auto.imapPort, imapSecurity: 'ssl', smtpHost: auto.smtpHost, smtpPort: auto.smtpPort, smtpSecurity: auto.smtpPort === 465 ? 'ssl' : 'starttls' } }); }
+    const targetHost = host || auto.imapHost;
+    const targetPort = Number(port) || auto.imapPort;
+
+    const imap = new Imap({
+        user: email,
+        password,
+        host: targetHost,
+        port: targetPort,
+        tls: true,
+        tlsOptions: { rejectUnauthorized: false }
     });
-    imap.once('error', (err) => { if (!responded) { responded = true; imap.end(); res.status(401).json({ success: false, error: 'Credenciales inválidas: ' + err.message }); } });
-    const timeout = setTimeout(() => { if (!responded) { res.status(408).json({ success: false, error: 'Timeout' }); imap.end(); } }, 15000);
+
+    let responded = false;
+
+    imap.once('ready', () => {
+        if (!responded) {
+            responded = true;
+            imap.end();
+            return res.json({
+                success: true,
+                message: 'Autenticación exitosa',
+                account: {
+                    email,
+                    password,
+                    imapHost: targetHost,
+                    imapPort: targetPort,
+                    imapSecurity: 'ssl',
+                    smtpHost: auto.smtpHost,
+                    smtpPort: auto.smtpPort,
+                    smtpSecurity: auto.smtpPort === 465 ? 'ssl' : 'starttls'
+                },
+                config: {
+                    imapHost: targetHost,
+                    imapPort: targetPort,
+                    smtpHost: auto.smtpHost,
+                    smtpPort: auto.smtpPort
+                }
+            });
+        }
+    });
+
+    imap.once('error', (err) => {
+        if (!responded) {
+            responded = true;
+            imap.end();
+            return res.status(401).json({ success: false, error: 'Credenciales inválidas: ' + err.message });
+        }
+    });
+
+    setTimeout(() => {
+        if (!responded) {
+            responded = true;
+            imap.end();
+            return res.status(408).json({ success: false, error: 'Timeout de conexión IMAP' });
+        }
+    }, 15000);
+
     imap.connect();
-});
+};
+
+app.post('/api/login', handleAuth);
+app.post('/api/verify', handleAuth);
 
 app.get('/ping', (req, res) => res.json({ alive: true }));
 
 // ------------------------------------------------------------
-//  OBTENER CARPETAS (devuelve path y specialUse)
+//  OBTENER CARPETAS
 // ------------------------------------------------------------
 app.post('/api/folders', async (req, res) => {
     const { email, password, host, port } = req.body;
@@ -53,7 +107,7 @@ app.post('/api/folders', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  OBTENER MENSAJES (más recientes primero gracias a reverse)
+//  OBTENER MENSAJES
 // ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, folder = 'INBOX', limit = 30 } = req.body;
@@ -88,7 +142,7 @@ app.post('/api/message-detail', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  GUARDAR EN ENVIADOS (usado tras envío desde el dispositivo)
+//  GUARDAR EN ENVIADOS
 // ------------------------------------------------------------
 app.post('/api/save-to-sent', async (req, res) => {
     const { email, password, host, rawMessage } = req.body;
@@ -110,7 +164,7 @@ app.post('/api/save-to-sent', async (req, res) => {
 function findSentFolder(boxes) { const patterns = [/^sent$/i, /enviado/i, /inbox\.sent/i]; function search(boxObj, prefix = '') { for (const key in boxObj) { const fullPath = prefix ? `${prefix}${boxObj[key].delimiter}${key}` : key; if (boxObj[key].attribs && boxObj[key].attribs.map(a => a.toLowerCase()).includes('\\sent')) return fullPath; for (const reg of patterns) if (reg.test(key) || reg.test(fullPath)) return fullPath; if (boxObj[key].children) { const found = search(boxObj[key].children, fullPath); if (found) return found; } } return null; } return search(boxes); }
 
 // ------------------------------------------------------------
-//  MOVER MENSAJE (genérico)
+//  MOVER MENSAJE
 // ------------------------------------------------------------
 app.post('/api/move-message', async (req, res) => {
     const { email, password, host, port, uid, fromFolder, toFolder } = req.body;
@@ -121,7 +175,7 @@ app.post('/api/move-message', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  ELIMINAR MENSAJE (permanente)
+//  ELIMINAR MENSAJE
 // ------------------------------------------------------------
 app.post('/api/delete-message', async (req, res) => {
     const { email, password, host, port, uid, folder } = req.body;

@@ -23,7 +23,7 @@ function getAutoConfig(email) {
 }
 
 // ------------------------------------------------------------
-//  1. LOGIN / VERIFICACIÓN (Multiruta /api/verify y /api/login)
+//  1. LOGIN / VERIFICACIÓN
 // ------------------------------------------------------------
 const handleAuth = (req, res) => {
     const { email, password, host, port } = req.body;
@@ -43,7 +43,6 @@ const handleAuth = (req, res) => {
     });
 
     let responded = false;
-
     imap.once('ready', () => {
         if (!responded) {
             responded = true;
@@ -96,7 +95,7 @@ app.post('/api/verify', handleAuth);
 app.get('/ping', (req, res) => res.json({ alive: true }));
 
 // ------------------------------------------------------------
-//  2. ENVÍO DE CORREO SMTP DESDE BACKEND (Opcional / Respaldo)
+//  2. ENVÍO DE CORREO SMTP DESDE BACKEND (Opcional)
 // ------------------------------------------------------------
 app.post('/api/send-email', async (req, res) => {
     const { email, password, host, port, to, subject, body, attachments } = req.body;
@@ -111,9 +110,7 @@ app.post('/api/send-email', async (req, res) => {
         port: smtpPort,
         secure: smtpPort === 465,
         auth: { user: email, pass: password },
-        tls: {
-            rejectUnauthorized: false
-        }
+        tls: { rejectUnauthorized: false }
     });
 
     try {
@@ -127,73 +124,61 @@ app.post('/api/send-email', async (req, res) => {
                 content: Buffer.from(att.content, 'base64')
             })) : []
         };
-
-        const info = await transporter.sendMail(mailOptions);
-        res.json({ success: true, messageId: info.messageId });
+        await transporter.sendMail(mailOptions);
+        res.json({ success: true });
     } catch (err) {
-        res.status(500).json({ success: false, error: 'Error al enviar correo: ' + err.message });
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 
 // ------------------------------------------------------------
-//  3. GUARDAR EN ENVIADOS (Tras envío directo desde el dispositivo)
+//  3. GUARDAR EN ENVIADOS (optimizado)
 // ------------------------------------------------------------
 app.post('/api/save-to-sent', async (req, res) => {
-    const { email, password, host, rawMessage } = req.body;
-    if (!email || !password || !rawMessage) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
+    const { email, password, host, port, to, subject, body } = req.body;
+    if (!email || !password) return res.status(400).json({ success: false, error: 'Parámetros insuficientes' });
 
     const auto = getAutoConfig(email);
-    const imapHost = host || auto.imapHost;
-    const imap = new Imap({
-        user: email,
-        password,
-        host: imapHost,
-        port: 993,
-        tls: true,
-        tlsOptions: { rejectUnauthorized: false }
+    const client = new ImapFlow({
+        host: host || auto.imapHost,
+        port: Number(port) || auto.imapPort,
+        secure: true,
+        auth: { user: email, pass: password },
+        logger: false,
+        tls: { rejectUnauthorized: false }
     });
 
-    imap.once('ready', () => {
-        imap.getBoxes((err, boxes) => {
-            if (err) {
-                imap.end();
-                return res.status(500).json({ error: 'Error obteniendo carpetas' });
-            }
-            const sentFolder = findSentFolder(boxes) || 'INBOX.Sent';
-            imap.openBox(sentFolder, false, (openErr) => {
-                if (openErr) {
-                    imap.end();
-                    return res.status(500).json({ error: 'Error abriendo carpeta Enviados' });
-                }
-                imap.append(rawMessage, { mailbox: sentFolder, flags: ['\\Seen'] }, (appendErr) => {
-                    imap.end();
-                    if (appendErr) return res.status(500).json({ error: appendErr.message });
-                    res.json({ success: true, message: 'Guardado en Enviados' });
-                });
-            });
-        });
-    });
+    try {
+        await client.connect();
+        const list = await client.list();
 
-    imap.once('error', (err) => res.status(500).json({ error: err.message }));
-    imap.connect();
-});
+        // Localizar carpeta de Enviados
+        let sentFolder = list.find(f =>
+            f.specialUse === '\\Sent' ||
+            /^sent$/i.test(f.name) ||
+            /enviad/i.test(f.name) ||
+            /inbox\.sent/i.test(f.path)
+        )?.path || 'INBOX.Sent';
 
-function findSentFolder(boxes) {
-    const patterns = [/^sent$/i, /enviado/i, /inbox\.sent/i];
-    function search(boxObj, prefix = '') {
-        for (const key in boxObj) {
-            const fullPath = prefix ? `${prefix}${boxObj[key].delimiter}${key}` : key;
-            if (boxObj[key].attribs && boxObj[key].attribs.map(a => a.toLowerCase()).includes('\\sent')) return fullPath;
-            for (const reg of patterns) if (reg.test(key) || reg.test(fullPath)) return fullPath;
-            if (boxObj[key].children) {
-                const found = search(boxObj[key].children, fullPath);
-                if (found) return found;
-            }
-        }
-        return null;
+        // Construir email en formato RFC822
+        const rawEmail = [
+            `From: ${email}`,
+            `To: ${to || ''}`,
+            `Subject: ${subject || '(Sin asunto)'}`,
+            `Date: ${new Date().toUTCString()}`,
+            `Content-Type: text/html; charset=utf-8`,
+            '',
+            body || ''
+        ].join('\r\n');
+
+        await client.append(sentFolder, Buffer.from(rawEmail), ['\\Seen']);
+        await client.logout();
+
+        res.json({ success: true, message: 'Guardado en Enviados' });
+    } catch (e) {
+        res.status(500).json({ success: false, error: 'Error al guardar en Enviados: ' + e.message });
     }
-    return search(boxes);
-}
+});
 
 // ------------------------------------------------------------
 //  4. OBTENER CARPETAS
@@ -208,24 +193,32 @@ app.post('/api/folders', async (req, res) => {
         await client.logout();
         const folders = list.map(f => ({ name: f.name, path: f.path, specialUse: f.specialUse || '' }));
         res.json({ success: true, folders });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
+    } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
 // ------------------------------------------------------------
-//  5. OBTENER MENSAJES (Ordenados estrictamente por fecha)
+//  5. OBTENER MENSAJES (optimizado – solo encabezados, carga rápida)
 // ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
-    const { email, password, host, port, folder = 'INBOX', limit = 30 } = req.body;
+    const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
     const auto = getAutoConfig(email);
-    const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+    const client = new ImapFlow({
+        host: host || auto.imapHost,
+        port: Number(port) || auto.imapPort,
+        secure: true,
+        auth: { user: email, pass: password },
+        logger: false,
+        tls: { rejectUnauthorized: false }
+    });
+
     try {
         await client.connect();
         const lock = await client.getMailboxLock(folder);
         const messages = [];
+
         try {
-            for await (const msg of client.fetch('1:*', { envelope: true, bodyStructure: true }, { max: limit, reverse: true })) {
+            // Solo pedimos el sobre (envelope), sin bodyStructure → mucho más rápido
+            for await (const msg of client.fetch('1:*', { envelope: true }, { max: limit, reverse: true })) {
                 messages.push({
                     uid: msg.uid,
                     id: msg.uid.toString(),
@@ -233,15 +226,16 @@ app.post('/api/messages', async (req, res) => {
                     from: msg.envelope.from?.[0]?.address || msg.envelope.from?.[0]?.name || '',
                     to: msg.envelope.to?.[0]?.address || '',
                     date: msg.envelope.date ? new Date(msg.envelope.date).toISOString() : new Date().toISOString(),
-                    hasAttachments: Boolean(msg.bodyStructure?.childNodes?.length)
+                    hasAttachments: false
                 });
             }
         } finally {
             lock.release();
         }
+
         await client.logout();
 
-        // ORDENAR EXPLÍCITAMENTE POR FECHA MÁS RECIENTE PRIMERO
+        // Ordenar por fecha (más reciente primero)
         messages.sort((a, b) => new Date(b.date) - new Date(a.date));
 
         res.json({ success: true, messages, total: messages.length });
@@ -291,32 +285,42 @@ app.post('/api/message-detail', async (req, res) => {
                 attachments
             }
         });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
+    } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
 // ------------------------------------------------------------
-//  7. ELIMINAR MENSAJE (Mover a la Papelera real del servidor)
+//  7. ELIMINAR / MOVER A PAPELERA
 // ------------------------------------------------------------
 app.post('/api/delete-message', async (req, res) => {
     const { email, password, host, port, uid, folder = 'INBOX' } = req.body;
     if (!uid) return res.status(400).json({ success: false, error: 'Falta UID' });
 
     const auto = getAutoConfig(email);
-    const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+    const client = new ImapFlow({
+        host: host || auto.imapHost,
+        port: Number(port) || auto.imapPort,
+        secure: true,
+        auth: { user: email, pass: password },
+        logger: false,
+        tls: { rejectUnauthorized: false }
+    });
 
     try {
         await client.connect();
 
-        // Si el correo ya se encuentra en la Papelera, se elimina permanentemente
+        // Si ya está en la papelera, eliminar permanentemente
         if (folder.toLowerCase().includes('trash') || folder.toLowerCase().includes('papelera')) {
             await client.messageDelete(uid, { uid: true });
             await client.expunge();
         } else {
-            // Localizar la carpeta de Papelera en cPanel mediante specialUse o patrones de texto
+            // Buscar la Papelera
             const list = await client.list();
-            let trashFolder = list.find(f => f.specialUse === '\\Trash' || /^trash$/i.test(f.name) || /papelera/i.test(f.name) || /inbox\.trash/i.test(f.path))?.path || 'INBOX.Trash';
+            let trashFolder = list.find(f =>
+                f.specialUse === '\\Trash' ||
+                /^trash$/i.test(f.name) ||
+                /papelera/i.test(f.name) ||
+                /inbox\.trash/i.test(f.path)
+            )?.path || 'INBOX.Trash';
 
             await client.messageMove(uid, trashFolder, { uid: true });
         }
@@ -329,25 +333,18 @@ app.post('/api/delete-message', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  8. MOVER MENSAJE
+//  8. MOVER MENSAJE GENÉRICO
 // ------------------------------------------------------------
 app.post('/api/move-message', async (req, res) => {
     const { email, password, host, port, uid, fromFolder, toFolder } = req.body;
     if (!uid || !fromFolder || !toFolder) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
     const auto = getAutoConfig(email);
     const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-    try {
-        await client.connect();
-        await client.messageMove(uid, toFolder, { uid: true });
-        await client.logout();
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ success: false, error: e.message });
-    }
+    try { await client.connect(); await client.messageMove(uid, toFolder, { uid: true }); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 // ------------------------------------------------------------
-//  9. MARCAR LEÍDO / NO LEÍDO
+//  9-12. RESTO DE ENDPOINTS (sin cambios)
 // ------------------------------------------------------------
 app.post('/api/toggle-read', async (req, res) => {
     const { email, password, host, port, uid, folder, read } = req.body;
@@ -357,9 +354,6 @@ app.post('/api/toggle-read', async (req, res) => {
     try { await client.connect(); if (read) await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true }); else await client.messageFlagsRemove(uid, ['\\Seen'], { uid: true }); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// ------------------------------------------------------------
-//  10. MARCAR IMPORTANTE / FLAGGED
-// ------------------------------------------------------------
 app.post('/api/toggle-flagged', async (req, res) => {
     const { email, password, host, port, uid, folder, flagged } = req.body;
     if (uid == null || !folder) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
@@ -368,9 +362,6 @@ app.post('/api/toggle-flagged', async (req, res) => {
     try { await client.connect(); if (flagged) await client.messageFlagsAdd(uid, ['\\Flagged'], { uid: true }); else await client.messageFlagsRemove(uid, ['\\Flagged'], { uid: true }); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// ------------------------------------------------------------
-//  11. CREAR / BORRAR CARPETAS
-// ------------------------------------------------------------
 app.post('/api/create-folder', async (req, res) => {
     const { email, password, host, port, folderName } = req.body;
     if (!folderName) return res.status(400).json({ success: false, error: 'Falta folderName' });
@@ -387,9 +378,6 @@ app.post('/api/delete-folder', async (req, res) => {
     try { await client.connect(); await client.mailboxDelete(folderName); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// ------------------------------------------------------------
-//  12. DESCARGAR ADJUNTO
-// ------------------------------------------------------------
 app.post('/api/download-attachment', async (req, res) => {
     const { email, password, host, port, folder, uid, partId } = req.body;
     if (!uid || !folder || !partId) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
@@ -399,4 +387,4 @@ app.post('/api/download-attachment', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Backend RSMAIL completamente operativo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Backend RSMAIL en puerto ${PORT}`));

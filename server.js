@@ -8,38 +8,34 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '25mb' }));
 
-// Helper de Autoconfiguración de dominios
+// Helper de configuración para cPanel / Servidores estándar
 function getAutoConfig(email) {
     const domain = email.split('@')[1]?.toLowerCase() || '';
 
     if (domain.includes('gmail.com')) {
-        return { imapHost: 'imap.gmail.com', imapPort: 993, smtpHost: 'smtp.gmail.com', smtpPort: 465 };
+        return { imapHost: 'imap.gmail.com', imapPort: 993, smtpHost: 'smtp.gmail.com', smtpPort: 587, smtpSecure: false };
     }
-    if (domain.includes('outlook.com') || domain.includes('hotmail.com') || domain.includes('live.com')) {
-        return { imapHost: 'outlook.office365.com', imapPort: 993, smtpHost: 'smtp.office365.com', smtpPort: 587 };
-    }
-    if (domain.includes('yahoo.')) {
-        return { imapHost: 'imap.mail.yahoo.com', imapPort: 993, smtpHost: 'smtp.mail.yahoo.com', smtpPort: 465 };
-    }
-    if (domain.includes('mail.ru') || domain.includes('inbox.ru') || domain.includes('list.ru') || domain.includes('bk.ru')) {
-        return { imapHost: 'imap.mail.ru', imapPort: 993, smtpHost: 'smtp.mail.ru', smtpPort: 465 };
+    if (domain.includes('outlook.com') || domain.includes('hotmail.com')) {
+        return { imapHost: 'outlook.office365.com', imapPort: 993, smtpHost: 'smtp.office365.com', smtpPort: 587, smtpSecure: false };
     }
 
+    // Configuración cPanel para rsmicro.es y dominios propios
     return {
         imapHost: 'mail.' + domain,
         imapPort: 993,
         smtpHost: 'mail.' + domain,
-        smtpPort: 587
+        smtpPort: 587,
+        smtpSecure: false // 587 usa STARTTLS (secure: false)
     };
 }
 
-// Conexión IMAP
+// Conexión IMAP Robusta
 async function getImapClient(email, password, customHost, customPort) {
     const auto = getAutoConfig(email);
     const client = new ImapFlow({
         host: customHost || auto.imapHost,
         port: Number(customPort) || auto.imapPort,
-        secure: true,
+        secure: true, // IMAP siempre 993 TLS
         auth: { user: email, pass: password },
         logger: false,
         tls: { rejectUnauthorized: false }
@@ -49,7 +45,7 @@ async function getImapClient(email, password, customHost, customPort) {
 }
 
 // ==========================================
-// 1. VERIFICAR CREDENCIALES
+// 1. VERIFICAR Y AUTO-CONFIGURAR
 // ==========================================
 app.post('/api/verify', async (req, res) => {
     const { email, password, host, port } = req.body;
@@ -72,7 +68,7 @@ app.post('/api/verify', async (req, res) => {
 });
 
 // ==========================================
-// 2. LISTAR CARPETAS
+// 2. LISTAR CARPETAS (Mapeado Correcto)
 // ==========================================
 app.post('/api/folders', async (req, res) => {
     const { email, password, host, port } = req.body;
@@ -83,7 +79,7 @@ app.post('/api/folders', async (req, res) => {
 
         const folders = list.map(f => ({
             name: f.name,
-            path: f.path,
+            path: f.path, // 👈 Importante: Flutter debe enviar este "path" (ej: "INBOX.Sent")
             specialUse: f.specialUse || ''
         }));
 
@@ -94,10 +90,10 @@ app.post('/api/folders', async (req, res) => {
 });
 
 // ==========================================
-// 3. MENSAJES (MÁS NUEVOS PRIMERO)
+// 3. OBTENER MENSAJES (Los más recientes primero)
 // ==========================================
 app.post('/api/messages', async (req, res) => {
-    const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
+    const { email, password, host, port, folder = 'INBOX', limit = 25 } = req.body;
 
     try {
         const client = await getImapClient(email, password, host, port);
@@ -105,15 +101,15 @@ app.post('/api/messages', async (req, res) => {
         const messages = [];
 
         try {
-            // "reverse: true" con "1:*" garantiza traer siempre los más recientes primero
-            for await (let message of client.fetch('1:*', { envelope: true }, { max: Number(limit), reverse: true })) {
+            // "reverse: true" obliga a traer los emails recién llegados primero
+            for await (let message of client.fetch('1:*', { envelope: true, bodyStructure: true }, { max: Number(limit), reverse: true })) {
                 messages.push({
                     uid: message.uid,
                     id: message.uid.toString(),
                     subject: message.envelope.subject || '(Sin asunto)',
-                    from: message.envelope.from?.[0]?.address || message.envelope.from?.[0]?.name || '',
+                    from: message.envelope.from?.[0]?.address || message.envelope.from?.[0]?.name || 'Desconocido',
                     to: message.envelope.to?.[0]?.address || '',
-                    date: message.envelope.date ? new Date(message.envelope.date).toISOString() : new Date().toISOString(),
+                    date: message.envelope.date ? new Date(message.envelope.date).toISOString() : new Date().toISOString()
                 });
             }
         } finally {
@@ -128,12 +124,12 @@ app.post('/api/messages', async (req, res) => {
 });
 
 // ==========================================
-// 4. DETALLE DEL MENSAJE
+// 4. DETALLE DEL CORREO (Lee Texto/HTML real)
 // ==========================================
 app.post('/api/message-detail', async (req, res) => {
     const { email, password, host, port, folder = 'INBOX', uid } = req.body;
 
-    if (!uid) return res.status(400).json({ success: false, error: 'UID requerido' });
+    if (!uid) return res.status(400).json({ success: false, error: 'UID de mensaje requerido' });
 
     try {
         const client = await getImapClient(email, password, host, port);
@@ -154,7 +150,7 @@ app.post('/api/message-detail', async (req, res) => {
         if (!parsedEmail) return res.status(404).json({ success: false, error: 'Mensaje no encontrado' });
 
         const attachments = (parsedEmail.attachments || []).map(att => ({
-            filename: att.filename || 'archivo',
+            filename: att.filename || 'adjunto',
             contentType: att.contentType,
             size: att.size,
             content: att.content ? att.content.toString('base64') : ''
@@ -179,7 +175,7 @@ app.post('/api/message-detail', async (req, res) => {
 });
 
 // ==========================================
-// 5. ENVIAR CORREO (SMTP MULTI-PUERTO BLINDADO)
+// 5. ENVIAR CORREO (Solución Error 07 / cPanel)
 // ==========================================
 app.post('/api/send-email', async (req, res) => {
     const { email, password, smtpHost, smtpPort, to, subject, text, html, attachments } = req.body;
@@ -187,23 +183,24 @@ app.post('/api/send-email', async (req, res) => {
     const auto = getAutoConfig(email);
     const host = smtpHost || auto.smtpHost;
 
-    // Intentar envío con los parámetros indicados o con fallback automático
-    const portsToTry = smtpPort
-        ? [Number(smtpPort), 587, 465]
-        : [auto.smtpPort, 587, 465];
+    // cPanel requiere probar SSL (465) y STARTTLS (587) alternativamente si uno falla
+    const configurations = [
+        { port: 587, secure: false }, // STARTTLS (Por defecto en cPanel)
+        { port: 465, secure: true },  // SSL Directo
+        { port: 25, secure: false }   // Fallback
+    ];
 
     let lastError = null;
 
-    for (const port of [...new Set(portsToTry)]) {
-        const isSecure = (port === 465);
+    for (const config of configurations) {
         try {
             const transporter = nodemailer.createTransport({
                 host: host,
-                port: port,
-                secure: isSecure,
+                port: config.port,
+                secure: config.secure,
                 auth: { user: email, pass: password },
                 tls: { rejectUnauthorized: false },
-                connectionTimeout: 10000
+                connectionTimeout: 8000
             });
 
             const info = await transporter.sendMail({
@@ -220,19 +217,16 @@ app.post('/api/send-email', async (req, res) => {
 
             return res.json({ success: true, messageId: info.messageId });
         } catch (err) {
-            console.error(`Falló puerto ${port}:`, err.message);
+            console.log(`Intentó puerto ${config.port} pero falló: ${err.message}`);
             lastError = err;
         }
     }
 
-    return res.status(500).json({
-        success: false,
-        error: 'No se pudo enviar el correo por ningún puerto SMTP: ' + (lastError ? lastError.message : 'Error desconocido')
-    });
+    res.status(500).json({ success: false, error: 'Error al enviar por SMTP: ' + (lastError ? lastError.message : 'Error de conexión') });
 });
 
 // ==========================================
-// 6. ELIMINAR / MOVER A LA PAPELERA
+// 6. ELIMINAR / PAPELERA (Especial para cPanel)
 // ==========================================
 app.post('/api/delete-message', async (req, res) => {
     const { email, password, host, port, folder = 'INBOX', uid } = req.body;
@@ -244,15 +238,19 @@ app.post('/api/delete-message', async (req, res) => {
         const lock = await client.getMailboxLock(folder);
 
         try {
-            // Intentar buscar la carpeta Trash/Papelera
             const list = await client.list();
-            const trashFolder = list.find(f => f.specialUse === '\\Trash' || f.name.toLowerCase().includes('trash') || f.name.toLowerCase().includes('papelera'));
+            // Buscar carpeta de papelera (en cPanel suele llamarse INBOX.Trash)
+            const trashFolder = list.find(f =>
+                f.specialUse === '\\Trash' ||
+                f.path.toUpperCase().includes('TRASH') ||
+                f.path.toUpperCase().includes('PAPELERA')
+            );
 
             if (trashFolder && trashFolder.path !== folder) {
                 // Mover a la papelera
                 await client.messageMove(uid.toString(), trashFolder.path, { uid: true });
             } else {
-                // Si ya estamos en la papelera o no se encuentra, marcar como borrado
+                // Si ya estaba en la papelera, borrar definitivamente
                 await client.messageDelete(uid.toString(), { uid: true });
             }
         } finally {
@@ -260,14 +258,14 @@ app.post('/api/delete-message', async (req, res) => {
         }
 
         await client.logout();
-        res.json({ success: true, message: 'Mensaje eliminado o movido a la papelera' });
+        res.json({ success: true, message: 'Mensaje movido o eliminado' });
     } catch (err) {
         res.status(500).json({ success: false, error: err.message });
     }
 });
 
-// INICIAR SERVIDOR
+// PUERTO
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`🚀 Servidor listo en el puerto ${PORT}`);
+    console.log(`🚀 Servidor cPanel/IMAP listo en el puerto ${PORT}`);
 });

@@ -134,7 +134,7 @@ app.post('/api/send-email', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  3. GUARDAR EN ENVIADOS (Formato raw mejorado)
+//  3. GUARDAR EN ENVIADOS (Formato raw estandarizado para IMAP)
 // ------------------------------------------------------------
 app.post('/api/save-to-sent', async (req, res) => {
     const { email, password, host, port, to, subject, body } = req.body;
@@ -161,19 +161,12 @@ app.post('/api/save-to-sent', async (req, res) => {
             /inbox\.sent/i.test(f.path)
         )?.path || 'INBOX.Sent';
 
-        // Generar un raw más completo con cabeceras estándar
-        const messageId = `<${Date.now()}.${Math.random().toString(36).substring(2, 10)}@${email.split('@')[1]}>`;
-        const date = new Date().toUTCString();
-
         const rawEmail = [
             `From: ${email}`,
             `To: ${to || ''}`,
             `Subject: ${subject || '(Sin asunto)'}`,
-            `Date: ${date}`,
-            `Message-ID: ${messageId}`,
-            `MIME-Version: 1.0`,
+            `Date: ${new Date().toUTCString()}`,
             `Content-Type: text/html; charset=utf-8`,
-            `Content-Transfer-Encoding: 7bit`,
             '',
             body || ''
         ].join('\r\n');
@@ -183,7 +176,6 @@ app.post('/api/save-to-sent', async (req, res) => {
 
         res.json({ success: true, message: 'Guardado en Enviados' });
     } catch (e) {
-        console.error('❌ Error en save-to-sent:', e.message);
         res.status(500).json({ success: false, error: 'Error al guardar en Enviados: ' + e.message });
     }
 });
@@ -205,7 +197,7 @@ app.post('/api/folders', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  5. OBTENER MENSAJES (CON FLAGS)
+//  5. OBTENER MENSAJES (OPTIMIZADO – solo encabezados, carga rápida)
 // ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
@@ -225,9 +217,7 @@ app.post('/api/messages', async (req, res) => {
         const messages = [];
 
         try {
-            // Obtener solo los encabezados y los flags
-            for await (const msg of client.fetch('1:*', { envelope: true, flags: true }, { max: limit, reverse: true })) {
-                const flags = msg.flags || [];
+            for await (const msg of client.fetch('1:*', { envelope: true }, { max: limit, reverse: true })) {
                 messages.push({
                     uid: msg.uid,
                     id: msg.uid.toString(),
@@ -235,11 +225,7 @@ app.post('/api/messages', async (req, res) => {
                     from: msg.envelope.from?.[0]?.address || msg.envelope.from?.[0]?.name || '',
                     to: msg.envelope.to?.[0]?.address || '',
                     date: msg.envelope.date ? new Date(msg.envelope.date).toISOString() : new Date().toISOString(),
-                    hasAttachments: false,
-                    flags: flags,
-                    // Campos adicionales para UI
-                    isRead: flags.includes('\\Seen'),
-                    isFlagged: flags.includes('\\Flagged'),
+                    hasAttachments: false
                 });
             }
         } finally {
@@ -248,11 +234,9 @@ app.post('/api/messages', async (req, res) => {
 
         await client.logout();
         messages.sort((a, b) => new Date(b.date) - new Date(a.date));
-        // Siempre devolver un array
-        res.json({ success: true, messages: messages, total: messages.length });
+        res.json({ success: true, messages, total: messages.length });
     } catch (err) {
-        console.error('❌ Error en /api/messages:', err.message);
-        res.status(500).json({ success: false, error: err.message, messages: [] });
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 
@@ -320,6 +304,7 @@ app.post('/api/delete-message', async (req, res) => {
     try {
         await client.connect();
 
+        // 1. Abrir y bloquear la carpeta de origen (OBLIGATORIO en ImapFlow)
         const lock = await client.getMailboxLock(folder);
 
         try {

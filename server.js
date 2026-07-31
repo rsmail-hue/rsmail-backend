@@ -295,7 +295,7 @@ app.post('/api/message-detail', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  7. ELIMINAR / MOVER A PAPELERA (¡CREA LA CARPETA SI NO EXISTE!)
+//  7. ELIMINAR / MOVER A PAPELERA (¡CON MAILBOXLOCK OBLIGATORIO!)
 // ------------------------------------------------------------
 app.post('/api/delete-message', async (req, res) => {
     const { email, password, host, port, uid, folder = 'INBOX' } = req.body;
@@ -314,40 +314,52 @@ app.post('/api/delete-message', async (req, res) => {
     try {
         await client.connect();
 
-        // Si ya está en la papelera, eliminar permanentemente
-        if (folder.toLowerCase().includes('trash') || folder.toLowerCase().includes('papelera')) {
-            await client.messageDelete(uid, { uid: true });
-            await client.expunge();
-        } else {
-            // Buscar la Papelera
-            const list = await client.list();
-            let trashFolder = list.find(f =>
-                f.specialUse === '\\Trash' ||
-                /^trash$/i.test(f.name) ||
-                /papelera/i.test(f.name) ||
-                /inbox\.trash/i.test(f.path)
-            )?.path;
+        // 1. Abrir y bloquear la carpeta de origen (OBLIGATORIO en ImapFlow)
+        const lock = await client.getMailboxLock(folder);
 
-            // Si no existe, intentar crear una
-            if (!trashFolder) {
-                const candidates = ['INBOX.Trash', 'Trash', 'Papelera'];
-                for (const cand of candidates) {
-                    try {
-                        await client.mailboxCreate(cand);
-                        trashFolder = cand;
-                        console.log(`✅ Carpeta de papelera creada: ${cand}`);
-                        break;
-                    } catch (createErr) {
-                        console.log(`⚠️ No se pudo crear ${cand}: ${createErr.message}`);
+        try {
+            // Si ya estamos dentro de la Papelera, borrar permanentemente
+            const isAlreadyTrash = folder.toLowerCase().includes('trash') ||
+                                   folder.toLowerCase().includes('papelera');
+
+            if (isAlreadyTrash) {
+                await client.messageDelete(String(uid), { uid: true });
+            } else {
+                // 2. Buscar la carpeta de Papelera en cPanel
+                const list = await client.list();
+                let trashFolder = list.find(f =>
+                    f.specialUse === '\\Trash' ||
+                    /^trash$/i.test(f.name) ||
+                    /papelera/i.test(f.name) ||
+                    /inbox\.trash/i.test(f.path) ||
+                    /inbox\/trash/i.test(f.path)
+                )?.path;
+
+                // 3. Si no existe, intentar crearla
+                if (!trashFolder) {
+                    const candidates = ['INBOX.Trash', 'Trash', 'Papelera'];
+                    for (const cand of candidates) {
+                        try {
+                            await client.mailboxCreate(cand);
+                            trashFolder = cand;
+                            console.log(`✅ Carpeta de papelera creada: ${cand}`);
+                            break;
+                        } catch (createErr) {
+                            console.log(`⚠️ No se pudo crear ${cand}: ${createErr.message}`);
+                        }
+                    }
+                    if (!trashFolder) {
+                        throw new Error('No se encontró ni se pudo crear la carpeta de Papelera');
                     }
                 }
-                if (!trashFolder) {
-                    throw new Error('No se encontró ni se pudo crear la carpeta de Papelera');
-                }
-            }
 
-            await client.messageMove(uid, trashFolder, { uid: true });
-            console.log(`✅ Mensaje ${uid} movido a la papelera: ${trashFolder}`);
+                // 4. Mover el correo a la papelera encontrada
+                await client.messageMove(String(uid), trashFolder, { uid: true });
+                console.log(`✅ Mensaje ${uid} movido a la papelera: ${trashFolder}`);
+            }
+        } finally {
+            // Liberar siempre el bloqueo de la carpeta
+            lock.release();
         }
 
         await client.logout();

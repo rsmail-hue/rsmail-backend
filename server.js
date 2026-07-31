@@ -111,9 +111,7 @@ app.post('/api/send-email', async (req, res) => {
         port: smtpPort,
         secure: smtpPort === 465,
         auth: { user: email, pass: password },
-        tls: {
-            rejectUnauthorized: false
-        }
+        tls: { rejectUnauthorized: false }
     });
 
     try {
@@ -128,15 +126,15 @@ app.post('/api/send-email', async (req, res) => {
             })) : []
         };
 
-        const info = await transporter.sendMail(mailOptions);
-        res.json({ success: true, messageId: info.messageId });
+        await transporter.sendMail(mailOptions);
+        res.json({ success: true });
     } catch (err) {
-        res.status(500).json({ success: false, error: 'Error al enviar correo: ' + err.message });
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 
 // ------------------------------------------------------------
-//  3. GUARDAR EN ENVIADOS (Formato raw estandarizado para IMAP)
+//  3. GUARDAR EN ENVIADOS (Formato raw mejorado)
 // ------------------------------------------------------------
 app.post('/api/save-to-sent', async (req, res) => {
     const { email, password, host, port, to, subject, body } = req.body;
@@ -156,7 +154,6 @@ app.post('/api/save-to-sent', async (req, res) => {
         await client.connect();
         const list = await client.list();
 
-        // Localizar carpeta de Enviados en cPanel
         let sentFolder = list.find(f =>
             f.specialUse === '\\Sent' ||
             /^sent$/i.test(f.name) ||
@@ -164,13 +161,17 @@ app.post('/api/save-to-sent', async (req, res) => {
             /inbox\.sent/i.test(f.path)
         )?.path || 'INBOX.Sent';
 
-        // Construir email simple en formato MIME/RFC822
+        // Generar un raw más completo con MIME-Version, Message-ID, etc.
+        const messageId = `<${Date.now()}${Math.random().toString(36).substring(2, 10)}@${email.split('@')[1]}>`;
         const rawEmail = [
             `From: ${email}`,
             `To: ${to || ''}`,
             `Subject: ${subject || '(Sin asunto)'}`,
             `Date: ${new Date().toUTCString()}`,
+            `Message-ID: ${messageId}`,
+            `MIME-Version: 1.0`,
             `Content-Type: text/html; charset=utf-8`,
+            `Content-Transfer-Encoding: 8bit`,
             '',
             body || ''
         ].join('\r\n');
@@ -197,13 +198,11 @@ app.post('/api/folders', async (req, res) => {
         await client.logout();
         const folders = list.map(f => ({ name: f.name, path: f.path, specialUse: f.specialUse || '' }));
         res.json({ success: true, folders });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
+    } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
 // ------------------------------------------------------------
-//  5. OBTENER MENSAJES (OPTIMIZADO – solo encabezados, carga rápida)
+//  5. OBTENER MENSAJES (OPTIMIZADO – incluye flags)
 // ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
@@ -223,8 +222,8 @@ app.post('/api/messages', async (req, res) => {
         const messages = [];
 
         try {
-            // Solo pedimos el sobre (envelope), sin bodyStructure → mucho más rápido
-            for await (const msg of client.fetch('1:*', { envelope: true }, { max: limit, reverse: true })) {
+            // Solicitar envelope y flags
+            for await (const msg of client.fetch('1:*', { envelope: true, flags: true }, { max: limit, reverse: true })) {
                 messages.push({
                     uid: msg.uid,
                     id: msg.uid.toString(),
@@ -232,7 +231,8 @@ app.post('/api/messages', async (req, res) => {
                     from: msg.envelope.from?.[0]?.address || msg.envelope.from?.[0]?.name || '',
                     to: msg.envelope.to?.[0]?.address || '',
                     date: msg.envelope.date ? new Date(msg.envelope.date).toISOString() : new Date().toISOString(),
-                    hasAttachments: false
+                    hasAttachments: false, // Podrías mejorarlo verificando bodyStructure, pero queda así por ahora
+                    flags: msg.flags || []  // <-- NUEVO: incluir flags
                 });
             }
         } finally {
@@ -240,10 +240,7 @@ app.post('/api/messages', async (req, res) => {
         }
 
         await client.logout();
-
-        // Ordenar por fecha (más reciente primero)
         messages.sort((a, b) => new Date(b.date) - new Date(a.date));
-
         res.json({ success: true, messages, total: messages.length });
     } catch (err) {
         res.status(500).json({ success: false, error: err.message });
@@ -295,7 +292,7 @@ app.post('/api/message-detail', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  7. ELIMINAR / MOVER A PAPELERA (¡CON MAILBOXLOCK OBLIGATORIO!)
+//  7. ELIMINAR / MOVER A PAPELERA (CON MAILBOXLOCK OBLIGATORIO)
 // ------------------------------------------------------------
 app.post('/api/delete-message', async (req, res) => {
     const { email, password, host, port, uid, folder = 'INBOX' } = req.body;
@@ -314,18 +311,16 @@ app.post('/api/delete-message', async (req, res) => {
     try {
         await client.connect();
 
-        // 1. Abrir y bloquear la carpeta de origen (OBLIGATORIO en ImapFlow)
+        // 1. Abrir y bloquear la carpeta de origen
         const lock = await client.getMailboxLock(folder);
 
         try {
-            // Si ya estamos dentro de la Papelera, borrar permanentemente
             const isAlreadyTrash = folder.toLowerCase().includes('trash') ||
                                    folder.toLowerCase().includes('papelera');
 
             if (isAlreadyTrash) {
                 await client.messageDelete(String(uid), { uid: true });
             } else {
-                // 2. Buscar la carpeta de Papelera en cPanel
                 const list = await client.list();
                 let trashFolder = list.find(f =>
                     f.specialUse === '\\Trash' ||
@@ -335,30 +330,23 @@ app.post('/api/delete-message', async (req, res) => {
                     /inbox\/trash/i.test(f.path)
                 )?.path;
 
-                // 3. Si no existe, intentar crearla
                 if (!trashFolder) {
                     const candidates = ['INBOX.Trash', 'Trash', 'Papelera'];
                     for (const cand of candidates) {
                         try {
                             await client.mailboxCreate(cand);
                             trashFolder = cand;
-                            console.log(`✅ Carpeta de papelera creada: ${cand}`);
                             break;
-                        } catch (createErr) {
-                            console.log(`⚠️ No se pudo crear ${cand}: ${createErr.message}`);
-                        }
+                        } catch (createErr) {}
                     }
                     if (!trashFolder) {
                         throw new Error('No se encontró ni se pudo crear la carpeta de Papelera');
                     }
                 }
 
-                // 4. Mover el correo a la papelera encontrada
                 await client.messageMove(String(uid), trashFolder, { uid: true });
-                console.log(`✅ Mensaje ${uid} movido a la papelera: ${trashFolder}`);
             }
         } finally {
-            // Liberar siempre el bloqueo de la carpeta
             lock.release();
         }
 

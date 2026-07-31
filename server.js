@@ -4,6 +4,7 @@ const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
 const Imap = require('imap');
 const nodemailer = require('nodemailer');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 app.use(cors());
@@ -161,17 +162,20 @@ app.post('/api/save-to-sent', async (req, res) => {
             /inbox\.sent/i.test(f.path)
         )?.path || 'INBOX.Sent';
 
-        // Generar un raw más completo con MIME-Version, Message-ID, etc.
-        const messageId = `<${Date.now()}${Math.random().toString(36).substring(2, 10)}@${email.split('@')[1]}>`;
+        // Construir raw email más completo
+        const messageId = `<${uuidv4()}@${email.split('@')[1] || 'rsmail.local'}>`;
+        const date = new Date().toUTCString();
+        const boundary = `----=_Part_${Math.random().toString(36).substring(2)}`;
+
         const rawEmail = [
             `From: ${email}`,
             `To: ${to || ''}`,
             `Subject: ${subject || '(Sin asunto)'}`,
-            `Date: ${new Date().toUTCString()}`,
+            `Date: ${date}`,
             `Message-ID: ${messageId}`,
             `MIME-Version: 1.0`,
             `Content-Type: text/html; charset=utf-8`,
-            `Content-Transfer-Encoding: 8bit`,
+            `Content-Transfer-Encoding: 7bit`,
             '',
             body || ''
         ].join('\r\n');
@@ -181,6 +185,7 @@ app.post('/api/save-to-sent', async (req, res) => {
 
         res.json({ success: true, message: 'Guardado en Enviados' });
     } catch (e) {
+        console.error('❌ Error en save-to-sent:', e.message);
         res.status(500).json({ success: false, error: 'Error al guardar en Enviados: ' + e.message });
     }
 });
@@ -202,7 +207,7 @@ app.post('/api/folders', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  5. OBTENER MENSAJES (OPTIMIZADO – incluye flags)
+//  5. OBTENER MENSAJES (CON FLAGS)
 // ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
@@ -222,7 +227,7 @@ app.post('/api/messages', async (req, res) => {
         const messages = [];
 
         try {
-            // Solicitar envelope y flags
+            // Obtener flags también
             for await (const msg of client.fetch('1:*', { envelope: true, flags: true }, { max: limit, reverse: true })) {
                 messages.push({
                     uid: msg.uid,
@@ -231,8 +236,8 @@ app.post('/api/messages', async (req, res) => {
                     from: msg.envelope.from?.[0]?.address || msg.envelope.from?.[0]?.name || '',
                     to: msg.envelope.to?.[0]?.address || '',
                     date: msg.envelope.date ? new Date(msg.envelope.date).toISOString() : new Date().toISOString(),
-                    hasAttachments: false, // Podrías mejorarlo verificando bodyStructure, pero queda así por ahora
-                    flags: msg.flags || []  // <-- NUEVO: incluir flags
+                    hasAttachments: false,
+                    flags: msg.flags || []
                 });
             }
         } finally {
@@ -243,6 +248,7 @@ app.post('/api/messages', async (req, res) => {
         messages.sort((a, b) => new Date(b.date) - new Date(a.date));
         res.json({ success: true, messages, total: messages.length });
     } catch (err) {
+        console.error('❌ Error en /api/messages:', err.message);
         res.status(500).json({ success: false, error: err.message });
     }
 });
@@ -292,7 +298,7 @@ app.post('/api/message-detail', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  7. ELIMINAR / MOVER A PAPELERA (CON MAILBOXLOCK OBLIGATORIO)
+//  7. ELIMINAR / MOVER A PAPELERA
 // ------------------------------------------------------------
 app.post('/api/delete-message', async (req, res) => {
     const { email, password, host, port, uid, folder = 'INBOX' } = req.body;
@@ -311,7 +317,6 @@ app.post('/api/delete-message', async (req, res) => {
     try {
         await client.connect();
 
-        // 1. Abrir y bloquear la carpeta de origen
         const lock = await client.getMailboxLock(folder);
 
         try {

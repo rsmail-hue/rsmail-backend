@@ -4,7 +4,6 @@ const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
 const Imap = require('imap');
 const nodemailer = require('nodemailer');
-const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 app.use(cors());
@@ -162,10 +161,9 @@ app.post('/api/save-to-sent', async (req, res) => {
             /inbox\.sent/i.test(f.path)
         )?.path || 'INBOX.Sent';
 
-        // Construir raw email más completo
-        const messageId = `<${uuidv4()}@${email.split('@')[1] || 'rsmail.local'}>`;
+        // Generar un raw más completo con cabeceras estándar
+        const messageId = `<${Date.now()}.${Math.random().toString(36).substring(2, 10)}@${email.split('@')[1]}>`;
         const date = new Date().toUTCString();
-        const boundary = `----=_Part_${Math.random().toString(36).substring(2)}`;
 
         const rawEmail = [
             `From: ${email}`,
@@ -227,8 +225,9 @@ app.post('/api/messages', async (req, res) => {
         const messages = [];
 
         try {
-            // Obtener flags también
+            // Obtener solo los encabezados y los flags
             for await (const msg of client.fetch('1:*', { envelope: true, flags: true }, { max: limit, reverse: true })) {
+                const flags = msg.flags || [];
                 messages.push({
                     uid: msg.uid,
                     id: msg.uid.toString(),
@@ -237,7 +236,10 @@ app.post('/api/messages', async (req, res) => {
                     to: msg.envelope.to?.[0]?.address || '',
                     date: msg.envelope.date ? new Date(msg.envelope.date).toISOString() : new Date().toISOString(),
                     hasAttachments: false,
-                    flags: msg.flags || []
+                    flags: flags,
+                    // Campos adicionales para UI
+                    isRead: flags.includes('\\Seen'),
+                    isFlagged: flags.includes('\\Flagged'),
                 });
             }
         } finally {
@@ -246,10 +248,11 @@ app.post('/api/messages', async (req, res) => {
 
         await client.logout();
         messages.sort((a, b) => new Date(b.date) - new Date(a.date));
-        res.json({ success: true, messages, total: messages.length });
+        // Siempre devolver un array
+        res.json({ success: true, messages: messages, total: messages.length });
     } catch (err) {
         console.error('❌ Error en /api/messages:', err.message);
-        res.status(500).json({ success: false, error: err.message });
+        res.status(500).json({ success: false, error: err.message, messages: [] });
     }
 });
 
@@ -298,7 +301,7 @@ app.post('/api/message-detail', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  7. ELIMINAR / MOVER A PAPELERA
+//  7. ELIMINAR / MOVER A PAPELERA (CON MAILBOXLOCK OBLIGATORIO)
 // ------------------------------------------------------------
 app.post('/api/delete-message', async (req, res) => {
     const { email, password, host, port, uid, folder = 'INBOX' } = req.body;

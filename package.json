@@ -16,6 +16,7 @@
     "nodemailer": "^9.0.3",
     "quoted-printable": "^1.0.1",
     "uuid": "^14.0.1",
-    "ws": "^8.21.3"
+    "ws": "^8.21.3",
+    "firebase-admin": "^12.0.0"
   }
 }

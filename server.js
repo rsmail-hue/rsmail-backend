@@ -4,13 +4,287 @@ const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
 const Imap = require('imap');
 const nodemailer = require('nodemailer');
+const WebSocket = require('ws');
+const http = require('http');
+const admin = require('firebase-admin');
 
+// ------------------------------------------------------------
+//  FIREBASE ADMIN (para FCM push notifications)
+// ------------------------------------------------------------
+if (!admin.apps.length) {
+  try {
+    const serviceAccount = require('./serviceAccountKey.json');
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+    console.log('✅ Firebase Admin inicializado');
+  } catch (e) {
+    console.warn('⚠️ No se encontró serviceAccountKey.json. FCM no disponible.');
+  }
+}
+const db = admin.apps.length ? admin.firestore() : null;
+
+// ------------------------------------------------------------
+//  EXPRESS + WEBSOCKET
+// ------------------------------------------------------------
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
 // ------------------------------------------------------------
-//  AUTO-CONFIGURACIÓN DE SERVIDORES
+//  WEBSOCKET + IMAP IDLE
+// ------------------------------------------------------------
+const activeSessions = new Map();
+
+wss.on('connection', (ws, req) => {
+  console.log('🔌 Nuevo cliente WebSocket conectado');
+  let email = null;
+  let password = null;
+
+  ws.on('message', async (message) => {
+    try {
+      const data = JSON.parse(message);
+      if (data.type === 'login') {
+        email = data.email;
+        password = data.password;
+        console.log(`📧 WebSocket login para ${email}`);
+        await startImapIdle(ws, email, password);
+      }
+    } catch (e) {
+      console.error('❌ Error en WebSocket:', e);
+    }
+  });
+
+  ws.on('close', () => {
+    console.log('🔌 Cliente WebSocket desconectado');
+    if (email && activeSessions.has(email)) {
+      const session = activeSessions.get(email);
+      if (session.idleTimeout) clearTimeout(session.idleTimeout);
+      if (session.imapClient) {
+        session.imapClient.logout().catch(() => {});
+      }
+      activeSessions.delete(email);
+    }
+  });
+});
+
+async function startImapIdle(ws, email, password) {
+  try {
+    const auto = getAutoConfig(email);
+    const client = new ImapFlow({
+      host: auto.imapHost,
+      port: auto.imapPort,
+      secure: true,
+      auth: { user: email, pass: password },
+      logger: false,
+      tls: { rejectUnauthorized: false }
+    });
+
+    await client.connect();
+    console.log(`✅ IMAP conectado para ${email}`);
+    await client.mailboxOpen('INBOX');
+
+    if (activeSessions.has(email)) {
+      const old = activeSessions.get(email);
+      if (old.idleTimeout) clearTimeout(old.idleTimeout);
+      if (old.imapClient) old.imapClient.logout().catch(() => {});
+    }
+    activeSessions.set(email, { ws, imapClient: client, idleTimeout: null });
+
+    const notifyNewEmail = async () => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'new_email',
+          email: email,
+          timestamp: new Date().toISOString()
+        }));
+      }
+      if (db) {
+        await sendPushNotification(email, {
+          title: '📧 Nuevo correo',
+          body: 'Tienes un nuevo mensaje en tu bandeja de entrada',
+          data: { type: 'new_email' }
+        });
+      }
+    };
+
+    const idleLoop = async () => {
+      try {
+        await client.idle();
+        await notifyNewEmail();
+        const session = activeSessions.get(email);
+        if (session && session.imapClient) {
+          session.idleTimeout = setTimeout(idleLoop, 1000);
+        }
+      } catch (e) {
+        console.log(`⚠️ IDLE interrumpido para ${email}:`, e.message);
+        const session = activeSessions.get(email);
+        if (session) {
+          session.idleTimeout = setTimeout(idleLoop, 5000);
+        }
+      }
+    };
+
+    idleLoop();
+
+    const heartbeat = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'ping' }));
+      }
+    }, 30000);
+
+    ws.on('close', () => clearInterval(heartbeat));
+
+  } catch (e) {
+    console.error(`❌ Error iniciando IDLE para ${email}:`, e.message);
+    ws.send(JSON.stringify({
+      type: 'error',
+      message: 'Error al conectar con IMAP: ' + e.message
+    }));
+  }
+}
+
+// ============================================================
+//  FCM PUSH NOTIFICATIONS
+// ============================================================
+async function sendPushNotification(email, payload) {
+  if (!db) {
+    console.log('⚠️ Firebase no disponible, no se enviará push');
+    return;
+  }
+  try {
+    const tokensSnapshot = await db.collection('fcm_tokens')
+      .where('email', '==', email)
+      .get();
+
+    if (tokensSnapshot.empty) {
+      console.log(`📴 No hay tokens FCM para ${email}`);
+      return;
+    }
+
+    const tokens = [];
+    tokensSnapshot.forEach(doc => {
+      tokens.push(doc.data().token);
+    });
+
+    const message = {
+      notification: {
+        title: payload.title || 'RSMAIL',
+        body: payload.body || 'Tienes una nueva notificación',
+      },
+      data: payload.data || { type: 'general' },
+      tokens: tokens,
+    };
+
+    const response = await admin.messaging().sendEachForMulticast(message);
+    console.log(`📨 Notificación push enviada a ${tokens.length} dispositivos para ${email}`);
+
+    if (response.failureCount > 0) {
+      const failedTokens = [];
+      response.responses.forEach((resp, idx) => {
+        if (!resp.success) {
+          failedTokens.push(tokens[idx]);
+        }
+      });
+      for (const token of failedTokens) {
+        const snapshots = await db.collection('fcm_tokens')
+          .where('token', '==', token)
+          .get();
+        snapshots.forEach(doc => doc.ref.delete());
+      }
+      console.log(`🧹 Eliminados ${failedTokens.length} tokens inválidos`);
+    }
+  } catch (e) {
+    console.error('❌ Error enviando push notification:', e);
+  }
+}
+
+// Endpoints FCM
+app.post('/api/fcm-token', async (req, res) => {
+  const { email, token } = req.body;
+  if (!email || !token) {
+    return res.status(400).json({ success: false, error: 'Email y token requeridos' });
+  }
+  if (!db) {
+    return res.status(503).json({ success: false, error: 'Firebase no disponible' });
+  }
+
+  try {
+    const existing = await db.collection('fcm_tokens')
+      .where('email', '==', email)
+      .where('token', '==', token)
+      .get();
+
+    if (existing.empty) {
+      await db.collection('fcm_tokens').add({
+        email: email,
+        token: token,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      console.log(`📱 Token FCM guardado para ${email}`);
+    }
+    res.json({ success: true });
+  } catch (e) {
+    console.error('❌ Error guardando token FCM:', e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post('/api/fcm-token/remove', async (req, res) => {
+  const { token } = req.body;
+  if (!token) {
+    return res.status(400).json({ success: false, error: 'Token requerido' });
+  }
+  if (!db) {
+    return res.status(503).json({ success: false, error: 'Firebase no disponible' });
+  }
+
+  try {
+    const snapshot = await db.collection('fcm_tokens')
+      .where('token', '==', token)
+      .get();
+    snapshot.forEach(doc => doc.ref.delete());
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post('/api/calendar-notify', async (req, res) => {
+  const { email, eventTitle, eventDate } = req.body;
+  if (!email) return res.status(400).json({ success: false, error: 'Email requerido' });
+  if (!db) {
+    return res.status(503).json({ success: false, error: 'Firebase no disponible' });
+  }
+
+  await sendPushNotification(email, {
+    title: '📅 Recordatorio de evento',
+    body: `${eventTitle || 'Evento'} - ${eventDate || 'Próximamente'}`,
+    data: { type: 'calendar_event' }
+  });
+  res.json({ success: true });
+});
+
+app.post('/api/note-notify', async (req, res) => {
+  const { email, noteTitle, senderEmail } = req.body;
+  if (!email) return res.status(400).json({ success: false, error: 'Email requerido' });
+  if (!db) {
+    return res.status(503).json({ success: false, error: 'Firebase no disponible' });
+  }
+
+  await sendPushNotification(email, {
+    title: '📝 Nota compartida',
+    body: `${senderEmail || 'Alguien'} compartió la nota "${noteTitle || 'sin título'}"`,
+    data: { type: 'note_shared' }
+  });
+  res.json({ success: true });
+});
+
+// ------------------------------------------------------------
+//  AUTO-CONFIGURACIÓN DE SERVIDORES (sin cambios)
 // ------------------------------------------------------------
 function getAutoConfig(email) {
     const domain = email.split('@')[1]?.toLowerCase();
@@ -23,7 +297,7 @@ function getAutoConfig(email) {
 }
 
 // ------------------------------------------------------------
-//  1. LOGIN / VERIFICACIÓN
+//  1. LOGIN / VERIFICACIÓN (sin cambios)
 // ------------------------------------------------------------
 const handleAuth = (req, res) => {
     const { email, password, host, port } = req.body;
@@ -92,11 +366,10 @@ const handleAuth = (req, res) => {
 
 app.post('/api/login', handleAuth);
 app.post('/api/verify', handleAuth);
-
 app.get('/ping', (req, res) => res.json({ alive: true }));
 
 // ------------------------------------------------------------
-//  2. ENVÍO DE CORREO SMTP DESDE BACKEND (Opcional / Respaldo)
+//  2. ENVÍO DE CORREO SMTP (sin cambios)
 // ------------------------------------------------------------
 app.post('/api/send-email', async (req, res) => {
     const { email, password, host, port, to, subject, body, attachments } = req.body;
@@ -134,7 +407,7 @@ app.post('/api/send-email', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  3. GUARDAR EN ENVIADOS (Formato raw estandarizado para IMAP)
+//  3. GUARDAR EN ENVIADOS (sin cambios)
 // ------------------------------------------------------------
 app.post('/api/save-to-sent', async (req, res) => {
     const { email, password, host, port, to, subject, body } = req.body;
@@ -181,7 +454,7 @@ app.post('/api/save-to-sent', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  4. OBTENER CARPETAS
+//  4. OBTENER CARPETAS (sin cambios)
 // ------------------------------------------------------------
 app.post('/api/folders', async (req, res) => {
     const { email, password, host, port } = req.body;
@@ -197,7 +470,7 @@ app.post('/api/folders', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  5. OBTENER MENSAJES (OPTIMIZADO – solo encabezados, carga rápida)
+//  5. OBTENER MENSAJES (OPTIMIZADO)
 // ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
@@ -241,7 +514,7 @@ app.post('/api/messages', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  6. DETALLE DEL CORREO
+//  6. DETALLE DEL CORREO (sin cambios)
 // ------------------------------------------------------------
 app.post('/api/message-detail', async (req, res) => {
     const { email, password, host, port, folder = 'INBOX', uid } = req.body;
@@ -285,7 +558,7 @@ app.post('/api/message-detail', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  7. ELIMINAR / MOVER A PAPELERA (CON MAILBOXLOCK OBLIGATORIO)
+//  7. ELIMINAR / MOVER A PAPELERA (sin cambios)
 // ------------------------------------------------------------
 app.post('/api/delete-message', async (req, res) => {
     const { email, password, host, port, uid, folder = 'INBOX' } = req.body;
@@ -304,7 +577,6 @@ app.post('/api/delete-message', async (req, res) => {
     try {
         await client.connect();
 
-        // 1. Abrir y bloquear la carpeta de origen (OBLIGATORIO en ImapFlow)
         const lock = await client.getMailboxLock(folder);
 
         try {
@@ -352,7 +624,7 @@ app.post('/api/delete-message', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  8. MOVER MENSAJE GENÉRICO
+//  8. MOVER MENSAJE GENÉRICO (sin cambios)
 // ------------------------------------------------------------
 app.post('/api/move-message', async (req, res) => {
     const { email, password, host, port, uid, fromFolder, toFolder } = req.body;
@@ -363,7 +635,7 @@ app.post('/api/move-message', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  9‑12. RESTO DE ENDPOINTS
+//  9‑12. RESTO DE ENDPOINTS (sin cambios)
 // ------------------------------------------------------------
 app.post('/api/toggle-read', async (req, res) => {
     const { email, password, host, port, uid, folder, read } = req.body;
@@ -406,4 +678,4 @@ app.post('/api/download-attachment', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Backend RSMAIL en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`✅ Backend RSMAIL en puerto ${PORT} con WebSocket y FCM`));

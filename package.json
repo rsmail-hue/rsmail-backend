@@ -9,6 +9,7 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.18.2",
+    "firebase-admin": "^12.7.0",
     "html-escaper": "^3.0.3",
     "imap": "^0.8.19",
     "imapflow": "^1.4.7",
@@ -16,7 +17,6 @@
     "nodemailer": "^9.0.3",
     "quoted-printable": "^1.0.1",
     "uuid": "^14.0.1",
-    "ws": "^8.21.3",
-    "firebase-admin": "^12.0.0"
+    "ws": "^8.21.3"
   }
 }

@@ -9,7 +9,7 @@ const http = require('http');
 const admin = require('firebase-admin');
 
 // ------------------------------------------------------------
-//  FIREBASE ADMIN
+//  FIREBASE ADMIN (FCM)
 // ------------------------------------------------------------
 if (!admin.apps.length) {
   if (process.env.FIREBASE_PRIVATE_KEY) {
@@ -47,7 +47,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
-//  WEBSOCKET + IMAP IDLE
+//  WEBSOCKET + IMAP IDLE (CON NOTIFICACIONES ENRIQUECIDAS)
 // ------------------------------------------------------------
 const activeSessions = new Map();
 
@@ -90,7 +90,10 @@ async function connectImap(email, password, host, port, secure) {
     secure: secure,
     auth: { user: email, pass: password },
     logger: console,
-    tls: { rejectUnauthorized: false, minVersion: 'TLSv1.2' },
+    tls: {
+      rejectUnauthorized: false,
+      minVersion: 'TLSv1.2',
+    },
     connectionTimeout: 30000,
     authTimeout: 30000,
   };
@@ -107,7 +110,7 @@ async function startImapIdle(ws, email, password) {
     let connected = false;
     let lastError = null;
 
-    // PRIORIDAD 1: STARTTLS
+    // Intentar STARTTLS (143)
     try {
       client = await connectImap(email, password, auto.imapHost, 143, false);
       await client.starttls();
@@ -116,6 +119,7 @@ async function startImapIdle(ws, email, password) {
     } catch (err1) {
       lastError = err1;
       console.log(`⚠️ Falló STARTTLS: ${err1.message}`);
+      // Fallback SSL directo (993)
       try {
         client = await connectImap(email, password, auto.imapHost, 993, true);
         connected = true;
@@ -123,6 +127,7 @@ async function startImapIdle(ws, email, password) {
       } catch (err2) {
         lastError = err2;
         console.log(`⚠️ Falló SSL directo: ${err2.message}`);
+        // Último recurso: sin TLS
         try {
           client = await connectImap(email, password, auto.imapHost, 143, false);
           connected = true;
@@ -130,7 +135,10 @@ async function startImapIdle(ws, email, password) {
         } catch (err3) {
           lastError = err3;
           console.error(`❌ Todos los intentos fallaron para ${email}`);
-          ws.send(JSON.stringify({ type: 'error', message: `Error IMAP: ${lastError.message}` }));
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: `Error IMAP: ${lastError.message}`,
+          }));
           return;
         }
       }
@@ -147,51 +155,43 @@ async function startImapIdle(ws, email, password) {
     }
     activeSessions.set(email, { ws, imapClient: client, idleTimeout: null });
 
+    // Función para notificar nuevo correo con detalles
     const notifyNewEmail = async () => {
+      let from = 'remitente desconocido';
+      let subject = 'sin asunto';
+      try {
+        // Obtener el último mensaje para extraer detalles
+        const lastMessages = await client.fetch('1:*', { envelope: true }, { max: 1, reverse: true });
+        if (lastMessages.length > 0) {
+          const msg = lastMessages[0];
+          from = msg.envelope.from?.[0]?.address || 'remitente desconocido';
+          subject = msg.envelope.subject || 'sin asunto';
+        }
+      } catch (e) {
+        console.log('⚠️ No se pudo obtener detalles del último mensaje:', e.message);
+      }
+
+      // Enviar por WebSocket
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
           type: 'new_email',
           email: email,
+          from: from,
+          subject: subject,
           timestamp: new Date().toISOString()
         }));
       }
 
-      // 🔥 Obtener detalles del nuevo correo
-      try {
-        const lock = await client.getMailboxLock('INBOX');
-        let lastMsg = null;
-        try {
-          for await (const msg of client.fetch('1:*', { envelope: true, source: true }, { max: 1, reverse: true })) {
-            lastMsg = msg;
-            break;
-          }
-        } finally {
-          lock.release();
+      // Enviar notificación push enriquecida
+      await sendPushNotification(email, {
+        title: `📧 ${from}`,
+        body: subject,
+        data: {
+          type: 'new_email',
+          from: from,
+          subject: subject,
         }
-
-        if (lastMsg) {
-          const subject = lastMsg.envelope?.subject || 'Nuevo correo';
-          const from = lastMsg.envelope?.from?.[0]?.address || 'Remitente desconocido';
-          await sendPushNotification(email, {
-            title: `📧 Nuevo correo de ${from}`,
-            body: subject,
-            data: { type: 'new_email', from: from, subject: subject }
-          });
-        } else {
-          await sendPushNotification(email, {
-            title: '📧 Nuevo correo',
-            body: 'Tienes un nuevo mensaje en tu bandeja de entrada',
-            data: { type: 'new_email' }
-          });
-        }
-      } catch (e) {
-        console.log('⚠️ Error obteniendo detalles del nuevo correo:', e.message);
-        await sendPushNotification(email, {
-          title: '📧 Nuevo correo',
-          body: 'Tienes un nuevo mensaje en tu bandeja de entrada',
-          data: { type: 'new_email' }
-        });
-      }
+      });
     };
 
     const idleLoop = async () => {
@@ -223,12 +223,15 @@ async function startImapIdle(ws, email, password) {
 
   } catch (e) {
     console.error(`❌ Error iniciando IDLE para ${email}:`, e.message);
-    ws.send(JSON.stringify({ type: 'error', message: 'Error al conectar con IMAP: ' + e.message }));
+    ws.send(JSON.stringify({
+      type: 'error',
+      message: 'Error al conectar con IMAP: ' + e.message
+    }));
   }
 }
 
 // ============================================================
-//  FCM PUSH NOTIFICATIONS
+//  FCM PUSH NOTIFICATIONS (ENRIQUECIDAS)
 // ============================================================
 async function sendPushNotification(email, payload) {
   try {
@@ -250,11 +253,6 @@ async function sendPushNotification(email, payload) {
       notification: {
         title: payload.title || 'RSMAIL',
         body: payload.body || 'Tienes una nueva notificación',
-      },
-      android: {
-        notification: {
-          icon: 'ic_launcher', // Logo de la app
-        },
       },
       data: payload.data || { type: 'general' },
       tokens: tokens,
@@ -284,7 +282,7 @@ async function sendPushNotification(email, payload) {
 }
 
 // ============================================================
-//  ENDPOINTS FCM
+//  ENDPOINTS FCM (ENRIQUECIDOS)
 // ============================================================
 app.post('/api/fcm-token', async (req, res) => {
   const { email, token } = req.body;
@@ -335,9 +333,13 @@ app.post('/api/calendar-notify', async (req, res) => {
   if (!email) return res.status(400).json({ success: false, error: 'Email requerido' });
 
   await sendPushNotification(email, {
-    title: '📅 Recordatorio de evento',
-    body: `"${eventTitle || 'Evento'}" - ${eventDate || 'Próximamente'}`,
-    data: { type: 'calendar_event', title: eventTitle, date: eventDate }
+    title: '📅 Recordatorio: ' + (eventTitle || 'Evento'),
+    body: 'Fecha: ' + (eventDate || 'Próximamente'),
+    data: {
+      type: 'calendar_event',
+      eventTitle: eventTitle || 'Evento',
+      eventDate: eventDate || 'Próximamente',
+    }
   });
   res.json({ success: true });
 });
@@ -348,8 +350,12 @@ app.post('/api/note-notify', async (req, res) => {
 
   await sendPushNotification(email, {
     title: '📝 Nota compartida',
-    body: `${senderEmail || 'Alguien'} te compartió "${noteTitle || 'una nota'}"`,
-    data: { type: 'note_shared', title: noteTitle, sender: senderEmail }
+    body: `${senderEmail || 'Alguien'} compartió "${noteTitle || 'una nota'}"`,
+    data: {
+      type: 'note_shared',
+      noteTitle: noteTitle || 'nota sin título',
+      senderEmail: senderEmail || 'Alguien',
+    }
   });
   res.json({ success: true });
 });
@@ -548,7 +554,7 @@ app.post('/api/folders', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  5. OBTENER MENSAJES
+//  5. OBTENER MENSAJES (CON flags CORREGIDO)
 // ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
@@ -556,6 +562,7 @@ app.post('/api/messages', async (req, res) => {
     let client;
     let connected = false;
 
+    // Intentar STARTTLS (143)
     try {
         client = new ImapFlow({
             host: host || auto.imapHost,
@@ -571,6 +578,7 @@ app.post('/api/messages', async (req, res) => {
         console.log(`✅ IMAP conectado (STARTTLS) para ${email} en /api/messages`);
     } catch (err) {
         console.log(`⚠️ Falló STARTTLS en /api/messages: ${err.message}`);
+        // Fallback SSL directo (993)
         try {
             client = new ImapFlow({
                 host: host || auto.imapHost,
@@ -585,6 +593,7 @@ app.post('/api/messages', async (req, res) => {
             console.log(`✅ IMAP conectado (SSL directo) para ${email} en /api/messages`);
         } catch (err2) {
             console.log(`⚠️ Falló SSL directo en /api/messages: ${err2.message}`);
+            // Último intento: sin TLS
             try {
                 client = new ImapFlow({
                     host: host || auto.imapHost,

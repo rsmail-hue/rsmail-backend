@@ -83,6 +83,9 @@ wss.on('connection', (ws, req) => {
   });
 });
 
+// ------------------------------------------------------------
+//  FUNCIÓN PARA CONECTAR IMAP CON FALLBACK
+// ------------------------------------------------------------
 async function connectImap(email, password, host, port, secure) {
   const config = {
     host: host,
@@ -103,6 +106,9 @@ async function connectImap(email, password, host, port, secure) {
   return client;
 }
 
+// ------------------------------------------------------------
+//  START IMAP IDLE CON PRIORIDAD STARTTLS
+// ------------------------------------------------------------
 async function startImapIdle(ws, email, password) {
   try {
     const auto = getAutoConfig(email);
@@ -155,19 +161,52 @@ async function startImapIdle(ws, email, password) {
     }
     activeSessions.set(email, { ws, imapClient: client, idleTimeout: null });
 
+    // ============================================================
+    //  NOTIFICACIÓN DE NUEVO CORREO (CON DETALLES)
+    // ============================================================
     const notifyNewEmail = async () => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          type: 'new_email',
-          email: email,
-          timestamp: new Date().toISOString()
-        }));
+      try {
+        // Obtener el último mensaje para extraer remitente y asunto
+        const lock = await client.getMailboxLock('INBOX');
+        let from = 'Remitente desconocido';
+        let subject = 'Nuevo correo';
+        try {
+          const results = await client.fetch('1:*', { envelope: true }, { max: 1, reverse: true });
+          if (results && results.length > 0) {
+            const lastMsg = results[0];
+            from = lastMsg.envelope.from?.[0]?.address || from;
+            subject = lastMsg.envelope.subject || subject;
+          }
+        } catch (fetchErr) {
+          console.log('⚠️ No se pudo obtener detalles del correo:', fetchErr.message);
+        } finally {
+          lock.release();
+        }
+
+        // WebSocket
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'new_email',
+            email: email,
+            timestamp: new Date().toISOString(),
+            from: from,
+            subject: subject
+          }));
+        }
+
+        // Push notification
+        await sendPushNotification(email, {
+          title: `📧 Nuevo correo de ${from}`,
+          body: subject,
+          data: {
+            type: 'new_email',
+            from: from,
+            subject: subject
+          }
+        });
+      } catch (e) {
+        console.error('❌ Error en notifyNewEmail:', e.message);
       }
-      await sendPushNotification(email, {
-        title: '📧 Nuevo correo',
-        body: 'Tienes un nuevo mensaje en tu bandeja de entrada',
-        data: { type: 'new_email' }
-      });
     };
 
     const idleLoop = async () => {
@@ -304,25 +343,31 @@ app.post('/api/fcm-token/remove', async (req, res) => {
   }
 });
 
+// ============================================================
+//  NOTIFICACIONES DE CALENDARIO (MEJORADAS)
+// ============================================================
 app.post('/api/calendar-notify', async (req, res) => {
   const { email, eventTitle, eventDate } = req.body;
   if (!email) return res.status(400).json({ success: false, error: 'Email requerido' });
 
   await sendPushNotification(email, {
-    title: '📅 Recordatorio de evento',
-    body: `${eventTitle || 'Evento'} - ${eventDate || 'Próximamente'}`,
+    title: `📅 Recordatorio: ${eventTitle || 'Evento'}`,
+    body: `Programado para ${eventDate || 'próximamente'}`,
     data: { type: 'calendar_event' }
   });
   res.json({ success: true });
 });
 
+// ============================================================
+//  NOTIFICACIONES DE NOTAS COMPARTIDAS (MEJORADAS)
+// ============================================================
 app.post('/api/note-notify', async (req, res) => {
   const { email, noteTitle, senderEmail } = req.body;
   if (!email) return res.status(400).json({ success: false, error: 'Email requerido' });
 
   await sendPushNotification(email, {
-    title: '📝 Nota compartida',
-    body: `${senderEmail || 'Alguien'} compartió la nota "${noteTitle || 'sin título'}"`,
+    title: `📝 Nota compartida por ${senderEmail || 'Alguien'}`,
+    body: `"${noteTitle || 'sin título'}"`,
     data: { type: 'note_shared' }
   });
   res.json({ success: true });
@@ -530,7 +575,7 @@ app.post('/api/messages', async (req, res) => {
     let client;
     let connected = false;
 
-    // 🔥 PRIORIDAD 1: STARTTLS en puerto 143
+    // PRIORIDAD 1: STARTTLS en puerto 143
     try {
         client = new ImapFlow({
             host: host || auto.imapHost,
@@ -591,10 +636,8 @@ app.post('/api/messages', async (req, res) => {
 
         try {
             for await (const msg of client.fetch('1:*', { envelope: true, flags: true }, { max: limit, reverse: true })) {
-                // ✅ CORRECCIÓN: Asegurar que flags sea un array
                 let flags = msg.flags || [];
                 if (!Array.isArray(flags)) {
-                    // Si por alguna razón no es array, convertirlo
                     flags = Object.values(flags);
                 }
                 messages.push({

@@ -6,23 +6,40 @@ const Imap = require('imap');
 const nodemailer = require('nodemailer');
 const WebSocket = require('ws');
 const http = require('http');
-const admin = require('firebase-admin');
+const admin = require('firebase-admin'); // 👈 IMPORTANTE
 
 // ------------------------------------------------------------
 //  FIREBASE ADMIN (para FCM push notifications)
 // ------------------------------------------------------------
 if (!admin.apps.length) {
-  try {
-    const serviceAccount = require('./serviceAccountKey.json');
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-    });
-    console.log('✅ Firebase Admin inicializado');
-  } catch (e) {
-    console.warn('⚠️ No se encontró serviceAccountKey.json. FCM no disponible.');
+  // PRIMERO: intentar con variables de entorno (recomendado en Render)
+  if (process.env.FIREBASE_PRIVATE_KEY) {
+    try {
+      admin.initializeApp({
+        credential: admin.credential.cert({
+          projectId: process.env.FIREBASE_PROJECT_ID,
+          privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+          clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        }),
+      });
+      console.log('✅ Firebase Admin inicializado con variables de entorno');
+    } catch (e) {
+      console.error('❌ Error con variables de entorno:', e.message);
+    }
+  } else {
+    // SEGUNDO: intentar cargar el archivo local (solo para desarrollo)
+    try {
+      const serviceAccount = require('./serviceAccountKey.json');
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+      });
+      console.log('✅ Firebase Admin inicializado con serviceAccountKey.json');
+    } catch (e) {
+      console.error('⚠️ No se encontró serviceAccountKey.json. FCM no disponible.');
+    }
   }
 }
-const db = admin.apps.length ? admin.firestore() : null;
+const db = admin.firestore();
 
 // ------------------------------------------------------------
 //  EXPRESS + WEBSOCKET
@@ -35,9 +52,9 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
-//  WEBSOCKET + IMAP IDLE
+//  WEBSOCKET + IMAP IDLE (sincronización en tiempo real)
 // ------------------------------------------------------------
-const activeSessions = new Map();
+const activeSessions = new Map(); // email -> { ws, imapClient, idleTimeout }
 
 wss.on('connection', (ws, req) => {
   console.log('🔌 Nuevo cliente WebSocket conectado');
@@ -102,13 +119,12 @@ async function startImapIdle(ws, email, password) {
           timestamp: new Date().toISOString()
         }));
       }
-      if (db) {
-        await sendPushNotification(email, {
-          title: '📧 Nuevo correo',
-          body: 'Tienes un nuevo mensaje en tu bandeja de entrada',
-          data: { type: 'new_email' }
-        });
-      }
+      // ✅ Enviar notificación push también
+      await sendPushNotification(email, {
+        title: '📧 Nuevo correo',
+        body: 'Tienes un nuevo mensaje en tu bandeja de entrada',
+        data: { type: 'new_email' }
+      });
     };
 
     const idleLoop = async () => {
@@ -151,10 +167,6 @@ async function startImapIdle(ws, email, password) {
 //  FCM PUSH NOTIFICATIONS
 // ============================================================
 async function sendPushNotification(email, payload) {
-  if (!db) {
-    console.log('⚠️ Firebase no disponible, no se enviará push');
-    return;
-  }
   try {
     const tokensSnapshot = await db.collection('fcm_tokens')
       .where('email', '==', email)
@@ -202,14 +214,13 @@ async function sendPushNotification(email, payload) {
   }
 }
 
-// Endpoints FCM
+// ============================================================
+//  NUEVOS ENDPOINTS FCM
+// ============================================================
 app.post('/api/fcm-token', async (req, res) => {
   const { email, token } = req.body;
   if (!email || !token) {
     return res.status(400).json({ success: false, error: 'Email y token requeridos' });
-  }
-  if (!db) {
-    return res.status(503).json({ success: false, error: 'Firebase no disponible' });
   }
 
   try {
@@ -238,9 +249,6 @@ app.post('/api/fcm-token/remove', async (req, res) => {
   if (!token) {
     return res.status(400).json({ success: false, error: 'Token requerido' });
   }
-  if (!db) {
-    return res.status(503).json({ success: false, error: 'Firebase no disponible' });
-  }
 
   try {
     const snapshot = await db.collection('fcm_tokens')
@@ -256,9 +264,6 @@ app.post('/api/fcm-token/remove', async (req, res) => {
 app.post('/api/calendar-notify', async (req, res) => {
   const { email, eventTitle, eventDate } = req.body;
   if (!email) return res.status(400).json({ success: false, error: 'Email requerido' });
-  if (!db) {
-    return res.status(503).json({ success: false, error: 'Firebase no disponible' });
-  }
 
   await sendPushNotification(email, {
     title: '📅 Recordatorio de evento',
@@ -271,9 +276,6 @@ app.post('/api/calendar-notify', async (req, res) => {
 app.post('/api/note-notify', async (req, res) => {
   const { email, noteTitle, senderEmail } = req.body;
   if (!email) return res.status(400).json({ success: false, error: 'Email requerido' });
-  if (!db) {
-    return res.status(503).json({ success: false, error: 'Firebase no disponible' });
-  }
 
   await sendPushNotification(email, {
     title: '📝 Nota compartida',
@@ -284,7 +286,7 @@ app.post('/api/note-notify', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  AUTO-CONFIGURACIÓN DE SERVIDORES (sin cambios)
+//  AUTO-CONFIGURACIÓN DE SERVIDORES
 // ------------------------------------------------------------
 function getAutoConfig(email) {
     const domain = email.split('@')[1]?.toLowerCase();
@@ -297,7 +299,7 @@ function getAutoConfig(email) {
 }
 
 // ------------------------------------------------------------
-//  1. LOGIN / VERIFICACIÓN (sin cambios)
+//  1. LOGIN / VERIFICACIÓN
 // ------------------------------------------------------------
 const handleAuth = (req, res) => {
     const { email, password, host, port } = req.body;
@@ -369,7 +371,7 @@ app.post('/api/verify', handleAuth);
 app.get('/ping', (req, res) => res.json({ alive: true }));
 
 // ------------------------------------------------------------
-//  2. ENVÍO DE CORREO SMTP (sin cambios)
+//  2. ENVÍO DE CORREO SMTP DESDE BACKEND
 // ------------------------------------------------------------
 app.post('/api/send-email', async (req, res) => {
     const { email, password, host, port, to, subject, body, attachments } = req.body;
@@ -407,7 +409,7 @@ app.post('/api/send-email', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  3. GUARDAR EN ENVIADOS (sin cambios)
+//  3. GUARDAR EN ENVIADOS
 // ------------------------------------------------------------
 app.post('/api/save-to-sent', async (req, res) => {
     const { email, password, host, port, to, subject, body } = req.body;
@@ -434,12 +436,18 @@ app.post('/api/save-to-sent', async (req, res) => {
             /inbox\.sent/i.test(f.path)
         )?.path || 'INBOX.Sent';
 
+        const messageId = `<${Date.now()}.${Math.random().toString(36).substring(2, 10)}@${email.split('@')[1]}>`;
+        const date = new Date().toUTCString();
+
         const rawEmail = [
             `From: ${email}`,
             `To: ${to || ''}`,
             `Subject: ${subject || '(Sin asunto)'}`,
-            `Date: ${new Date().toUTCString()}`,
+            `Date: ${date}`,
+            `Message-ID: ${messageId}`,
+            `MIME-Version: 1.0`,
             `Content-Type: text/html; charset=utf-8`,
+            `Content-Transfer-Encoding: 7bit`,
             '',
             body || ''
         ].join('\r\n');
@@ -449,12 +457,13 @@ app.post('/api/save-to-sent', async (req, res) => {
 
         res.json({ success: true, message: 'Guardado en Enviados' });
     } catch (e) {
+        console.error('❌ Error en save-to-sent:', e.message);
         res.status(500).json({ success: false, error: 'Error al guardar en Enviados: ' + e.message });
     }
 });
 
 // ------------------------------------------------------------
-//  4. OBTENER CARPETAS (sin cambios)
+//  4. OBTENER CARPETAS
 // ------------------------------------------------------------
 app.post('/api/folders', async (req, res) => {
     const { email, password, host, port } = req.body;
@@ -470,7 +479,7 @@ app.post('/api/folders', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  5. OBTENER MENSAJES (OPTIMIZADO)
+//  5. OBTENER MENSAJES (CON FLAGS)
 // ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
@@ -490,7 +499,8 @@ app.post('/api/messages', async (req, res) => {
         const messages = [];
 
         try {
-            for await (const msg of client.fetch('1:*', { envelope: true }, { max: limit, reverse: true })) {
+            for await (const msg of client.fetch('1:*', { envelope: true, flags: true }, { max: limit, reverse: true })) {
+                const flags = msg.flags || [];
                 messages.push({
                     uid: msg.uid,
                     id: msg.uid.toString(),
@@ -498,7 +508,10 @@ app.post('/api/messages', async (req, res) => {
                     from: msg.envelope.from?.[0]?.address || msg.envelope.from?.[0]?.name || '',
                     to: msg.envelope.to?.[0]?.address || '',
                     date: msg.envelope.date ? new Date(msg.envelope.date).toISOString() : new Date().toISOString(),
-                    hasAttachments: false
+                    hasAttachments: false,
+                    flags: flags,
+                    isRead: flags.includes('\\Seen'),
+                    isFlagged: flags.includes('\\Flagged'),
                 });
             }
         } finally {
@@ -507,14 +520,15 @@ app.post('/api/messages', async (req, res) => {
 
         await client.logout();
         messages.sort((a, b) => new Date(b.date) - new Date(a.date));
-        res.json({ success: true, messages, total: messages.length });
+        res.json({ success: true, messages: messages, total: messages.length });
     } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
+        console.error('❌ Error en /api/messages:', err.message);
+        res.status(500).json({ success: false, error: err.message, messages: [] });
     }
 });
 
 // ------------------------------------------------------------
-//  6. DETALLE DEL CORREO (sin cambios)
+//  6. DETALLE DEL CORREO
 // ------------------------------------------------------------
 app.post('/api/message-detail', async (req, res) => {
     const { email, password, host, port, folder = 'INBOX', uid } = req.body;
@@ -558,7 +572,7 @@ app.post('/api/message-detail', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  7. ELIMINAR / MOVER A PAPELERA (sin cambios)
+//  7. ELIMINAR / MOVER A PAPELERA
 // ------------------------------------------------------------
 app.post('/api/delete-message', async (req, res) => {
     const { email, password, host, port, uid, folder = 'INBOX' } = req.body;
@@ -624,7 +638,7 @@ app.post('/api/delete-message', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  8. MOVER MENSAJE GENÉRICO (sin cambios)
+//  8. MOVER MENSAJE GENÉRICO
 // ------------------------------------------------------------
 app.post('/api/move-message', async (req, res) => {
     const { email, password, host, port, uid, fromFolder, toFolder } = req.body;
@@ -635,7 +649,7 @@ app.post('/api/move-message', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  9‑12. RESTO DE ENDPOINTS (sin cambios)
+//  9‑12. RESTO DE ENDPOINTS
 // ------------------------------------------------------------
 app.post('/api/toggle-read', async (req, res) => {
     const { email, password, host, port, uid, folder, read } = req.body;
@@ -677,5 +691,8 @@ app.post('/api/download-attachment', async (req, res) => {
     try { await client.connect(); await client.mailboxOpen(folder); const msg = await client.fetchOne(String(uid), { bodyParts: [partId] }, { uid: true }); await client.logout(); if (!msg?.bodyParts?.[partId]) return res.status(404).json({ success: false, error: 'Adjunto no encontrado' }); res.json({ success: true, data: msg.bodyParts[partId].toString('base64') }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
+// ------------------------------------------------------------
+//  INICIAR SERVIDOR
+// ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`✅ Backend RSMAIL en puerto ${PORT} con WebSocket y FCM`));

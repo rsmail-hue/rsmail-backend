@@ -6,13 +6,12 @@ const Imap = require('imap');
 const nodemailer = require('nodemailer');
 const WebSocket = require('ws');
 const http = require('http');
-const admin = require('firebase-admin'); // 👈 IMPORTANTE
+const admin = require('firebase-admin');
 
 // ------------------------------------------------------------
-//  FIREBASE ADMIN (para FCM push notifications)
+//  FIREBASE ADMIN (FCM)
 // ------------------------------------------------------------
 if (!admin.apps.length) {
-  // PRIMERO: intentar con variables de entorno (recomendado en Render)
   if (process.env.FIREBASE_PRIVATE_KEY) {
     try {
       admin.initializeApp({
@@ -27,7 +26,6 @@ if (!admin.apps.length) {
       console.error('❌ Error con variables de entorno:', e.message);
     }
   } else {
-    // SEGUNDO: intentar cargar el archivo local (solo para desarrollo)
     try {
       const serviceAccount = require('./serviceAccountKey.json');
       admin.initializeApp({
@@ -41,9 +39,6 @@ if (!admin.apps.length) {
 }
 const db = admin.firestore();
 
-// ------------------------------------------------------------
-//  EXPRESS + WEBSOCKET
-// ------------------------------------------------------------
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -52,9 +47,9 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
-//  WEBSOCKET + IMAP IDLE (sincronización en tiempo real)
+//  WEBSOCKET + IMAP IDLE
 // ------------------------------------------------------------
-const activeSessions = new Map(); // email -> { ws, imapClient, idleTimeout }
+const activeSessions = new Map();
 
 wss.on('connection', (ws, req) => {
   console.log('🔌 Nuevo cliente WebSocket conectado');
@@ -88,20 +83,69 @@ wss.on('connection', (ws, req) => {
   });
 });
 
+async function connectImap(email, password, host, port, secure) {
+  const config = {
+    host: host,
+    port: port,
+    secure: secure,
+    auth: { user: email, pass: password },
+    logger: console,
+    tls: {
+      rejectUnauthorized: false,
+      minVersion: 'TLSv1.2',
+    },
+    connectionTimeout: 30000,
+    authTimeout: 30000,
+  };
+  console.log(`🔄 Intentando conectar IMAP a ${host}:${port} (secure=${secure})`);
+  const client = new ImapFlow(config);
+  await client.connect();
+  return client;
+}
+
 async function startImapIdle(ws, email, password) {
   try {
     const auto = getAutoConfig(email);
-    const client = new ImapFlow({
-      host: auto.imapHost,
-      port: auto.imapPort,
-      secure: true,
-      auth: { user: email, pass: password },
-      logger: false,
-      tls: { rejectUnauthorized: false }
-    });
+    let client;
+    let connected = false;
+    let lastError = null;
 
-    await client.connect();
-    console.log(`✅ IMAP conectado para ${email}`);
+    // PRIORIDAD 1: STARTTLS en puerto 143
+    try {
+      client = await connectImap(email, password, auto.imapHost, 143, false);
+      await client.starttls();
+      connected = true;
+      console.log(`✅ IMAP conectado (STARTTLS) para ${email}`);
+    } catch (err1) {
+      lastError = err1;
+      console.log(`⚠️ Falló STARTTLS: ${err1.message}`);
+      // PRIORIDAD 2: SSL directo en 993
+      try {
+        client = await connectImap(email, password, auto.imapHost, 993, true);
+        connected = true;
+        console.log(`✅ IMAP conectado (SSL directo) para ${email}`);
+      } catch (err2) {
+        lastError = err2;
+        console.log(`⚠️ Falló SSL directo: ${err2.message}`);
+        // Último recurso: sin TLS
+        try {
+          client = await connectImap(email, password, auto.imapHost, 143, false);
+          connected = true;
+          console.log(`⚠️ IMAP conectado (sin TLS) para ${email} - ¡INSEGURO!`);
+        } catch (err3) {
+          lastError = err3;
+          console.error(`❌ Todos los intentos fallaron para ${email}`);
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: `Error IMAP: ${lastError.message}`,
+          }));
+          return;
+        }
+      }
+    }
+
+    if (!connected) return;
+
     await client.mailboxOpen('INBOX');
 
     if (activeSessions.has(email)) {
@@ -119,7 +163,6 @@ async function startImapIdle(ws, email, password) {
           timestamp: new Date().toISOString()
         }));
       }
-      // ✅ Enviar notificación push también
       await sendPushNotification(email, {
         title: '📧 Nuevo correo',
         body: 'Tienes un nuevo mensaje en tu bandeja de entrada',
@@ -215,7 +258,7 @@ async function sendPushNotification(email, payload) {
 }
 
 // ============================================================
-//  NUEVOS ENDPOINTS FCM
+//  ENDPOINTS FCM
 // ============================================================
 app.post('/api/fcm-token', async (req, res) => {
   const { email, token } = req.body;
@@ -295,7 +338,7 @@ function getAutoConfig(email) {
     if (domain.includes('outlook.com') || domain.includes('hotmail.com') || domain.includes('live.com')) return { imapHost: 'outlook.office365.com', imapPort: 993, smtpHost: 'smtp.office365.com', smtpPort: 587, secure: true };
     if (domain.includes('yahoo.')) return { imapHost: 'imap.mail.yahoo.com', imapPort: 993, smtpHost: 'smtp.mail.yahoo.com', smtpPort: 465, secure: true };
     if (domain.includes('zoho.')) return { imapHost: 'imap.zoho.com', imapPort: 993, smtpHost: 'smtp.zoho.com', smtpPort: 465, secure: true };
-    return { imapHost: 'mail.' + domain, imapPort: 993, smtpHost: 'mail.' + domain, smtpPort: 587, secure: true };
+    return { imapHost: 'mail.' + domain, imapPort: 143, smtpHost: 'mail.' + domain, smtpPort: 587, secure: false };
 }
 
 // ------------------------------------------------------------
@@ -371,7 +414,7 @@ app.post('/api/verify', handleAuth);
 app.get('/ping', (req, res) => res.json({ alive: true }));
 
 // ------------------------------------------------------------
-//  2. ENVÍO DE CORREO SMTP DESDE BACKEND
+//  2. ENVÍO DE CORREO SMTP
 // ------------------------------------------------------------
 app.post('/api/send-email', async (req, res) => {
     const { email, password, host, port, to, subject, body, attachments } = req.body;
@@ -479,28 +522,81 @@ app.post('/api/folders', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  5. OBTENER MENSAJES (CON FLAGS)
+//  5. OBTENER MENSAJES (CON CORRECCIÓN DE flags)
 // ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
     const auto = getAutoConfig(email);
-    const client = new ImapFlow({
-        host: host || auto.imapHost,
-        port: Number(port) || auto.imapPort,
-        secure: true,
-        auth: { user: email, pass: password },
-        logger: false,
-        tls: { rejectUnauthorized: false }
-    });
+    let client;
+    let connected = false;
+
+    // 🔥 PRIORIDAD 1: STARTTLS en puerto 143
+    try {
+        client = new ImapFlow({
+            host: host || auto.imapHost,
+            port: 143,
+            secure: false,
+            auth: { user: email, pass: password },
+            logger: false,
+            tls: { rejectUnauthorized: false }
+        });
+        await client.connect();
+        await client.starttls();
+        connected = true;
+        console.log(`✅ IMAP conectado (STARTTLS) para ${email} en /api/messages`);
+    } catch (err) {
+        console.log(`⚠️ Falló STARTTLS en /api/messages: ${err.message}`);
+        // PRIORIDAD 2: SSL directo en 993
+        try {
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 993,
+                secure: true,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+            connected = true;
+            console.log(`✅ IMAP conectado (SSL directo) para ${email} en /api/messages`);
+        } catch (err2) {
+            console.log(`⚠️ Falló SSL directo en /api/messages: ${err2.message}`);
+            // Último intento: sin TLS
+            try {
+                client = new ImapFlow({
+                    host: host || auto.imapHost,
+                    port: 143,
+                    secure: false,
+                    auth: { user: email, pass: password },
+                    logger: false,
+                    tls: { rejectUnauthorized: false }
+                });
+                await client.connect();
+                connected = true;
+                console.log(`⚠️ IMAP conectado (sin TLS) para ${email} en /api/messages - ¡INSEGURO!`);
+            } catch (err3) {
+                console.error(`❌ Todos los intentos fallaron para ${email}:`, err3.message);
+                return res.status(500).json({ success: false, error: err3.message, messages: [] });
+            }
+        }
+    }
+
+    if (!connected) {
+        return res.status(500).json({ success: false, error: 'No se pudo conectar al servidor IMAP', messages: [] });
+    }
 
     try {
-        await client.connect();
         const lock = await client.getMailboxLock(folder);
         const messages = [];
 
         try {
             for await (const msg of client.fetch('1:*', { envelope: true, flags: true }, { max: limit, reverse: true })) {
-                const flags = msg.flags || [];
+                // ✅ CORRECCIÓN: Asegurar que flags sea un array
+                let flags = msg.flags || [];
+                if (!Array.isArray(flags)) {
+                    // Si por alguna razón no es array, convertirlo
+                    flags = Object.values(flags);
+                }
                 messages.push({
                     uid: msg.uid,
                     id: msg.uid.toString(),

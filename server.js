@@ -47,9 +47,9 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
-//  WEBSOCKET + IMAP IDLE
+//  WEBSOCKET + IMAP IDLE (UNA CONEXIÓN POR USUARIO)
 // ------------------------------------------------------------
-const activeSessions = new Map();
+const activeSessions = new Map(); // email -> { ws, imapClient, idleTimeout }
 
 wss.on('connection', (ws, req) => {
   console.log('🔌 Nuevo cliente WebSocket conectado');
@@ -83,6 +83,9 @@ wss.on('connection', (ws, req) => {
   });
 });
 
+// ------------------------------------------------------------
+//  FUNCIÓN PARA CONECTAR IMAP CON UN SOLO INTENTO (sin múltiples fallbacks)
+// ------------------------------------------------------------
 async function connectImap(email, password, host, port, secure) {
   const config = {
     host: host,
@@ -94,97 +97,76 @@ async function connectImap(email, password, host, port, secure) {
       rejectUnauthorized: false,
       minVersion: 'TLSv1.2',
     },
-    connectionTimeout: 30000,
-    authTimeout: 30000,
+    connectionTimeout: 15000,
+    authTimeout: 15000,
   };
-  console.log(`🔄 Intentando conectar IMAP a ${host}:${port} (secure=${secure})`);
+  console.log(`🔄 Conectando IMAP a ${host}:${port} (secure=${secure})`);
   const client = new ImapFlow(config);
   await client.connect();
   return client;
 }
 
+// ------------------------------------------------------------
+//  START IMAP IDLE (CON CIERRE DE SESIONES ANTERIORES)
+// ------------------------------------------------------------
 async function startImapIdle(ws, email, password) {
   try {
     const auto = getAutoConfig(email);
     let client;
     let connected = false;
 
-    // PRIORIDAD 1: STARTTLS (si falla, SSL directo)
+    // 🔥 Si ya hay una sesión activa para este email, cerrarla primero
+    if (activeSessions.has(email)) {
+      const oldSession = activeSessions.get(email);
+      if (oldSession.idleTimeout) clearTimeout(oldSession.idleTimeout);
+      if (oldSession.imapClient) {
+        await oldSession.imapClient.logout().catch(() => {});
+      }
+      activeSessions.delete(email);
+      console.log(`♻️ Sesión IMAP anterior cerrada para ${email}`);
+    }
+
+    // 🔥 Intentar STARTTLS primero (puerto 143)
     try {
       client = await connectImap(email, password, auto.imapHost, 143, false);
-      await client.starttls();
+      await client.startTls();
       connected = true;
-      console.log(`✅ IMAP conectado (STARTTLS) para ${email}`);
+      console.log(`✅ IMAP IDLE conectado (STARTTLS) para ${email}`);
     } catch (err1) {
       console.log(`⚠️ Falló STARTTLS: ${err1.message}`);
+      // Intentar SSL directo (puerto 993)
       try {
         client = await connectImap(email, password, auto.imapHost, 993, true);
         connected = true;
-        console.log(`✅ IMAP conectado (SSL directo) para ${email}`);
+        console.log(`✅ IMAP IDLE conectado (SSL directo) para ${email}`);
       } catch (err2) {
-        console.log(`⚠️ Falló SSL directo: ${err2.message}`);
-        try {
-          client = await connectImap(email, password, auto.imapHost, 143, false);
-          connected = true;
-          console.log(`⚠️ IMAP conectado (sin TLS) para ${email} - ¡INSEGURO!`);
-        } catch (err3) {
-          console.error(`❌ Todos los intentos fallaron para ${email}`);
-          ws.send(JSON.stringify({
-            type: 'error',
-            message: `Error IMAP: ${err3.message}`,
-          }));
-          return;
-        }
+        console.error(`❌ Todos los intentos de conexión IDLE fallaron para ${email}`);
+        ws.send(JSON.stringify({
+          type: 'error',
+          message: `Error IMAP: ${err2.message}`,
+        }));
+        return;
       }
     }
 
     if (!connected) return;
 
     await client.mailboxOpen('INBOX');
-
-    if (activeSessions.has(email)) {
-      const old = activeSessions.get(email);
-      if (old.idleTimeout) clearTimeout(old.idleTimeout);
-      if (old.imapClient) old.imapClient.logout().catch(() => {});
-    }
     activeSessions.set(email, { ws, imapClient: client, idleTimeout: null });
 
-    // 🔥 Función para obtener detalles del nuevo correo
-    const getNewEmailDetails = async () => {
-      try {
-        const messages = await client.fetch('1:*', { envelope: true }, { max: 1, reverse: true });
-        if (messages.length > 0) {
-          const msg = messages[0];
-          const from = msg.envelope.from?.[0]?.address || 'remitente desconocido';
-          const subject = msg.envelope.subject || 'sin asunto';
-          return { from, subject };
-        }
-        return { from: 'remitente desconocido', subject: 'sin asunto' };
-      } catch (e) {
-        console.log('⚠️ Error obteniendo detalles del correo:', e.message);
-        return { from: 'remitente desconocido', subject: 'sin asunto' };
-      }
-    };
-
     const notifyNewEmail = async () => {
-      const details = await getNewEmailDetails();
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
           type: 'new_email',
           email: email,
-          timestamp: new Date().toISOString(),
-          from: details.from,
-          subject: details.subject,
+          timestamp: new Date().toISOString()
         }));
       }
+      // Notificación push (sin datos adicionales, la app los enriquecerá localmente)
       await sendPushNotification(email, {
-        title: `📧 Nuevo correo de ${details.from}`,
-        body: details.subject,
-        data: {
-          type: 'new_email',
-          from: details.from,
-          subject: details.subject,
-        }
+        title: '📧 Nuevo correo',
+        body: 'Tienes un nuevo mensaje en tu bandeja',
+        data: { type: 'new_email' }
       });
     };
 
@@ -194,13 +176,13 @@ async function startImapIdle(ws, email, password) {
         await notifyNewEmail();
         const session = activeSessions.get(email);
         if (session && session.imapClient) {
-          session.idleTimeout = setTimeout(idleLoop, 1000);
+          session.idleTimeout = setTimeout(idleLoop, 2000); // 🔥 Aumentado a 2s
         }
       } catch (e) {
         console.log(`⚠️ IDLE interrumpido para ${email}:`, e.message);
         const session = activeSessions.get(email);
         if (session) {
-          session.idleTimeout = setTimeout(idleLoop, 5000);
+          session.idleTimeout = setTimeout(idleLoop, 10000); // Reintentar después de 10s
         }
       }
     };
@@ -225,7 +207,7 @@ async function startImapIdle(ws, email, password) {
 }
 
 // ============================================================
-//  FCM PUSH NOTIFICATIONS
+//  FCM PUSH NOTIFICATIONS (sin cambios)
 // ============================================================
 async function sendPushNotification(email, payload) {
   try {
@@ -276,7 +258,7 @@ async function sendPushNotification(email, payload) {
 }
 
 // ============================================================
-//  ENDPOINTS FCM
+//  ENDPOINTS FCM (sin cambios)
 // ============================================================
 app.post('/api/fcm-token', async (req, res) => {
   const { email, token } = req.body;
@@ -327,13 +309,9 @@ app.post('/api/calendar-notify', async (req, res) => {
   if (!email) return res.status(400).json({ success: false, error: 'Email requerido' });
 
   await sendPushNotification(email, {
-    title: `📅 Recordatorio: ${eventTitle || 'Evento'}`,
-    body: `Fecha: ${eventDate || 'Próximamente'}`,
-    data: {
-      type: 'calendar_event',
-      eventTitle: eventTitle || 'Evento',
-      eventDate: eventDate || 'Próximamente',
-    }
+    title: '📅 Recordatorio de evento',
+    body: `${eventTitle || 'Evento'} - ${eventDate || 'Próximamente'}`,
+    data: { type: 'calendar_event', eventTitle: eventTitle || 'Evento', eventDate: eventDate || 'Próximamente' }
   });
   res.json({ success: true });
 });
@@ -343,19 +321,15 @@ app.post('/api/note-notify', async (req, res) => {
   if (!email) return res.status(400).json({ success: false, error: 'Email requerido' });
 
   await sendPushNotification(email, {
-    title: `📝 Nota compartida`,
-    body: `${senderEmail || 'Alguien'} compartió "${noteTitle || 'sin título'}"`,
-    data: {
-      type: 'note_shared',
-      noteTitle: noteTitle || 'sin título',
-      senderEmail: senderEmail || 'Alguien',
-    }
+    title: '📝 Nota compartida',
+    body: `${senderEmail || 'Alguien'} compartió "${noteTitle || 'una nota'}"`,
+    data: { type: 'note_shared', noteTitle: noteTitle || 'nota', senderEmail: senderEmail || 'Alguien' }
   });
   res.json({ success: true });
 });
 
 // ------------------------------------------------------------
-//  AUTO-CONFIGURACIÓN DE SERVIDORES
+//  AUTO-CONFIGURACIÓN DE SERVIDORES (para dominios genéricos priorizar STARTTLS)
 // ------------------------------------------------------------
 function getAutoConfig(email) {
     const domain = email.split('@')[1]?.toLowerCase();
@@ -368,7 +342,7 @@ function getAutoConfig(email) {
 }
 
 // ------------------------------------------------------------
-//  1. LOGIN / VERIFICACIÓN
+//  1. LOGIN / VERIFICACIÓN (sin cambios)
 // ------------------------------------------------------------
 const handleAuth = (req, res) => {
     const { email, password, host, port } = req.body;
@@ -440,7 +414,7 @@ app.post('/api/verify', handleAuth);
 app.get('/ping', (req, res) => res.json({ alive: true }));
 
 // ------------------------------------------------------------
-//  2. ENVÍO DE CORREO SMTP
+//  2. ENVÍO DE CORREO SMTP (sin cambios)
 // ------------------------------------------------------------
 app.post('/api/send-email', async (req, res) => {
     const { email, password, host, port, to, subject, body, attachments } = req.body;
@@ -478,7 +452,7 @@ app.post('/api/send-email', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  3. GUARDAR EN ENVIADOS
+//  3. GUARDAR EN ENVIADOS (sin cambios)
 // ------------------------------------------------------------
 app.post('/api/save-to-sent', async (req, res) => {
     const { email, password, host, port, to, subject, body } = req.body;
@@ -532,23 +506,49 @@ app.post('/api/save-to-sent', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  4. OBTENER CARPETAS
+//  4. OBTENER CARPETAS (con cierre de conexión)
 // ------------------------------------------------------------
 app.post('/api/folders', async (req, res) => {
     const { email, password, host, port } = req.body;
     const auto = getAutoConfig(email);
-    const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+    let client;
     try {
-        await client.connect();
+        // Intentar STARTTLS primero
+        try {
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 143,
+                secure: false,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+            await client.startTls();
+        } catch (err) {
+            // Fallback SSL directo
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 993,
+                secure: true,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+        }
         const list = await client.list();
         await client.logout();
         const folders = list.map(f => ({ name: f.name, path: f.path, specialUse: f.specialUse || '' }));
         res.json({ success: true, folders });
-    } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+    } catch (err) {
+        if (client) await client.logout().catch(() => {});
+        res.status(500).json({ success: false, error: err.message });
+    }
 });
 
 // ------------------------------------------------------------
-//  5. OBTENER MENSAJES
+//  5. OBTENER MENSAJES (CON UNA SOLA CONEXIÓN Y CIERRE)
 // ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
@@ -556,7 +556,7 @@ app.post('/api/messages', async (req, res) => {
     let client;
     let connected = false;
 
-    // PRIORIDAD 1: STARTTLS
+    // 🔥 Intentar STARTTLS primero (143)
     try {
         client = new ImapFlow({
             host: host || auto.imapHost,
@@ -567,12 +567,12 @@ app.post('/api/messages', async (req, res) => {
             tls: { rejectUnauthorized: false }
         });
         await client.connect();
-        await client.starttls();
+        await client.startTls();
         connected = true;
         console.log(`✅ IMAP conectado (STARTTLS) para ${email} en /api/messages`);
     } catch (err) {
         console.log(`⚠️ Falló STARTTLS en /api/messages: ${err.message}`);
-        // PRIORIDAD 2: SSL directo
+        // Fallback a SSL directo (993)
         try {
             client = new ImapFlow({
                 host: host || auto.imapHost,
@@ -586,24 +586,8 @@ app.post('/api/messages', async (req, res) => {
             connected = true;
             console.log(`✅ IMAP conectado (SSL directo) para ${email} en /api/messages`);
         } catch (err2) {
-            console.log(`⚠️ Falló SSL directo en /api/messages: ${err2.message}`);
-            // Último intento: sin TLS
-            try {
-                client = new ImapFlow({
-                    host: host || auto.imapHost,
-                    port: 143,
-                    secure: false,
-                    auth: { user: email, pass: password },
-                    logger: false,
-                    tls: { rejectUnauthorized: false }
-                });
-                await client.connect();
-                connected = true;
-                console.log(`⚠️ IMAP conectado (sin TLS) para ${email} en /api/messages - ¡INSEGURO!`);
-            } catch (err3) {
-                console.error(`❌ Todos los intentos fallaron para ${email}:`, err3.message);
-                return res.status(500).json({ success: false, error: err3.message, messages: [] });
-            }
+            console.error(`❌ Falló SSL directo en /api/messages: ${err2.message}`);
+            return res.status(500).json({ success: false, error: err2.message, messages: [] });
         }
     }
 
@@ -618,9 +602,7 @@ app.post('/api/messages', async (req, res) => {
         try {
             for await (const msg of client.fetch('1:*', { envelope: true, flags: true }, { max: limit, reverse: true })) {
                 let flags = msg.flags || [];
-                if (!Array.isArray(flags)) {
-                    flags = Object.values(flags);
-                }
+                if (!Array.isArray(flags)) flags = Object.values(flags);
                 messages.push({
                     uid: msg.uid,
                     id: msg.uid.toString(),
@@ -642,21 +624,44 @@ app.post('/api/messages', async (req, res) => {
         messages.sort((a, b) => new Date(b.date) - new Date(a.date));
         res.json({ success: true, messages: messages, total: messages.length });
     } catch (err) {
+        await client.logout().catch(() => {});
         console.error('❌ Error en /api/messages:', err.message);
         res.status(500).json({ success: false, error: err.message, messages: [] });
     }
 });
 
 // ------------------------------------------------------------
-//  6. DETALLE DEL CORREO
+//  6. DETALLE DEL CORREO (con conexión y cierre)
 // ------------------------------------------------------------
 app.post('/api/message-detail', async (req, res) => {
     const { email, password, host, port, folder = 'INBOX', uid } = req.body;
     if (!uid) return res.status(400).json({ success: false, error: 'UID requerido' });
     const auto = getAutoConfig(email);
-    const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+    let client;
     try {
-        await client.connect();
+        // Intentar STARTTLS
+        try {
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 143,
+                secure: false,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+            await client.startTls();
+        } catch (err) {
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 993,
+                secure: true,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+        }
         const lock = await client.getMailboxLock(folder);
         let parsed;
         try {
@@ -688,35 +693,46 @@ app.post('/api/message-detail', async (req, res) => {
                 attachments
             }
         });
-    } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+    } catch (err) {
+        if (client) await client.logout().catch(() => {});
+        res.status(500).json({ success: false, error: err.message });
+    }
 });
 
 // ------------------------------------------------------------
-//  7. ELIMINAR / MOVER A PAPELERA
+//  7. ELIMINAR / MOVER A PAPELERA (con conexión y cierre)
 // ------------------------------------------------------------
 app.post('/api/delete-message', async (req, res) => {
     const { email, password, host, port, uid, folder = 'INBOX' } = req.body;
     if (!uid) return res.status(400).json({ success: false, error: 'Falta UID' });
-
     const auto = getAutoConfig(email);
-    const client = new ImapFlow({
-        host: host || auto.imapHost,
-        port: Number(port) || auto.imapPort,
-        secure: true,
-        auth: { user: email, pass: password },
-        logger: false,
-        tls: { rejectUnauthorized: false }
-    });
-
+    let client;
     try {
-        await client.connect();
-
-        const lock = await client.getMailboxLock(folder);
-
         try {
-            const isAlreadyTrash = folder.toLowerCase().includes('trash') ||
-                                   folder.toLowerCase().includes('papelera');
-
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 143,
+                secure: false,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+            await client.startTls();
+        } catch (err) {
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 993,
+                secure: true,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+        }
+        const lock = await client.getMailboxLock(folder);
+        try {
+            const isAlreadyTrash = folder.toLowerCase().includes('trash') || folder.toLowerCase().includes('papelera');
             if (isAlreadyTrash) {
                 await client.messageDelete(String(uid), { uid: true });
             } else {
@@ -728,7 +744,6 @@ app.post('/api/delete-message', async (req, res) => {
                     /inbox\.trash/i.test(f.path) ||
                     /inbox\/trash/i.test(f.path)
                 )?.path;
-
                 if (!trashFolder) {
                     const candidates = ['INBOX.Trash', 'Trash', 'Papelera'];
                     for (const cand of candidates) {
@@ -742,73 +757,250 @@ app.post('/api/delete-message', async (req, res) => {
                         throw new Error('No se encontró ni se pudo crear la carpeta de Papelera');
                     }
                 }
-
                 await client.messageMove(String(uid), trashFolder, { uid: true });
             }
         } finally {
             lock.release();
         }
-
         await client.logout();
         res.json({ success: true, message: 'Mensaje procesado correctamente' });
     } catch (e) {
+        if (client) await client.logout().catch(() => {});
         console.error('❌ Error en delete-message:', e.message);
         res.status(500).json({ success: false, error: e.message });
     }
 });
 
 // ------------------------------------------------------------
-//  8. MOVER MENSAJE GENÉRICO
+//  8. MOVER MENSAJE GENÉRICO (con conexión y cierre)
 // ------------------------------------------------------------
 app.post('/api/move-message', async (req, res) => {
     const { email, password, host, port, uid, fromFolder, toFolder } = req.body;
     if (!uid || !fromFolder || !toFolder) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
     const auto = getAutoConfig(email);
-    const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-    try { await client.connect(); await client.messageMove(uid, toFolder, { uid: true }); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+    let client;
+    try {
+        try {
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 143,
+                secure: false,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+            await client.startTls();
+        } catch (err) {
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 993,
+                secure: true,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+        }
+        await client.messageMove(uid, toFolder, { uid: true });
+        await client.logout();
+        res.json({ success: true });
+    } catch (e) {
+        if (client) await client.logout().catch(() => {});
+        res.status(500).json({ success: false, error: e.message });
+    }
 });
 
 // ------------------------------------------------------------
-//  9‑12. RESTO DE ENDPOINTS
+//  9‑12. RESTO DE ENDPOINTS (con conexión y cierre)
 // ------------------------------------------------------------
 app.post('/api/toggle-read', async (req, res) => {
     const { email, password, host, port, uid, folder, read } = req.body;
     if (uid == null || !folder) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
     const auto = getAutoConfig(email);
-    const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-    try { await client.connect(); if (read) await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true }); else await client.messageFlagsRemove(uid, ['\\Seen'], { uid: true }); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+    let client;
+    try {
+        try {
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 143,
+                secure: false,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+            await client.startTls();
+        } catch (err) {
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 993,
+                secure: true,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+        }
+        if (read) await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true });
+        else await client.messageFlagsRemove(uid, ['\\Seen'], { uid: true });
+        await client.logout();
+        res.json({ success: true });
+    } catch (e) {
+        if (client) await client.logout().catch(() => {});
+        res.status(500).json({ success: false, error: e.message });
+    }
 });
 
 app.post('/api/toggle-flagged', async (req, res) => {
     const { email, password, host, port, uid, folder, flagged } = req.body;
     if (uid == null || !folder) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
     const auto = getAutoConfig(email);
-    const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-    try { await client.connect(); if (flagged) await client.messageFlagsAdd(uid, ['\\Flagged'], { uid: true }); else await client.messageFlagsRemove(uid, ['\\Flagged'], { uid: true }); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+    let client;
+    try {
+        try {
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 143,
+                secure: false,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+            await client.startTls();
+        } catch (err) {
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 993,
+                secure: true,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+        }
+        if (flagged) await client.messageFlagsAdd(uid, ['\\Flagged'], { uid: true });
+        else await client.messageFlagsRemove(uid, ['\\Flagged'], { uid: true });
+        await client.logout();
+        res.json({ success: true });
+    } catch (e) {
+        if (client) await client.logout().catch(() => {});
+        res.status(500).json({ success: false, error: e.message });
+    }
 });
 
 app.post('/api/create-folder', async (req, res) => {
     const { email, password, host, port, folderName } = req.body;
     if (!folderName) return res.status(400).json({ success: false, error: 'Falta folderName' });
     const auto = getAutoConfig(email);
-    const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-    try { await client.connect(); await client.mailboxCreate(folderName); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+    let client;
+    try {
+        try {
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 143,
+                secure: false,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+            await client.startTls();
+        } catch (err) {
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 993,
+                secure: true,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+        }
+        await client.mailboxCreate(folderName);
+        await client.logout();
+        res.json({ success: true });
+    } catch (e) {
+        if (client) await client.logout().catch(() => {});
+        res.status(500).json({ success: false, error: e.message });
+    }
 });
 
 app.post('/api/delete-folder', async (req, res) => {
     const { email, password, host, port, folderName } = req.body;
     if (!folderName) return res.status(400).json({ success: false, error: 'Falta folderName' });
     const auto = getAutoConfig(email);
-    const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-    try { await client.connect(); await client.mailboxDelete(folderName); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+    let client;
+    try {
+        try {
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 143,
+                secure: false,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+            await client.startTls();
+        } catch (err) {
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 993,
+                secure: true,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+        }
+        await client.mailboxDelete(folderName);
+        await client.logout();
+        res.json({ success: true });
+    } catch (e) {
+        if (client) await client.logout().catch(() => {});
+        res.status(500).json({ success: false, error: e.message });
+    }
 });
 
 app.post('/api/download-attachment', async (req, res) => {
     const { email, password, host, port, folder, uid, partId } = req.body;
     if (!uid || !folder || !partId) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
     const auto = getAutoConfig(email);
-    const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-    try { await client.connect(); await client.mailboxOpen(folder); const msg = await client.fetchOne(String(uid), { bodyParts: [partId] }, { uid: true }); await client.logout(); if (!msg?.bodyParts?.[partId]) return res.status(404).json({ success: false, error: 'Adjunto no encontrado' }); res.json({ success: true, data: msg.bodyParts[partId].toString('base64') }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+    let client;
+    try {
+        try {
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 143,
+                secure: false,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+            await client.startTls();
+        } catch (err) {
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 993,
+                secure: true,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+        }
+        await client.mailboxOpen(folder);
+        const msg = await client.fetchOne(String(uid), { bodyParts: [partId] }, { uid: true });
+        await client.logout();
+        if (!msg?.bodyParts?.[partId]) return res.status(404).json({ success: false, error: 'Adjunto no encontrado' });
+        res.json({ success: true, data: msg.bodyParts[partId].toString('base64') });
+    } catch (e) {
+        if (client) await client.logout().catch(() => {});
+        res.status(500).json({ success: false, error: e.message });
+    }
 });
 
 // ------------------------------------------------------------

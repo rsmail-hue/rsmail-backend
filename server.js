@@ -47,9 +47,9 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
-//  WEBSOCKET + IMAP IDLE + POLLING
+//  POLLING POR CUENTA (sin IDLE)
 // ------------------------------------------------------------
-const activeSessions = new Map(); // email -> { ws, imapClient, idleTimeout, lastUid, pollingInterval }
+const pollingStates = new Map(); // email -> { lastUid, interval, client }
 
 wss.on('connection', (ws, req) => {
   console.log('🔌 Nuevo cliente WebSocket conectado');
@@ -63,7 +63,7 @@ wss.on('connection', (ws, req) => {
         email = data.email;
         password = data.password;
         console.log(`📧 WebSocket login para ${email}`);
-        await startImapIdle(ws, email, password);
+        startPolling(ws, email, password);
       }
     } catch (e) {
       console.error('❌ Error en WebSocket:', e);
@@ -72,20 +72,19 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     console.log('🔌 Cliente WebSocket desconectado');
-    if (email && activeSessions.has(email)) {
-      const session = activeSessions.get(email);
-      if (session.idleTimeout) clearTimeout(session.idleTimeout);
-      if (session.pollingInterval) clearInterval(session.pollingInterval);
-      if (session.imapClient) {
-        session.imapClient.logout().catch(() => {});
+    if (email && pollingStates.has(email)) {
+      const state = pollingStates.get(email);
+      if (state.interval) clearInterval(state.interval);
+      if (state.client) {
+        state.client.logout().catch(() => {});
       }
-      activeSessions.delete(email);
+      pollingStates.delete(email);
     }
   });
 });
 
 // ------------------------------------------------------------
-//  FUNCIÓN PARA CONECTAR IMAP CON FALLBACK
+//  FUNCIÓN PARA CONECTAR IMAP (con fallback)
 // ------------------------------------------------------------
 async function connectImap(email, password, host, port, secure) {
   const config = {
@@ -93,11 +92,8 @@ async function connectImap(email, password, host, port, secure) {
     port: port,
     secure: secure,
     auth: { user: email, pass: password },
-    logger: console,
-    tls: {
-      rejectUnauthorized: false,
-      minVersion: 'TLSv1.2',
-    },
+    logger: false,
+    tls: { rejectUnauthorized: false },
     connectionTimeout: 15000,
     authTimeout: 15000,
   };
@@ -108,173 +104,110 @@ async function connectImap(email, password, host, port, secure) {
 }
 
 // ------------------------------------------------------------
-//  START IMAP IDLE + POLLING
+//  INICIAR POLLING
 // ------------------------------------------------------------
-async function startImapIdle(ws, email, password) {
+async function startPolling(ws, email, password) {
+  // Si ya existe polling para este email, detenerlo
+  if (pollingStates.has(email)) {
+    const old = pollingStates.get(email);
+    if (old.interval) clearInterval(old.interval);
+    if (old.client) old.client.logout().catch(() => {});
+    pollingStates.delete(email);
+  }
+
+  const auto = getAutoConfig(email);
+  let client = null;
+  let lastUid = 0;
+
+  // Intentar conectar IMAP inicialmente
   try {
-    const auto = getAutoConfig(email);
-    let client;
-    let connected = false;
-
-    // Si ya hay sesión, cerrarla
-    if (activeSessions.has(email)) {
-      const oldSession = activeSessions.get(email);
-      if (oldSession.idleTimeout) clearTimeout(oldSession.idleTimeout);
-      if (oldSession.pollingInterval) clearInterval(oldSession.pollingInterval);
-      if (oldSession.imapClient) {
-        await oldSession.imapClient.logout().catch(() => {});
-      }
-      activeSessions.delete(email);
-      console.log(`♻️ Sesión IMAP anterior cerrada para ${email}`);
-    }
-
-    // Intentar STARTTLS (143)
+    // Probar SSL directo (993)
+    client = await connectImap(email, password, auto.imapHost, 993, true);
+    console.log(`✅ IMAP conectado (SSL) para ${email}`);
+  } catch (err) {
+    console.log(`⚠️ Falló SSL directo para ${email}: ${err.message}`);
     try {
+      // Probar STARTTLS (143)
       client = await connectImap(email, password, auto.imapHost, 143, false);
       await client.startTls();
-      connected = true;
-      console.log(`✅ IMAP IDLE conectado (STARTTLS) para ${email}`);
-    } catch (err1) {
-      console.log(`⚠️ Falló STARTTLS: ${err1.message}`);
-      // Intentar SSL directo (993)
-      try {
-        client = await connectImap(email, password, auto.imapHost, 993, true);
-        connected = true;
-        console.log(`✅ IMAP IDLE conectado (SSL directo) para ${email}`);
-      } catch (err2) {
-        console.error(`❌ Todos los intentos de conexión IDLE fallaron para ${email}`);
-        // Aun así, intentaremos usar polling sin IDLE
-        connected = false;
-      }
+      console.log(`✅ IMAP conectado (STARTTLS) para ${email}`);
+    } catch (err2) {
+      console.error(`❌ No se pudo conectar IMAP para ${email}:`, err2.message);
+      // Si no podemos conectar, no hacemos polling
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: 'Error al conectar con el servidor de correo'
+      }));
+      return;
     }
+  }
 
-    // Obtener el último UID conocido
-    let lastUid = 0;
-    if (connected) {
-      try {
-        await client.mailboxOpen('INBOX');
-        const results = await client.fetch('1:*', { uid: true }, { max: 1, reverse: true });
-        if (results && results.length > 0) {
-          lastUid = results[0].uid || 0;
-        }
-      } catch (e) {
-        console.log('⚠️ No se pudo obtener el último UID:', e.message);
-      }
+  // Obtener el último UID
+  try {
+    await client.mailboxOpen('INBOX');
+    const results = await client.fetch('1:*', { uid: true }, { max: 1, reverse: true });
+    if (results && results.length > 0) {
+      lastUid = results[0].uid || 0;
     }
+  } catch (e) {
+    console.log(`⚠️ No se pudo obtener último UID para ${email}:`, e.message);
+  }
 
-    // Guardar sesión
-    const session = {
-      ws,
-      imapClient: connected ? client : null,
-      idleTimeout: null,
-      pollingInterval: null,
-      lastUid: lastUid,
-      email: email,
-      password: password,
-      imapHost: auto.imapHost,
-      isConnected: connected
-    };
-    activeSessions.set(email, session);
+  // Guardar estado
+  const state = {
+    lastUid: lastUid,
+    client: client,
+    interval: null,
+    ws: ws,
+    email: email,
+    password: password,
+    host: auto.imapHost,
+    isConnected: true
+  };
+  pollingStates.set(email, state);
 
-    // ------------------------------------------------------------
-    //  POLLING DE RESPALDO (cada 15 segundos)
-    // ------------------------------------------------------------
-    const startPolling = () => {
-      if (session.pollingInterval) clearInterval(session.pollingInterval);
-      session.pollingInterval = setInterval(async () => {
+  // ------------------------------------------------------------
+  //  FUNCIÓN DE POLLING (se ejecuta cada 15 segundos)
+  // ------------------------------------------------------------
+  const poll = async () => {
+    try {
+      let currentClient = state.client;
+      let currentUid = state.lastUid;
+
+      // Verificar si el cliente sigue conectado
+      if (!state.isConnected || !currentClient) {
+        // Reintentar conexión
         try {
-          // Intentar conectar si no hay cliente o está cerrado
-          let pollClient = session.imapClient;
-          if (!pollClient || !session.isConnected) {
-            try {
-              // Intentar reconectar
-              let newClient;
-              try {
-                newClient = await connectImap(email, password, auto.imapHost, 143, false);
-                await newClient.startTls();
-              } catch (err) {
-                newClient = await connectImap(email, password, auto.imapHost, 993, true);
-              }
-              session.imapClient = newClient;
-              session.isConnected = true;
-              pollClient = newClient;
-              console.log(`✅ Polling: reconexión IMAP exitosa para ${email}`);
-            } catch (e) {
-              console.log(`⚠️ Polling: no se pudo reconectar IMAP para ${email}:`, e.message);
-              return;
-            }
-          }
-
-          await pollClient.mailboxOpen('INBOX');
-          const results = await pollClient.fetch('1:*', { uid: true, envelope: true }, { max: 1, reverse: true });
-          if (results && results.length > 0) {
-            const latest = results[0];
-            const currentUid = latest.uid || 0;
-            if (currentUid > session.lastUid) {
-              // Nuevo correo detectado por polling
-              session.lastUid = currentUid;
-              const from = latest.envelope.from?.[0]?.address || 'Remitente desconocido';
-              const subject = latest.envelope.subject || 'Nuevo correo';
-              console.log(`📨 Polling: Nuevo correo detectado para ${email} (UID: ${currentUid})`);
-
-              // Notificar por WebSocket
-              if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                  type: 'new_email',
-                  email: email,
-                  timestamp: new Date().toISOString(),
-                  from: from,
-                  subject: subject
-                }));
-              }
-
-              // Notificación push
-              await sendPushNotification(email, {
-                title: `📧 Nuevo correo de ${from}`,
-                body: subject,
-                data: { type: 'new_email', from: from, subject: subject }
-              });
-            }
-          }
-        } catch (e) {
-          console.log(`⚠️ Polling error para ${email}:`, e.message);
-          session.isConnected = false;
-        }
-      }, 15000); // Cada 15 segundos
-    };
-
-    // Iniciar polling siempre (como respaldo)
-    startPolling();
-
-    // ------------------------------------------------------------
-    //  IDLE (si la conexión inicial fue exitosa)
-    // ------------------------------------------------------------
-    if (connected && client) {
-      const notifyNewEmail = async () => {
-        try {
-          // Obtener detalles del último correo
-          const lock = await client.getMailboxLock('INBOX');
-          let from = 'Remitente desconocido';
-          let subject = 'Nuevo correo';
-          let uid = 0;
+          let newClient;
           try {
-            const results = await client.fetch('1:*', { envelope: true, uid: true }, { max: 1, reverse: true });
-            if (results && results.length > 0) {
-              const msg = results[0];
-              uid = msg.uid || 0;
-              from = msg.envelope.from?.[0]?.address || from;
-              subject = msg.envelope.subject || subject;
-              if (uid > session.lastUid) {
-                session.lastUid = uid;
-              }
-            }
-          } catch (fetchErr) {
-            console.log('⚠️ IDLE: No se pudieron obtener detalles del correo:', fetchErr.message);
-          } finally {
-            lock.release();
+            newClient = await connectImap(email, password, state.host, 993, true);
+          } catch (err) {
+            newClient = await connectImap(email, password, state.host, 143, false);
+            await newClient.startTls();
           }
+          state.client = newClient;
+          state.isConnected = true;
+          currentClient = newClient;
+          console.log(`✅ Polling: reconexión IMAP exitosa para ${email}`);
+        } catch (e) {
+          console.log(`⚠️ Polling: no se pudo reconectar IMAP para ${email}:`, e.message);
+          return;
+        }
+      }
 
-          // WebSocket
+      await currentClient.mailboxOpen('INBOX');
+      const results = await currentClient.fetch('1:*', { uid: true, envelope: true }, { max: 1, reverse: true });
+      if (results && results.length > 0) {
+        const latest = results[0];
+        const newUid = latest.uid || 0;
+        if (newUid > currentUid) {
+          // Nuevo correo detectado
+          state.lastUid = newUid;
+          const from = latest.envelope.from?.[0]?.address || 'Remitente desconocido';
+          const subject = latest.envelope.subject || 'Nuevo correo';
+          console.log(`📨 Polling: Nuevo correo detectado para ${email} (UID: ${newUid})`);
+
+          // Notificar por WebSocket
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
               type: 'new_email',
@@ -285,46 +218,24 @@ async function startImapIdle(ws, email, password) {
             }));
           }
 
-          // Push notification
+          // Enviar notificación push
           await sendPushNotification(email, {
             title: `📧 Nuevo correo de ${from}`,
             body: subject,
             data: { type: 'new_email', from: from, subject: subject }
           });
-        } catch (e) {
-          console.error('❌ Error en notifyNewEmail (IDLE):', e.message);
         }
-      };
-
-      const idleLoop = async () => {
-        try {
-          await client.idle();
-          await notifyNewEmail();
-          const sessionData = activeSessions.get(email);
-          if (sessionData && sessionData.imapClient) {
-            sessionData.idleTimeout = setTimeout(idleLoop, 1000);
-          }
-        } catch (e) {
-          console.log(`⚠️ IDLE interrumpido para ${email}:`, e.message);
-          const sessionData = activeSessions.get(email);
-          if (sessionData) {
-            sessionData.isConnected = false;
-            sessionData.idleTimeout = setTimeout(idleLoop, 5000);
-          }
-        }
-      };
-
-      // Iniciar IDLE (si la conexión existe)
-      idleLoop();
+      }
+    } catch (e) {
+      console.log(`⚠️ Polling error para ${email}:`, e.message);
+      state.isConnected = false;
     }
+  };
 
-  } catch (e) {
-    console.error(`❌ Error iniciando sesión para ${email}:`, e.message);
-    ws.send(JSON.stringify({
-      type: 'error',
-      message: 'Error al conectar con IMAP: ' + e.message
-    }));
-  }
+  // Ejecutar poll inmediatamente y luego cada 15 segundos
+  await poll();
+  state.interval = setInterval(poll, 15000);
+  console.log(`✅ Polling iniciado para ${email} (cada 15s)`);
 }
 
 // ============================================================
@@ -379,7 +290,7 @@ async function sendPushNotification(email, payload) {
 }
 
 // ============================================================
-//  ENDPOINTS FCM (MEJORADOS)
+//  ENDPOINTS FCM
 // ============================================================
 app.post('/api/fcm-token', async (req, res) => {
   const { email, token } = req.body;
@@ -459,11 +370,11 @@ function getAutoConfig(email) {
     if (domain.includes('outlook.com') || domain.includes('hotmail.com') || domain.includes('live.com')) return { imapHost: 'outlook.office365.com', imapPort: 993, smtpHost: 'smtp.office365.com', smtpPort: 587, secure: true };
     if (domain.includes('yahoo.')) return { imapHost: 'imap.mail.yahoo.com', imapPort: 993, smtpHost: 'smtp.mail.yahoo.com', smtpPort: 465, secure: true };
     if (domain.includes('zoho.')) return { imapHost: 'imap.zoho.com', imapPort: 993, smtpHost: 'smtp.zoho.com', smtpPort: 465, secure: true };
-    return { imapHost: 'mail.' + domain, imapPort: 143, smtpHost: 'mail.' + domain, smtpPort: 587, secure: false };
+    return { imapHost: 'mail.' + domain, imapPort: 993, smtpHost: 'mail.' + domain, smtpPort: 587, secure: true };
 }
 
 // ------------------------------------------------------------
-//  LOGIN / VERIFICACIÓN
+//  1. LOGIN / VERIFICACIÓN
 // ------------------------------------------------------------
 const handleAuth = (req, res) => {
     const { email, password, host, port } = req.body;
@@ -535,7 +446,7 @@ app.post('/api/verify', handleAuth);
 app.get('/ping', (req, res) => res.json({ alive: true }));
 
 // ------------------------------------------------------------
-//  ENVÍO DE CORREO SMTP
+//  2. ENVÍO DE CORREO SMTP
 // ------------------------------------------------------------
 app.post('/api/send-email', async (req, res) => {
     const { email, password, host, port, to, subject, body, attachments } = req.body;
@@ -573,7 +484,7 @@ app.post('/api/send-email', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  GUARDAR EN ENVIADOS
+//  3. GUARDAR EN ENVIADOS
 // ------------------------------------------------------------
 app.post('/api/save-to-sent', async (req, res) => {
     const { email, password, host, port, to, subject, body } = req.body;
@@ -643,62 +554,44 @@ app.post('/api/folders', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  5. OBTENER MENSAJES (CON CORRECCIÓN DE flags)
+//  5. OBTENER MENSAJES
 // ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
     const auto = getAutoConfig(email);
     let client;
-    let connected = false;
-
-    // PRIORIDAD 1: STARTTLS en puerto 143
     try {
-        client = new ImapFlow({
-            host: host || auto.imapHost,
-            port: 143,
-            secure: false,
-            auth: { user: email, pass: password },
-            logger: false,
-            tls: { rejectUnauthorized: false }
-        });
-        await client.connect();
-        await client.starttls();
-        connected = true;
-        console.log(`✅ IMAP conectado (STARTTLS) para ${email} en /api/messages`);
-    } catch (err) {
-        console.log(`⚠️ Falló STARTTLS en /api/messages: ${err.message}`);
+        // Intentar SSL directo
         try {
             client = new ImapFlow({
                 host: host || auto.imapHost,
-                port: 993,
+                port: Number(port) || 993,
                 secure: true,
                 auth: { user: email, pass: password },
                 logger: false,
                 tls: { rejectUnauthorized: false }
             });
             await client.connect();
-            connected = true;
-            console.log(`✅ IMAP conectado (SSL directo) para ${email} en /api/messages`);
-        } catch (err2) {
-            console.error(`❌ Falló SSL directo en /api/messages: ${err2.message}`);
-            return res.status(500).json({ success: false, error: err2.message, messages: [] });
+        } catch (err) {
+            // Fallback a STARTTLS
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 143,
+                secure: false,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+            await client.startTls();
         }
-    }
-
-    if (!connected) {
-        return res.status(500).json({ success: false, error: 'No se pudo conectar al servidor IMAP', messages: [] });
-    }
-
-    try {
         const lock = await client.getMailboxLock(folder);
         const messages = [];
 
         try {
             for await (const msg of client.fetch('1:*', { envelope: true, flags: true }, { max: limit, reverse: true })) {
                 let flags = msg.flags || [];
-                if (!Array.isArray(flags)) {
-                    flags = Object.values(flags);
-                }
+                if (!Array.isArray(flags)) flags = Object.values(flags);
                 messages.push({
                     uid: msg.uid,
                     id: msg.uid.toString(),
@@ -721,6 +614,7 @@ app.post('/api/messages', async (req, res) => {
         res.json({ success: true, messages: messages, total: messages.length });
     } catch (err) {
         console.error('❌ Error en /api/messages:', err.message);
+        if (client) await client.logout().catch(() => {});
         res.status(500).json({ success: false, error: err.message, messages: [] });
     }
 });
@@ -892,4 +786,4 @@ app.post('/api/download-attachment', async (req, res) => {
 //  INICIAR SERVIDOR
 // ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`✅ Backend RSMAIL en puerto ${PORT} con WebSocket, IDLE y polling`));
+server.listen(PORT, () => console.log(`✅ Backend RSMAIL en puerto ${PORT} con polling (sin IDLE)`));

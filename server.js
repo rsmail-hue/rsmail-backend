@@ -37,7 +37,7 @@ if (!admin.apps.length) {
     }
   }
 }
-const db = admin.firestore();
+const db = admin.apps.length ? admin.firestore() : null;
 
 const app = express();
 app.use(cors());
@@ -47,7 +47,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
-//  POLLING POR CUENTA
+//  POLLING POR CUENTA (CORREGIDO CON LOCKS)
 // ------------------------------------------------------------
 const pollingStates = new Map();
 
@@ -69,17 +69,20 @@ async function connectImap(email, password, host, port, secure) {
   return client;
 }
 
-// Obtener UIDs y sobres de todos los mensajes usando iterador asíncrono
+// Obtener UIDs y sobres de todos los mensajes abriendo el Lock correctamente
 async function fetchAllMessages(client) {
   const messages = [];
+  let lock;
   try {
-    await client.mailboxOpen('INBOX');
+    lock = await client.getMailboxLock('INBOX');
     const iter = client.fetch('1:*', { uid: true, envelope: true });
     for await (const msg of iter) {
       messages.push(msg);
     }
   } catch (e) {
     console.log('⚠️ Error en fetchAllMessages:', e.message);
+  } finally {
+    if (lock) lock.release();
   }
   return messages;
 }
@@ -121,16 +124,17 @@ async function startPolling(ws, email, password) {
   }
 
   const auto = getAutoConfig(email);
-  
+  const host = auto ? auto.imapHost : 'imap.gmail.com';
+
   // Conectar inicialmente para obtener UIDs
   let client;
   try {
-    client = await connectImap(email, password, auto.imapHost, 993, true);
+    client = await connectImap(email, password, host, 993, true);
     console.log(`✅ IMAP conectado (SSL) para ${email}`);
   } catch (err) {
     console.log(`⚠️ Falló SSL directo para ${email}: ${err.message}`);
     try {
-      client = await connectImap(email, password, auto.imapHost, 143, false);
+      client = await connectImap(email, password, host, 143, false);
       await client.startTls();
       console.log(`✅ IMAP conectado (STARTTLS) para ${email}`);
     } catch (err2) {
@@ -150,7 +154,6 @@ async function startPolling(ws, email, password) {
     initialUids = [];
   }
 
-  // Cerrar conexión inicial (el polling abrirá nuevas)
   await client.logout().catch(() => {});
 
   const state = {
@@ -158,7 +161,7 @@ async function startPolling(ws, email, password) {
     ws,
     email,
     password,
-    host: auto.imapHost,
+    host,
     lastUids: new Set(initialUids),
   };
   pollingStates.set(email, state);
@@ -173,9 +176,9 @@ async function startPolling(ws, email, password) {
         newClient = await connectImap(email, password, state.host, 143, false);
         await newClient.startTls();
       }
-      
+
       const messages = await fetchAllMessages(newClient);
-      await newClient.logout();
+      await newClient.logout().catch(() => {});
 
       if (messages.length === 0) {
         console.log(`ℹ️ No hay mensajes en INBOX para ${email}`);
@@ -210,7 +213,7 @@ async function startPolling(ws, email, password) {
           await sendPushNotification(email, {
             title: `📧 Nuevo correo de ${from}`,
             body: subject,
-            data: { type: 'new_email', from, subject, uid }
+            data: { type: 'new_email', from, subject, uid: String(uid) }
           });
         }
 
@@ -232,6 +235,7 @@ async function startPolling(ws, email, password) {
 //  FCM PUSH NOTIFICATIONS
 // ============================================================
 async function sendPushNotification(email, payload) {
+  if (!db) return;
   try {
     const tokensSnapshot = await db.collection('fcm_tokens').where('email', '==', email).get();
     if (tokensSnapshot.empty) {
@@ -275,7 +279,7 @@ async function sendPushNotification(email, payload) {
 // ============================================================
 app.post('/api/fcm-token', async (req, res) => {
   const { email, token } = req.body;
-  if (!email || !token) return res.status(400).json({ success: false, error: 'Email y token requeridos' });
+  if (!email || !token || !db) return res.status(400).json({ success: false, error: 'Email y token requeridos' });
 
   try {
     const existing = await db.collection('fcm_tokens').where('email', '==', email).where('token', '==', token).get();
@@ -292,7 +296,7 @@ app.post('/api/fcm-token', async (req, res) => {
 
 app.post('/api/fcm-token/remove', async (req, res) => {
   const { token } = req.body;
-  if (!token) return res.status(400).json({ success: false, error: 'Token requerido' });
+  if (!token || !db) return res.status(400).json({ success: false, error: 'Token requerido' });
 
   try {
     const snapshot = await db.collection('fcm_tokens').where('token', '==', token).get();
@@ -698,26 +702,58 @@ app.post('/api/move-message', async (req, res) => {
   if (!uid || !fromFolder || !toFolder) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
   const auto = getAutoConfig(email);
   const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-  try { await client.connect(); await client.messageMove(uid, toFolder, { uid: true }); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  try {
+    await client.connect();
+    const lock = await client.getMailboxLock(fromFolder);
+    try {
+      await client.messageMove(String(uid), toFolder, { uid: true });
+    } finally {
+      lock.release();
+    }
+    await client.logout();
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 // ------------------------------------------------------------
 //  9‑12. RESTO DE ENDPOINTS
 // ------------------------------------------------------------
 app.post('/api/toggle-read', async (req, res) => {
-  const { email, password, host, port, uid, folder, read } = req.body;
-  if (uid == null || !folder) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
+  const { email, password, host, port, uid, folder = 'INBOX', read } = req.body;
+  if (uid == null) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
   const auto = getAutoConfig(email);
   const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-  try { await client.connect(); if (read) await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true }); else await client.messageFlagsRemove(uid, ['\\Seen'], { uid: true }); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  try {
+    await client.connect();
+    const lock = await client.getMailboxLock(folder);
+    try {
+      if (read) await client.messageFlagsAdd(String(uid), ['\\Seen'], { uid: true });
+      else await client.messageFlagsRemove(String(uid), ['\\Seen'], { uid: true });
+    } finally {
+      lock.release();
+    }
+    await client.logout();
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 app.post('/api/toggle-flagged', async (req, res) => {
-  const { email, password, host, port, uid, folder, flagged } = req.body;
-  if (uid == null || !folder) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
+  const { email, password, host, port, uid, folder = 'INBOX', flagged } = req.body;
+  if (uid == null) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
   const auto = getAutoConfig(email);
   const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-  try { await client.connect(); if (flagged) await client.messageFlagsAdd(uid, ['\\Flagged'], { uid: true }); else await client.messageFlagsRemove(uid, ['\\Flagged'], { uid: true }); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  try {
+    await client.connect();
+    const lock = await client.getMailboxLock(folder);
+    try {
+      if (flagged) await client.messageFlagsAdd(String(uid), ['\\Flagged'], { uid: true });
+      else await client.messageFlagsRemove(String(uid), ['\\Flagged'], { uid: true });
+    } finally {
+      lock.release();
+    }
+    await client.logout();
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 app.post('/api/create-folder', async (req, res) => {
@@ -737,11 +773,23 @@ app.post('/api/delete-folder', async (req, res) => {
 });
 
 app.post('/api/download-attachment', async (req, res) => {
-  const { email, password, host, port, folder, uid, partId } = req.body;
-  if (!uid || !folder || !partId) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
+  const { email, password, host, port, folder = 'INBOX', uid, partId } = req.body;
+  if (!uid || !partId) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
   const auto = getAutoConfig(email);
   const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-  try { await client.connect(); await client.mailboxOpen(folder); const msg = await client.fetchOne(String(uid), { bodyParts: [partId] }, { uid: true }); await client.logout(); if (!msg?.bodyParts?.[partId]) return res.status(404).json({ success: false, error: 'Adjunto no encontrado' }); res.json({ success: true, data: msg.bodyParts[partId].toString('base64') }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  try {
+    await client.connect();
+    const lock = await client.getMailboxLock(folder);
+    let msg;
+    try {
+      msg = await client.fetchOne(String(uid), { bodyParts: [partId] }, { uid: true });
+    } finally {
+      lock.release();
+    }
+    await client.logout();
+    if (!msg?.bodyParts?.[partId]) return res.status(404).json({ success: false, error: 'Adjunto no encontrado' });
+    res.json({ success: true, data: msg.bodyParts[partId].toString('base64') });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 // ------------------------------------------------------------

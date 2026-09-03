@@ -47,9 +47,9 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
-//  WEBSOCKET + IMAP IDLE (UNA CONEXIÓN POR USUARIO)
+//  WEBSOCKET + IMAP IDLE + POLLING
 // ------------------------------------------------------------
-const activeSessions = new Map(); // email -> { ws, imapClient, idleTimeout }
+const activeSessions = new Map(); // email -> { ws, imapClient, idleTimeout, lastUid, pollingInterval }
 
 wss.on('connection', (ws, req) => {
   console.log('🔌 Nuevo cliente WebSocket conectado');
@@ -75,6 +75,7 @@ wss.on('connection', (ws, req) => {
     if (email && activeSessions.has(email)) {
       const session = activeSessions.get(email);
       if (session.idleTimeout) clearTimeout(session.idleTimeout);
+      if (session.pollingInterval) clearInterval(session.pollingInterval);
       if (session.imapClient) {
         session.imapClient.logout().catch(() => {});
       }
@@ -84,38 +85,42 @@ wss.on('connection', (ws, req) => {
 });
 
 // ------------------------------------------------------------
-//  FUNCIÓN PARA CONECTAR IMAP (SOLO SSL DIRECTO)
+//  FUNCIÓN PARA CONECTAR IMAP CON FALLBACK
 // ------------------------------------------------------------
-async function connectImap(email, password, host, port) {
+async function connectImap(email, password, host, port, secure) {
   const config = {
     host: host,
-    port: port || 993,
-    secure: true,
+    port: port,
+    secure: secure,
     auth: { user: email, pass: password },
-    logger: false,
+    logger: console,
     tls: {
       rejectUnauthorized: false,
+      minVersion: 'TLSv1.2',
     },
     connectionTimeout: 15000,
     authTimeout: 15000,
   };
-  console.log(`🔄 Conectando IMAP a ${host}:${port || 993} (SSL)`);
+  console.log(`🔄 Conectando IMAP a ${host}:${port} (secure=${secure})`);
   const client = new ImapFlow(config);
   await client.connect();
   return client;
 }
 
 // ------------------------------------------------------------
-//  START IMAP IDLE (CON CIERRE DE SESIONES ANTERIORES)
+//  START IMAP IDLE + POLLING
 // ------------------------------------------------------------
 async function startImapIdle(ws, email, password) {
   try {
     const auto = getAutoConfig(email);
+    let client;
+    let connected = false;
 
-    // 🔥 Si ya hay una sesión activa para este email, cerrarla primero
+    // Si ya hay sesión, cerrarla
     if (activeSessions.has(email)) {
       const oldSession = activeSessions.get(email);
       if (oldSession.idleTimeout) clearTimeout(oldSession.idleTimeout);
+      if (oldSession.pollingInterval) clearInterval(oldSession.pollingInterval);
       if (oldSession.imapClient) {
         await oldSession.imapClient.logout().catch(() => {});
       }
@@ -123,63 +128,207 @@ async function startImapIdle(ws, email, password) {
       console.log(`♻️ Sesión IMAP anterior cerrada para ${email}`);
     }
 
-    // 🔥 Conectar con SSL directo (puerto 993)
-    const client = await connectImap(email, password, auto.imapHost, auto.imapPort || 993);
-    console.log(`✅ IMAP IDLE conectado (SSL) para ${email}`);
-
-    await client.mailboxOpen('INBOX');
-    activeSessions.set(email, { ws, imapClient: client, idleTimeout: null });
-
-    const notifyNewEmail = async () => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          type: 'new_email',
-          email: email,
-          timestamp: new Date().toISOString()
-        }));
-      }
-      await sendPushNotification(email, {
-        title: '📧 Nuevo correo',
-        body: 'Tienes un nuevo mensaje en tu bandeja',
-        data: { type: 'new_email' }
-      });
-    };
-
-    const idleLoop = async () => {
+    // Intentar STARTTLS (143)
+    try {
+      client = await connectImap(email, password, auto.imapHost, 143, false);
+      await client.startTls();
+      connected = true;
+      console.log(`✅ IMAP IDLE conectado (STARTTLS) para ${email}`);
+    } catch (err1) {
+      console.log(`⚠️ Falló STARTTLS: ${err1.message}`);
+      // Intentar SSL directo (993)
       try {
-        await client.idle();
-        await notifyNewEmail();
-        const session = activeSessions.get(email);
-        if (session && session.imapClient) {
-          session.idleTimeout = setTimeout(idleLoop, 5000); // 5 segundos entre reintentos
+        client = await connectImap(email, password, auto.imapHost, 993, true);
+        connected = true;
+        console.log(`✅ IMAP IDLE conectado (SSL directo) para ${email}`);
+      } catch (err2) {
+        console.error(`❌ Todos los intentos de conexión IDLE fallaron para ${email}`);
+        // Aun así, intentaremos usar polling sin IDLE
+        connected = false;
+      }
+    }
+
+    // Obtener el último UID conocido
+    let lastUid = 0;
+    if (connected) {
+      try {
+        await client.mailboxOpen('INBOX');
+        const results = await client.fetch('1:*', { uid: true }, { max: 1, reverse: true });
+        if (results && results.length > 0) {
+          lastUid = results[0].uid || 0;
         }
       } catch (e) {
-        console.log(`⚠️ IDLE interrumpido para ${email}:`, e.message);
-        const session = activeSessions.get(email);
-        if (session) {
-          session.idleTimeout = setTimeout(idleLoop, 15000); // Reintentar después de 15s
-        }
+        console.log('⚠️ No se pudo obtener el último UID:', e.message);
       }
+    }
+
+    // Guardar sesión
+    const session = {
+      ws,
+      imapClient: connected ? client : null,
+      idleTimeout: null,
+      pollingInterval: null,
+      lastUid: lastUid,
+      email: email,
+      password: password,
+      imapHost: auto.imapHost,
+      isConnected: connected
+    };
+    activeSessions.set(email, session);
+
+    // ------------------------------------------------------------
+    //  POLLING DE RESPALDO (cada 15 segundos)
+    // ------------------------------------------------------------
+    const startPolling = () => {
+      if (session.pollingInterval) clearInterval(session.pollingInterval);
+      session.pollingInterval = setInterval(async () => {
+        try {
+          // Intentar conectar si no hay cliente o está cerrado
+          let pollClient = session.imapClient;
+          if (!pollClient || !session.isConnected) {
+            try {
+              // Intentar reconectar
+              let newClient;
+              try {
+                newClient = await connectImap(email, password, auto.imapHost, 143, false);
+                await newClient.startTls();
+              } catch (err) {
+                newClient = await connectImap(email, password, auto.imapHost, 993, true);
+              }
+              session.imapClient = newClient;
+              session.isConnected = true;
+              pollClient = newClient;
+              console.log(`✅ Polling: reconexión IMAP exitosa para ${email}`);
+            } catch (e) {
+              console.log(`⚠️ Polling: no se pudo reconectar IMAP para ${email}:`, e.message);
+              return;
+            }
+          }
+
+          await pollClient.mailboxOpen('INBOX');
+          const results = await pollClient.fetch('1:*', { uid: true, envelope: true }, { max: 1, reverse: true });
+          if (results && results.length > 0) {
+            const latest = results[0];
+            const currentUid = latest.uid || 0;
+            if (currentUid > session.lastUid) {
+              // Nuevo correo detectado por polling
+              session.lastUid = currentUid;
+              const from = latest.envelope.from?.[0]?.address || 'Remitente desconocido';
+              const subject = latest.envelope.subject || 'Nuevo correo';
+              console.log(`📨 Polling: Nuevo correo detectado para ${email} (UID: ${currentUid})`);
+
+              // Notificar por WebSocket
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                  type: 'new_email',
+                  email: email,
+                  timestamp: new Date().toISOString(),
+                  from: from,
+                  subject: subject
+                }));
+              }
+
+              // Notificación push
+              await sendPushNotification(email, {
+                title: `📧 Nuevo correo de ${from}`,
+                body: subject,
+                data: { type: 'new_email', from: from, subject: subject }
+              });
+            }
+          }
+        } catch (e) {
+          console.log(`⚠️ Polling error para ${email}:`, e.message);
+          session.isConnected = false;
+        }
+      }, 15000); // Cada 15 segundos
     };
 
-    idleLoop();
+    // Iniciar polling siempre (como respaldo)
+    startPolling();
 
-    const heartbeat = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'ping' }));
-      }
-    }, 45000); // Heartbeat cada 45 segundos (menos frecuente)
+    // ------------------------------------------------------------
+    //  IDLE (si la conexión inicial fue exitosa)
+    // ------------------------------------------------------------
+    if (connected && client) {
+      const notifyNewEmail = async () => {
+        try {
+          // Obtener detalles del último correo
+          const lock = await client.getMailboxLock('INBOX');
+          let from = 'Remitente desconocido';
+          let subject = 'Nuevo correo';
+          let uid = 0;
+          try {
+            const results = await client.fetch('1:*', { envelope: true, uid: true }, { max: 1, reverse: true });
+            if (results && results.length > 0) {
+              const msg = results[0];
+              uid = msg.uid || 0;
+              from = msg.envelope.from?.[0]?.address || from;
+              subject = msg.envelope.subject || subject;
+              if (uid > session.lastUid) {
+                session.lastUid = uid;
+              }
+            }
+          } catch (fetchErr) {
+            console.log('⚠️ IDLE: No se pudieron obtener detalles del correo:', fetchErr.message);
+          } finally {
+            lock.release();
+          }
 
-    ws.on('close', () => clearInterval(heartbeat));
+          // WebSocket
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'new_email',
+              email: email,
+              timestamp: new Date().toISOString(),
+              from: from,
+              subject: subject
+            }));
+          }
+
+          // Push notification
+          await sendPushNotification(email, {
+            title: `📧 Nuevo correo de ${from}`,
+            body: subject,
+            data: { type: 'new_email', from: from, subject: subject }
+          });
+        } catch (e) {
+          console.error('❌ Error en notifyNewEmail (IDLE):', e.message);
+        }
+      };
+
+      const idleLoop = async () => {
+        try {
+          await client.idle();
+          await notifyNewEmail();
+          const sessionData = activeSessions.get(email);
+          if (sessionData && sessionData.imapClient) {
+            sessionData.idleTimeout = setTimeout(idleLoop, 1000);
+          }
+        } catch (e) {
+          console.log(`⚠️ IDLE interrumpido para ${email}:`, e.message);
+          const sessionData = activeSessions.get(email);
+          if (sessionData) {
+            sessionData.isConnected = false;
+            sessionData.idleTimeout = setTimeout(idleLoop, 5000);
+          }
+        }
+      };
+
+      // Iniciar IDLE (si la conexión existe)
+      idleLoop();
+    }
 
   } catch (e) {
-    console.error(`❌ Error iniciando IDLE para ${email}:`, e.message);
-    // No enviamos error al cliente para no romper la conexión WebSocket
+    console.error(`❌ Error iniciando sesión para ${email}:`, e.message);
+    ws.send(JSON.stringify({
+      type: 'error',
+      message: 'Error al conectar con IMAP: ' + e.message
+    }));
   }
 }
 
 // ============================================================
-//  FCM PUSH NOTIFICATIONS (sin cambios)
+//  FCM PUSH NOTIFICATIONS
 // ============================================================
 async function sendPushNotification(email, payload) {
   try {
@@ -230,7 +379,7 @@ async function sendPushNotification(email, payload) {
 }
 
 // ============================================================
-//  ENDPOINTS FCM (sin cambios)
+//  ENDPOINTS FCM (MEJORADOS)
 // ============================================================
 app.post('/api/fcm-token', async (req, res) => {
   const { email, token } = req.body;
@@ -281,9 +430,9 @@ app.post('/api/calendar-notify', async (req, res) => {
   if (!email) return res.status(400).json({ success: false, error: 'Email requerido' });
 
   await sendPushNotification(email, {
-    title: '📅 Recordatorio de evento',
-    body: `${eventTitle || 'Evento'} - ${eventDate || 'Próximamente'}`,
-    data: { type: 'calendar_event', eventTitle: eventTitle || 'Evento', eventDate: eventDate || 'Próximamente' }
+    title: `📅 Recordatorio: ${eventTitle || 'Evento'}`,
+    body: `Programado para ${eventDate || 'próximamente'}`,
+    data: { type: 'calendar_event' }
   });
   res.json({ success: true });
 });
@@ -293,15 +442,15 @@ app.post('/api/note-notify', async (req, res) => {
   if (!email) return res.status(400).json({ success: false, error: 'Email requerido' });
 
   await sendPushNotification(email, {
-    title: '📝 Nota compartida',
-    body: `${senderEmail || 'Alguien'} compartió "${noteTitle || 'una nota'}"`,
-    data: { type: 'note_shared', noteTitle: noteTitle || 'nota', senderEmail: senderEmail || 'Alguien' }
+    title: `📝 Nota compartida por ${senderEmail || 'Alguien'}`,
+    body: `"${noteTitle || 'sin título'}"`,
+    data: { type: 'note_shared' }
   });
   res.json({ success: true });
 });
 
 // ------------------------------------------------------------
-//  AUTO-CONFIGURACIÓN DE SERVIDORES (SOLO SSL DIRECTO)
+//  AUTO-CONFIGURACIÓN DE SERVIDORES
 // ------------------------------------------------------------
 function getAutoConfig(email) {
     const domain = email.split('@')[1]?.toLowerCase();
@@ -310,12 +459,11 @@ function getAutoConfig(email) {
     if (domain.includes('outlook.com') || domain.includes('hotmail.com') || domain.includes('live.com')) return { imapHost: 'outlook.office365.com', imapPort: 993, smtpHost: 'smtp.office365.com', smtpPort: 587, secure: true };
     if (domain.includes('yahoo.')) return { imapHost: 'imap.mail.yahoo.com', imapPort: 993, smtpHost: 'smtp.mail.yahoo.com', smtpPort: 465, secure: true };
     if (domain.includes('zoho.')) return { imapHost: 'imap.zoho.com', imapPort: 993, smtpHost: 'smtp.zoho.com', smtpPort: 465, secure: true };
-    // Para dominios genéricos, usar SSL directo en 993
-    return { imapHost: 'mail.' + domain, imapPort: 993, smtpHost: 'mail.' + domain, smtpPort: 587, secure: true };
+    return { imapHost: 'mail.' + domain, imapPort: 143, smtpHost: 'mail.' + domain, smtpPort: 587, secure: false };
 }
 
 // ------------------------------------------------------------
-//  1. LOGIN / VERIFICACIÓN (sin cambios)
+//  LOGIN / VERIFICACIÓN
 // ------------------------------------------------------------
 const handleAuth = (req, res) => {
     const { email, password, host, port } = req.body;
@@ -387,7 +535,7 @@ app.post('/api/verify', handleAuth);
 app.get('/ping', (req, res) => res.json({ alive: true }));
 
 // ------------------------------------------------------------
-//  2. ENVÍO DE CORREO SMTP (sin cambios)
+//  ENVÍO DE CORREO SMTP
 // ------------------------------------------------------------
 app.post('/api/send-email', async (req, res) => {
     const { email, password, host, port, to, subject, body, attachments } = req.body;
@@ -425,7 +573,7 @@ app.post('/api/send-email', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  3. GUARDAR EN ENVIADOS (sin cambios)
+//  GUARDAR EN ENVIADOS
 // ------------------------------------------------------------
 app.post('/api/save-to-sent', async (req, res) => {
     const { email, password, host, port, to, subject, body } = req.body;
@@ -479,56 +627,78 @@ app.post('/api/save-to-sent', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  4. OBTENER CARPETAS (SSL directo)
+//  4. OBTENER CARPETAS
 // ------------------------------------------------------------
 app.post('/api/folders', async (req, res) => {
     const { email, password, host, port } = req.body;
     const auto = getAutoConfig(email);
-    let client;
+    const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
     try {
-        client = new ImapFlow({
-            host: host || auto.imapHost,
-            port: Number(port) || auto.imapPort || 993,
-            secure: true,
-            auth: { user: email, pass: password },
-            logger: false,
-            tls: { rejectUnauthorized: false }
-        });
         await client.connect();
         const list = await client.list();
         await client.logout();
         const folders = list.map(f => ({ name: f.name, path: f.path, specialUse: f.specialUse || '' }));
         res.json({ success: true, folders });
-    } catch (err) {
-        if (client) await client.logout().catch(() => {});
-        res.status(500).json({ success: false, error: err.message });
-    }
+    } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
 // ------------------------------------------------------------
-//  5. OBTENER MENSAJES (SSL directo)
+//  5. OBTENER MENSAJES (CON CORRECCIÓN DE flags)
 // ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
     const auto = getAutoConfig(email);
     let client;
+    let connected = false;
+
+    // PRIORIDAD 1: STARTTLS en puerto 143
     try {
         client = new ImapFlow({
             host: host || auto.imapHost,
-            port: Number(port) || auto.imapPort || 993,
-            secure: true,
+            port: 143,
+            secure: false,
             auth: { user: email, pass: password },
             logger: false,
             tls: { rejectUnauthorized: false }
         });
         await client.connect();
+        await client.starttls();
+        connected = true;
+        console.log(`✅ IMAP conectado (STARTTLS) para ${email} en /api/messages`);
+    } catch (err) {
+        console.log(`⚠️ Falló STARTTLS en /api/messages: ${err.message}`);
+        try {
+            client = new ImapFlow({
+                host: host || auto.imapHost,
+                port: 993,
+                secure: true,
+                auth: { user: email, pass: password },
+                logger: false,
+                tls: { rejectUnauthorized: false }
+            });
+            await client.connect();
+            connected = true;
+            console.log(`✅ IMAP conectado (SSL directo) para ${email} en /api/messages`);
+        } catch (err2) {
+            console.error(`❌ Falló SSL directo en /api/messages: ${err2.message}`);
+            return res.status(500).json({ success: false, error: err2.message, messages: [] });
+        }
+    }
+
+    if (!connected) {
+        return res.status(500).json({ success: false, error: 'No se pudo conectar al servidor IMAP', messages: [] });
+    }
+
+    try {
         const lock = await client.getMailboxLock(folder);
         const messages = [];
 
         try {
             for await (const msg of client.fetch('1:*', { envelope: true, flags: true }, { max: limit, reverse: true })) {
                 let flags = msg.flags || [];
-                if (!Array.isArray(flags)) flags = Object.values(flags);
+                if (!Array.isArray(flags)) {
+                    flags = Object.values(flags);
+                }
                 messages.push({
                     uid: msg.uid,
                     id: msg.uid.toString(),
@@ -550,20 +720,176 @@ app.post('/api/messages', async (req, res) => {
         messages.sort((a, b) => new Date(b.date) - new Date(a.date));
         res.json({ success: true, messages: messages, total: messages.length });
     } catch (err) {
-        if (client) await client.logout().catch(() => {});
         console.error('❌ Error en /api/messages:', err.message);
         res.status(500).json({ success: false, error: err.message, messages: [] });
     }
 });
 
 // ------------------------------------------------------------
-//  6-12. RESTO DE ENDPOINTS (SSL directo y cierre)
+//  6. DETALLE DEL CORREO
 // ------------------------------------------------------------
-// (Mantener igual que antes, pero con la conexión SSL directa)
-// ...
+app.post('/api/message-detail', async (req, res) => {
+    const { email, password, host, port, folder = 'INBOX', uid } = req.body;
+    if (!uid) return res.status(400).json({ success: false, error: 'UID requerido' });
+    const auto = getAutoConfig(email);
+    const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+    try {
+        await client.connect();
+        const lock = await client.getMailboxLock(folder);
+        let parsed;
+        try {
+            const msg = await client.fetchOne(String(uid), { source: true }, { uid: true });
+            if (msg?.source) parsed = await simpleParser(msg.source);
+        } finally {
+            lock.release();
+        }
+        await client.logout();
+        if (!parsed) return res.status(404).json({ success: false, error: 'Correo no encontrado' });
+
+        const attachments = (parsed.attachments || []).map(att => ({
+            filename: att.filename || 'adjunto',
+            contentType: att.contentType,
+            size: att.size,
+            content: att.content ? att.content.toString('base64') : ''
+        }));
+
+        res.json({
+            success: true,
+            message: {
+                uid: Number(uid),
+                subject: parsed.subject || '(Sin asunto)',
+                from: parsed.from?.text || '',
+                to: parsed.to?.text || '',
+                date: parsed.date ? parsed.date.toISOString() : new Date().toISOString(),
+                text: parsed.text || '',
+                html: parsed.html || parsed.textAsHtml || parsed.text || '',
+                attachments
+            }
+        });
+    } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+});
+
+// ------------------------------------------------------------
+//  7. ELIMINAR / MOVER A PAPELERA
+// ------------------------------------------------------------
+app.post('/api/delete-message', async (req, res) => {
+    const { email, password, host, port, uid, folder = 'INBOX' } = req.body;
+    if (!uid) return res.status(400).json({ success: false, error: 'Falta UID' });
+
+    const auto = getAutoConfig(email);
+    const client = new ImapFlow({
+        host: host || auto.imapHost,
+        port: Number(port) || auto.imapPort,
+        secure: true,
+        auth: { user: email, pass: password },
+        logger: false,
+        tls: { rejectUnauthorized: false }
+    });
+
+    try {
+        await client.connect();
+        const lock = await client.getMailboxLock(folder);
+
+        try {
+            const isAlreadyTrash = folder.toLowerCase().includes('trash') ||
+                                   folder.toLowerCase().includes('papelera');
+
+            if (isAlreadyTrash) {
+                await client.messageDelete(String(uid), { uid: true });
+            } else {
+                const list = await client.list();
+                let trashFolder = list.find(f =>
+                    f.specialUse === '\\Trash' ||
+                    /^trash$/i.test(f.name) ||
+                    /papelera/i.test(f.name) ||
+                    /inbox\.trash/i.test(f.path) ||
+                    /inbox\/trash/i.test(f.path)
+                )?.path;
+
+                if (!trashFolder) {
+                    const candidates = ['INBOX.Trash', 'Trash', 'Papelera'];
+                    for (const cand of candidates) {
+                        try {
+                            await client.mailboxCreate(cand);
+                            trashFolder = cand;
+                            break;
+                        } catch (createErr) {}
+                    }
+                    if (!trashFolder) {
+                        throw new Error('No se encontró ni se pudo crear la carpeta de Papelera');
+                    }
+                }
+
+                await client.messageMove(String(uid), trashFolder, { uid: true });
+            }
+        } finally {
+            lock.release();
+        }
+
+        await client.logout();
+        res.json({ success: true, message: 'Mensaje procesado correctamente' });
+    } catch (e) {
+        console.error('❌ Error en delete-message:', e.message);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// ------------------------------------------------------------
+//  8. MOVER MENSAJE GENÉRICO
+// ------------------------------------------------------------
+app.post('/api/move-message', async (req, res) => {
+    const { email, password, host, port, uid, fromFolder, toFolder } = req.body;
+    if (!uid || !fromFolder || !toFolder) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
+    const auto = getAutoConfig(email);
+    const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+    try { await client.connect(); await client.messageMove(uid, toFolder, { uid: true }); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ------------------------------------------------------------
+//  9‑12. RESTO DE ENDPOINTS
+// ------------------------------------------------------------
+app.post('/api/toggle-read', async (req, res) => {
+    const { email, password, host, port, uid, folder, read } = req.body;
+    if (uid == null || !folder) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
+    const auto = getAutoConfig(email);
+    const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+    try { await client.connect(); if (read) await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true }); else await client.messageFlagsRemove(uid, ['\\Seen'], { uid: true }); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/toggle-flagged', async (req, res) => {
+    const { email, password, host, port, uid, folder, flagged } = req.body;
+    if (uid == null || !folder) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
+    const auto = getAutoConfig(email);
+    const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+    try { await client.connect(); if (flagged) await client.messageFlagsAdd(uid, ['\\Flagged'], { uid: true }); else await client.messageFlagsRemove(uid, ['\\Flagged'], { uid: true }); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/create-folder', async (req, res) => {
+    const { email, password, host, port, folderName } = req.body;
+    if (!folderName) return res.status(400).json({ success: false, error: 'Falta folderName' });
+    const auto = getAutoConfig(email);
+    const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+    try { await client.connect(); await client.mailboxCreate(folderName); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/delete-folder', async (req, res) => {
+    const { email, password, host, port, folderName } = req.body;
+    if (!folderName) return res.status(400).json({ success: false, error: 'Falta folderName' });
+    const auto = getAutoConfig(email);
+    const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+    try { await client.connect(); await client.mailboxDelete(folderName); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/download-attachment', async (req, res) => {
+    const { email, password, host, port, folder, uid, partId } = req.body;
+    if (!uid || !folder || !partId) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
+    const auto = getAutoConfig(email);
+    const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+    try { await client.connect(); await client.mailboxOpen(folder); const msg = await client.fetchOne(String(uid), { bodyParts: [partId] }, { uid: true }); await client.logout(); if (!msg?.bodyParts?.[partId]) return res.status(404).json({ success: false, error: 'Adjunto no encontrado' }); res.json({ success: true, data: msg.bodyParts[partId].toString('base64') }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
 
 // ------------------------------------------------------------
 //  INICIAR SERVIDOR
 // ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`✅ Backend RSMAIL en puerto ${PORT} con WebSocket y FCM`));
+server.listen(PORT, () => console.log(`✅ Backend RSMAIL en puerto ${PORT} con WebSocket, IDLE y polling`));

@@ -9,7 +9,7 @@ const http = require('http');
 const admin = require('firebase-admin');
 
 // ------------------------------------------------------------
-//  FIREBASE ADMIN (FCM) - CON LOGS
+//  FIREBASE ADMIN (FCM)
 // ------------------------------------------------------------
 if (!admin.apps.length) {
   if (process.env.FIREBASE_PRIVATE_KEY) {
@@ -47,9 +47,27 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
-//  POLLING POR CUENTA (con logs detallados)
+//  POLLING POR CUENTA (comparación de UIDs)
 // ------------------------------------------------------------
-const pollingStates = new Map();
+const pollingStates = new Map(); // email -> { lastUids: Set, interval, client, ws }
+
+// Función para conectar IMAP (con fallback)
+async function connectImap(email, password, host, port, secure) {
+  const config = {
+    host: host,
+    port: port,
+    secure: secure,
+    auth: { user: email, pass: password },
+    logger: false,
+    tls: { rejectUnauthorized: false },
+    connectionTimeout: 15000,
+    authTimeout: 15000,
+  };
+  console.log(`🔄 Conectando IMAP a ${host}:${port} (secure=${secure})`);
+  const client = new ImapFlow(config);
+  await client.connect();
+  return client;
+}
 
 wss.on('connection', (ws, req) => {
   console.log('🔌 Nuevo cliente WebSocket conectado');
@@ -83,35 +101,9 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// ------------------------------------------------------------
-//  FUNCIÓN PARA CONECTAR IMAP
-// ------------------------------------------------------------
-async function connectImap(email, password, host, port, secure) {
-  const config = {
-    host: host,
-    port: port,
-    secure: secure,
-    auth: { user: email, pass: password },
-    logger: false,
-    tls: { rejectUnauthorized: false },
-    connectionTimeout: 15000,
-    authTimeout: 15000,
-  };
-  console.log(`🔄 Conectando IMAP a ${host}:${port} (secure=${secure})`);
-  const client = new ImapFlow(config);
-  await client.connect();
-  console.log(`✅ Conexión IMAP establecida a ${host}:${port}`);
-  return client;
-}
-
-// ------------------------------------------------------------
-//  INICIAR POLLING (con logs)
-// ------------------------------------------------------------
 async function startPolling(ws, email, password) {
-  console.log(`📡 Iniciando polling para ${email}`);
-
+  // Detener polling anterior si existe
   if (pollingStates.has(email)) {
-    console.log(`♻️ Deteniendo polling anterior para ${email}`);
     const old = pollingStates.get(email);
     if (old.interval) clearInterval(old.interval);
     if (old.client) old.client.logout().catch(() => {});
@@ -120,63 +112,75 @@ async function startPolling(ws, email, password) {
 
   const auto = getAutoConfig(email);
   let client = null;
-  let lastUid = 0;
+  let lastUids = new Set(); // Guardar UIDs anteriores
 
-  // Intentar conectar IMAP
+  // Conectar IMAP
   try {
     client = await connectImap(email, password, auto.imapHost, 993, true);
+    console.log(`✅ IMAP conectado (SSL) para ${email}`);
   } catch (err) {
     console.log(`⚠️ Falló SSL directo para ${email}: ${err.message}`);
     try {
       client = await connectImap(email, password, auto.imapHost, 143, false);
       await client.startTls();
+      console.log(`✅ IMAP conectado (STARTTLS) para ${email}`);
     } catch (err2) {
       console.error(`❌ No se pudo conectar IMAP para ${email}:`, err2.message);
-      ws.send(JSON.stringify({
-        type: 'error',
-        message: 'Error al conectar con el servidor de correo'
-      }));
+      ws.send(JSON.stringify({ type: 'error', message: 'Error al conectar con el servidor de correo' }));
       return;
     }
   }
 
-  // Obtener el último UID
-  try {
-    await client.mailboxOpen('INBOX');
-    const results = await client.fetch('1:*', { uid: true }, { max: 1, reverse: true });
-    if (results && results.length > 0) {
-      lastUid = results[0].uid || 0;
-      console.log(`📊 Último UID para ${email}: ${lastUid}`);
-    } else {
-      console.log(`📊 No hay mensajes en INBOX para ${email}`);
-    }
-  } catch (e) {
-    console.log(`⚠️ No se pudo obtener último UID para ${email}:`, e.message);
-  }
-
+  // Guardar estado
   const state = {
-    lastUid: lastUid,
     client: client,
     interval: null,
     ws: ws,
     email: email,
     password: password,
     host: auto.imapHost,
-    isConnected: true
+    isConnected: true,
+    lastUids: new Set()
   };
   pollingStates.set(email, state);
-  console.log(`✅ Polling iniciado para ${email} (lastUid=${lastUid})`);
 
-  // ------------------------------------------------------------
-  //  POLLING
-  // ------------------------------------------------------------
+  // Función para obtener todos los UIDs de la bandeja
+  async function getUids(client) {
+    try {
+      await client.mailboxOpen('INBOX');
+      const result = await client.search({ uid: true });
+      return result || [];
+    } catch (e) {
+      console.log(`⚠️ Error al obtener UIDs para ${email}:`, e.message);
+      return [];
+    }
+  }
+
+  // Función para obtener detalles de un mensaje por UID
+  async function getMessageDetails(client, uid) {
+    try {
+      const results = await client.fetch(String(uid), { envelope: true, uid: true });
+      if (results && results.length > 0) {
+        const msg = results[0];
+        return {
+          from: msg.envelope.from?.[0]?.address || 'Remitente desconocido',
+          subject: msg.envelope.subject || 'Nuevo correo'
+        };
+      }
+    } catch (e) {
+      console.log(`⚠️ Error al obtener detalles del mensaje ${uid}:`, e.message);
+    }
+    return null;
+  }
+
+  // Función de polling
   const poll = async () => {
     try {
-      console.log(`🔍 Polling para ${email}...`);
       let currentClient = state.client;
 
+      // Verificar si el cliente sigue conectado
       if (!state.isConnected || !currentClient) {
-        console.log(`🔄 Intentando reconectar IMAP para ${email}`);
+        // Reintentar conexión
         try {
           let newClient;
           try {
@@ -195,52 +199,60 @@ async function startPolling(ws, email, password) {
         }
       }
 
-      await currentClient.mailboxOpen('INBOX');
-      const results = await currentClient.fetch('1:*', { uid: true, envelope: true }, { max: 1, reverse: true });
+      // Obtener UIDs actuales
+      const currentUids = await getUids(currentClient);
+      if (currentUids.length === 0) {
+        console.log(`ℹ️ No hay mensajes en INBOX para ${email}`);
+        return;
+      }
 
-      if (results && results.length > 0) {
-        const latest = results[0];
-        const newUid = latest.uid || 0;
-        console.log(`📊 UID actual: ${newUid}, último guardado: ${state.lastUid}`);
+      // Comparar con UIDs anteriores
+      const newUids = currentUids.filter(uid => !state.lastUids.has(uid));
+      if (newUids.length > 0) {
+        console.log(`📨 ${newUids.length} nuevo(s) correo(s) detectado(s) para ${email}`);
 
-        if (newUid > state.lastUid) {
-          state.lastUid = newUid;
-          const from = latest.envelope.from?.[0]?.address || 'Remitente desconocido';
-          const subject = latest.envelope.subject || 'Nuevo correo';
-          console.log(`📨 Polling: NUEVO CORREO detectado para ${email} (UID: ${newUid})`);
+        // Para cada nuevo UID, obtener detalles y enviar notificación
+        for (const uid of newUids) {
+          const details = await getMessageDetails(currentClient, uid);
+          if (!details) continue;
 
-          // WebSocket
+          console.log(`📨 Nuevo correo UID:${uid} de ${details.from} - ${details.subject}`);
+
+          // Notificar por WebSocket
           if (ws.readyState === WebSocket.OPEN) {
-            console.log(`📤 Enviando notificación WebSocket para ${email}`);
             ws.send(JSON.stringify({
               type: 'new_email',
               email: email,
               timestamp: new Date().toISOString(),
-              from: from,
-              subject: subject
+              from: details.from,
+              subject: details.subject,
+              uid: uid
             }));
-          } else {
-            console.log(`⚠️ WebSocket no está abierto para ${email}`);
           }
 
-          // Push notification
-          console.log(`📤 Enviando push notification para ${email}`);
+          // Enviar notificación push
           await sendPushNotification(email, {
-            title: `📧 Nuevo correo de ${from}`,
-            body: subject,
-            data: { type: 'new_email', from: from, subject: subject }
+            title: `📧 Nuevo correo de ${details.from}`,
+            body: details.subject,
+            data: { type: 'new_email', from: details.from, subject: details.subject, uid: uid }
           });
-        } else {
-          console.log(`ℹ️ No hay nuevos correos para ${email}`);
         }
+
+        // Actualizar la lista de UIDs anteriores
+        state.lastUids = new Set(currentUids);
       } else {
-        console.log(`ℹ️ No se pudieron obtener mensajes para ${email}`);
+        console.log(`🔍 Polling para ${email}... sin cambios`);
       }
     } catch (e) {
       console.log(`⚠️ Polling error para ${email}:`, e.message);
       state.isConnected = false;
     }
   };
+
+  // Obtener UIDs iniciales
+  const initialUids = await getUids(client);
+  state.lastUids = new Set(initialUids);
+  console.log(`✅ Polling iniciado para ${email} (${initialUids.length} mensajes iniciales)`);
 
   // Ejecutar poll inmediatamente y luego cada 15 segundos
   await poll();
@@ -249,10 +261,9 @@ async function startPolling(ws, email, password) {
 }
 
 // ============================================================
-//  FCM PUSH NOTIFICATIONS (con logs)
+//  FCM PUSH NOTIFICATIONS
 // ============================================================
 async function sendPushNotification(email, payload) {
-  console.log(`📤 Enviando push a ${email}`);
   try {
     const tokensSnapshot = await db.collection('fcm_tokens')
       .where('email', '==', email)
@@ -267,7 +278,6 @@ async function sendPushNotification(email, payload) {
     tokensSnapshot.forEach(doc => {
       tokens.push(doc.data().token);
     });
-    console.log(`📱 Tokens FCM encontrados: ${tokens.length}`);
 
     const message = {
       notification: {
@@ -282,12 +292,10 @@ async function sendPushNotification(email, payload) {
     console.log(`📨 Notificación push enviada a ${tokens.length} dispositivos para ${email}`);
 
     if (response.failureCount > 0) {
-      console.log(`⚠️ Fallaron ${response.failureCount} envíos`);
       const failedTokens = [];
       response.responses.forEach((resp, idx) => {
         if (!resp.success) {
           failedTokens.push(tokens[idx]);
-          console.log(`   ❌ Token fallido: ${tokens[idx].substring(0, 20)}...`);
         }
       });
       for (const token of failedTokens) {
@@ -304,12 +312,10 @@ async function sendPushNotification(email, payload) {
 }
 
 // ============================================================
-//  ENDPOINTS FCM (con logs)
+//  ENDPOINTS FCM (sin cambios)
 // ============================================================
 app.post('/api/fcm-token', async (req, res) => {
   const { email, token } = req.body;
-  console.log(`📱 Recibido token FCM para ${email}: ${token.substring(0, 20)}...`);
-
   if (!email || !token) {
     return res.status(400).json({ success: false, error: 'Email y token requeridos' });
   }
@@ -326,9 +332,7 @@ app.post('/api/fcm-token', async (req, res) => {
         token: token,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
-      console.log(`✅ Token FCM guardado para ${email}`);
-    } else {
-      console.log(`ℹ️ Token FCM ya existe para ${email}`);
+      console.log(`📱 Token FCM guardado para ${email}`);
     }
     res.json({ success: true });
   } catch (e) {
@@ -339,7 +343,6 @@ app.post('/api/fcm-token', async (req, res) => {
 
 app.post('/api/fcm-token/remove', async (req, res) => {
   const { token } = req.body;
-  console.log(`🗑️ Eliminando token FCM: ${token.substring(0, 20)}...`);
   if (!token) {
     return res.status(400).json({ success: false, error: 'Token requerido' });
   }
@@ -393,7 +396,7 @@ function getAutoConfig(email) {
 }
 
 // ------------------------------------------------------------
-//  1. LOGIN / VERIFICACIÓN
+//  1. LOGIN / VERIFICACIÓN (sin cambios)
 // ------------------------------------------------------------
 const handleAuth = (req, res) => {
     const { email, password, host, port } = req.body;
@@ -573,7 +576,7 @@ app.post('/api/folders', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  5. OBTENER MENSAJES
+//  5. OBTENER MENSAJES (con corrección de flags)
 // ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
@@ -803,4 +806,4 @@ app.post('/api/download-attachment', async (req, res) => {
 //  INICIAR SERVIDOR
 // ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`✅ Backend RSMAIL en puerto ${PORT} con polling (sin IDLE)`));
+server.listen(PORT, () => console.log(`✅ Backend RSMAIL en puerto ${PORT} con polling robusto`));

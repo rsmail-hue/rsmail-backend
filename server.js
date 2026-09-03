@@ -9,7 +9,7 @@ const http = require('http');
 const admin = require('firebase-admin');
 
 // ------------------------------------------------------------
-//  FIREBASE ADMIN (FCM)
+//  FIREBASE ADMIN (FCM) - CON LOGS
 // ------------------------------------------------------------
 if (!admin.apps.length) {
   if (process.env.FIREBASE_PRIVATE_KEY) {
@@ -47,9 +47,9 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
-//  POLLING POR CUENTA (sin IDLE)
+//  POLLING POR CUENTA (con logs detallados)
 // ------------------------------------------------------------
-const pollingStates = new Map(); // email -> { lastUid, interval, client }
+const pollingStates = new Map();
 
 wss.on('connection', (ws, req) => {
   console.log('🔌 Nuevo cliente WebSocket conectado');
@@ -84,7 +84,7 @@ wss.on('connection', (ws, req) => {
 });
 
 // ------------------------------------------------------------
-//  FUNCIÓN PARA CONECTAR IMAP (con fallback)
+//  FUNCIÓN PARA CONECTAR IMAP
 // ------------------------------------------------------------
 async function connectImap(email, password, host, port, secure) {
   const config = {
@@ -100,15 +100,18 @@ async function connectImap(email, password, host, port, secure) {
   console.log(`🔄 Conectando IMAP a ${host}:${port} (secure=${secure})`);
   const client = new ImapFlow(config);
   await client.connect();
+  console.log(`✅ Conexión IMAP establecida a ${host}:${port}`);
   return client;
 }
 
 // ------------------------------------------------------------
-//  INICIAR POLLING
+//  INICIAR POLLING (con logs)
 // ------------------------------------------------------------
 async function startPolling(ws, email, password) {
-  // Si ya existe polling para este email, detenerlo
+  console.log(`📡 Iniciando polling para ${email}`);
+
   if (pollingStates.has(email)) {
+    console.log(`♻️ Deteniendo polling anterior para ${email}`);
     const old = pollingStates.get(email);
     if (old.interval) clearInterval(old.interval);
     if (old.client) old.client.logout().catch(() => {});
@@ -119,21 +122,16 @@ async function startPolling(ws, email, password) {
   let client = null;
   let lastUid = 0;
 
-  // Intentar conectar IMAP inicialmente
+  // Intentar conectar IMAP
   try {
-    // Probar SSL directo (993)
     client = await connectImap(email, password, auto.imapHost, 993, true);
-    console.log(`✅ IMAP conectado (SSL) para ${email}`);
   } catch (err) {
     console.log(`⚠️ Falló SSL directo para ${email}: ${err.message}`);
     try {
-      // Probar STARTTLS (143)
       client = await connectImap(email, password, auto.imapHost, 143, false);
       await client.startTls();
-      console.log(`✅ IMAP conectado (STARTTLS) para ${email}`);
     } catch (err2) {
       console.error(`❌ No se pudo conectar IMAP para ${email}:`, err2.message);
-      // Si no podemos conectar, no hacemos polling
       ws.send(JSON.stringify({
         type: 'error',
         message: 'Error al conectar con el servidor de correo'
@@ -148,12 +146,14 @@ async function startPolling(ws, email, password) {
     const results = await client.fetch('1:*', { uid: true }, { max: 1, reverse: true });
     if (results && results.length > 0) {
       lastUid = results[0].uid || 0;
+      console.log(`📊 Último UID para ${email}: ${lastUid}`);
+    } else {
+      console.log(`📊 No hay mensajes en INBOX para ${email}`);
     }
   } catch (e) {
     console.log(`⚠️ No se pudo obtener último UID para ${email}:`, e.message);
   }
 
-  // Guardar estado
   const state = {
     lastUid: lastUid,
     client: client,
@@ -165,18 +165,18 @@ async function startPolling(ws, email, password) {
     isConnected: true
   };
   pollingStates.set(email, state);
+  console.log(`✅ Polling iniciado para ${email} (lastUid=${lastUid})`);
 
   // ------------------------------------------------------------
-  //  FUNCIÓN DE POLLING (se ejecuta cada 15 segundos)
+  //  POLLING
   // ------------------------------------------------------------
   const poll = async () => {
     try {
+      console.log(`🔍 Polling para ${email}...`);
       let currentClient = state.client;
-      let currentUid = state.lastUid;
 
-      // Verificar si el cliente sigue conectado
       if (!state.isConnected || !currentClient) {
-        // Reintentar conexión
+        console.log(`🔄 Intentando reconectar IMAP para ${email}`);
         try {
           let newClient;
           try {
@@ -197,18 +197,21 @@ async function startPolling(ws, email, password) {
 
       await currentClient.mailboxOpen('INBOX');
       const results = await currentClient.fetch('1:*', { uid: true, envelope: true }, { max: 1, reverse: true });
+
       if (results && results.length > 0) {
         const latest = results[0];
         const newUid = latest.uid || 0;
-        if (newUid > currentUid) {
-          // Nuevo correo detectado
+        console.log(`📊 UID actual: ${newUid}, último guardado: ${state.lastUid}`);
+
+        if (newUid > state.lastUid) {
           state.lastUid = newUid;
           const from = latest.envelope.from?.[0]?.address || 'Remitente desconocido';
           const subject = latest.envelope.subject || 'Nuevo correo';
-          console.log(`📨 Polling: Nuevo correo detectado para ${email} (UID: ${newUid})`);
+          console.log(`📨 Polling: NUEVO CORREO detectado para ${email} (UID: ${newUid})`);
 
-          // Notificar por WebSocket
+          // WebSocket
           if (ws.readyState === WebSocket.OPEN) {
+            console.log(`📤 Enviando notificación WebSocket para ${email}`);
             ws.send(JSON.stringify({
               type: 'new_email',
               email: email,
@@ -216,15 +219,22 @@ async function startPolling(ws, email, password) {
               from: from,
               subject: subject
             }));
+          } else {
+            console.log(`⚠️ WebSocket no está abierto para ${email}`);
           }
 
-          // Enviar notificación push
+          // Push notification
+          console.log(`📤 Enviando push notification para ${email}`);
           await sendPushNotification(email, {
             title: `📧 Nuevo correo de ${from}`,
             body: subject,
             data: { type: 'new_email', from: from, subject: subject }
           });
+        } else {
+          console.log(`ℹ️ No hay nuevos correos para ${email}`);
         }
+      } else {
+        console.log(`ℹ️ No se pudieron obtener mensajes para ${email}`);
       }
     } catch (e) {
       console.log(`⚠️ Polling error para ${email}:`, e.message);
@@ -235,13 +245,14 @@ async function startPolling(ws, email, password) {
   // Ejecutar poll inmediatamente y luego cada 15 segundos
   await poll();
   state.interval = setInterval(poll, 15000);
-  console.log(`✅ Polling iniciado para ${email} (cada 15s)`);
+  console.log(`✅ Polling loop iniciado para ${email}`);
 }
 
 // ============================================================
-//  FCM PUSH NOTIFICATIONS
+//  FCM PUSH NOTIFICATIONS (con logs)
 // ============================================================
 async function sendPushNotification(email, payload) {
+  console.log(`📤 Enviando push a ${email}`);
   try {
     const tokensSnapshot = await db.collection('fcm_tokens')
       .where('email', '==', email)
@@ -256,6 +267,7 @@ async function sendPushNotification(email, payload) {
     tokensSnapshot.forEach(doc => {
       tokens.push(doc.data().token);
     });
+    console.log(`📱 Tokens FCM encontrados: ${tokens.length}`);
 
     const message = {
       notification: {
@@ -270,10 +282,12 @@ async function sendPushNotification(email, payload) {
     console.log(`📨 Notificación push enviada a ${tokens.length} dispositivos para ${email}`);
 
     if (response.failureCount > 0) {
+      console.log(`⚠️ Fallaron ${response.failureCount} envíos`);
       const failedTokens = [];
       response.responses.forEach((resp, idx) => {
         if (!resp.success) {
           failedTokens.push(tokens[idx]);
+          console.log(`   ❌ Token fallido: ${tokens[idx].substring(0, 20)}...`);
         }
       });
       for (const token of failedTokens) {
@@ -290,10 +304,12 @@ async function sendPushNotification(email, payload) {
 }
 
 // ============================================================
-//  ENDPOINTS FCM
+//  ENDPOINTS FCM (con logs)
 // ============================================================
 app.post('/api/fcm-token', async (req, res) => {
   const { email, token } = req.body;
+  console.log(`📱 Recibido token FCM para ${email}: ${token.substring(0, 20)}...`);
+
   if (!email || !token) {
     return res.status(400).json({ success: false, error: 'Email y token requeridos' });
   }
@@ -310,7 +326,9 @@ app.post('/api/fcm-token', async (req, res) => {
         token: token,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
-      console.log(`📱 Token FCM guardado para ${email}`);
+      console.log(`✅ Token FCM guardado para ${email}`);
+    } else {
+      console.log(`ℹ️ Token FCM ya existe para ${email}`);
     }
     res.json({ success: true });
   } catch (e) {
@@ -321,6 +339,7 @@ app.post('/api/fcm-token', async (req, res) => {
 
 app.post('/api/fcm-token/remove', async (req, res) => {
   const { token } = req.body;
+  console.log(`🗑️ Eliminando token FCM: ${token.substring(0, 20)}...`);
   if (!token) {
     return res.status(400).json({ success: false, error: 'Token requerido' });
   }
@@ -561,7 +580,6 @@ app.post('/api/messages', async (req, res) => {
     const auto = getAutoConfig(email);
     let client;
     try {
-        // Intentar SSL directo
         try {
             client = new ImapFlow({
                 host: host || auto.imapHost,
@@ -573,7 +591,6 @@ app.post('/api/messages', async (req, res) => {
             });
             await client.connect();
         } catch (err) {
-            // Fallback a STARTTLS
             client = new ImapFlow({
                 host: host || auto.imapHost,
                 port: 143,

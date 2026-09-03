@@ -47,9 +47,9 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
-//  POLLING POR CUENTA (usando fetch en lugar de search)
+//  POLLING POR CUENTA
 // ------------------------------------------------------------
-const pollingStates = new Map(); // email -> { lastUids: Set, interval, client, ws }
+const pollingStates = new Map(); // email -> { interval, ws, lastUids: Set, client }
 
 // Función para conectar IMAP (con fallback)
 async function connectImap(email, password, host, port, secure) {
@@ -111,9 +111,9 @@ async function startPolling(ws, email, password) {
   }
 
   const auto = getAutoConfig(email);
-  let client = null;
+  let client;
 
-  // Conectar IMAP (intentar SSL directo primero)
+  // Conectar IMAP
   try {
     client = await connectImap(email, password, auto.imapHost, 993, true);
     console.log(`✅ IMAP conectado (SSL) para ${email}`);
@@ -130,86 +130,70 @@ async function startPolling(ws, email, password) {
     }
   }
 
+  // Abrir INBOX
+  await client.mailboxOpen('INBOX');
+
+  // Obtener UIDs iniciales correctamente
+  let initialUids = [];
+  try {
+    const results = await client.fetch('1:*', { uid: true });
+    // results es un Array de objetos con propiedad 'uid'
+    if (Array.isArray(results)) {
+      initialUids = results.map(r => r.uid).filter(u => u !== undefined);
+    } else {
+      // Si no es array, intentar convertir
+      console.log('⚠️ fetch no devolvió un array, resultados:', results);
+      initialUids = [];
+    }
+    console.log(`📊 INBOX tiene ${initialUids.length} mensajes para ${email}`);
+  } catch (e) {
+    console.log(`⚠️ Error al obtener UIDs iniciales: ${e.message}`);
+    initialUids = [];
+  }
+
   // Guardar estado
   const state = {
-    client: client,
     interval: null,
     ws: ws,
     email: email,
     password: password,
     host: auto.imapHost,
-    isConnected: true,
-    lastUids: new Set()
+    client: client,        // Mantener la conexión abierta
+    lastUids: new Set(initialUids),
   };
   pollingStates.set(email, state);
+  console.log(`✅ Polling iniciado para ${email} (${initialUids.length} mensajes iniciales)`);
 
-  // Función para obtener todos los UIDs usando fetch
-  async function getUids(client) {
-    try {
-      await client.mailboxOpen('INBOX');
-      const results = await client.fetch('1:*', { uid: true });
-      if (!results || results.length === 0) {
-        return [];
-      }
-      return results.map(msg => msg.uid).filter(uid => uid !== undefined);
-    } catch (e) {
-      console.log(`⚠️ Error al obtener UIDs para ${email}:`, e.message);
-      // Si falla, intentamos con search como fallback
-      try {
-        const result = await client.search({ uid: true });
-        return result || [];
-      } catch (e2) {
-        console.log(`⚠️ Falló también search para ${email}:`, e2.message);
-        return [];
-      }
-    }
-  }
-
-  // Función para obtener detalles de un mensaje por UID
-  async function getMessageDetails(client, uid) {
-    try {
-      const results = await client.fetch(String(uid), { envelope: true, uid: true });
-      if (results && results.length > 0) {
-        const msg = results[0];
-        return {
-          from: msg.envelope.from?.[0]?.address || 'Remitente desconocido',
-          subject: msg.envelope.subject || 'Nuevo correo'
-        };
-      }
-    } catch (e) {
-      console.log(`⚠️ Error al obtener detalles del mensaje ${uid}:`, e.message);
-    }
-    return null;
-  }
-
-  // Función de polling (intervalo reducido a 10 segundos)
+  // Función de polling (reutiliza la conexión abierta)
   const poll = async () => {
     try {
       let currentClient = state.client;
-
-      // Verificar si el cliente sigue conectado
-      if (!state.isConnected || !currentClient) {
-        // Reintentar conexión
+      // Verificar si la conexión sigue viva
+      try {
+        // Intentar un comando ligero para probar la conexión
+        await currentClient.noop();
+      } catch (e) {
+        console.log(`⚠️ Conexión IMAP perdida para ${email}, reconectando...`);
+        // Reconectar
         try {
-          let newClient;
-          try {
-            newClient = await connectImap(email, password, state.host, 993, true);
-          } catch (err) {
-            newClient = await connectImap(email, password, state.host, 143, false);
-            await newClient.startTls();
-          }
-          state.client = newClient;
-          state.isConnected = true;
-          currentClient = newClient;
-          console.log(`✅ Polling: reconexión IMAP exitosa para ${email}`);
-        } catch (e) {
-          console.log(`⚠️ Polling: no se pudo reconectar IMAP para ${email}:`, e.message);
-          return;
+          currentClient = await connectImap(email, password, state.host, 993, true);
+        } catch (err) {
+          currentClient = await connectImap(email, password, state.host, 143, false);
+          await currentClient.startTls();
         }
+        await currentClient.mailboxOpen('INBOX');
+        state.client = currentClient;
+        console.log(`✅ Polling: reconexión IMAP exitosa para ${email}`);
       }
 
       // Obtener UIDs actuales
-      const currentUids = await getUids(currentClient);
+      const results = await currentClient.fetch('1:*', { uid: true, envelope: true });
+      if (!Array.isArray(results) || results.length === 0) {
+        console.log(`ℹ️ No hay mensajes en INBOX para ${email}`);
+        return;
+      }
+
+      const currentUids = results.map(r => r.uid).filter(u => u !== undefined);
       if (currentUids.length === 0) {
         console.log(`ℹ️ No hay mensajes en INBOX para ${email}`);
         return;
@@ -222,10 +206,12 @@ async function startPolling(ws, email, password) {
 
         // Para cada nuevo UID, obtener detalles y enviar notificación
         for (const uid of newUids) {
-          const details = await getMessageDetails(currentClient, uid);
-          if (!details) continue;
+          const msg = results.find(r => r.uid === uid);
+          if (!msg) continue;
 
-          console.log(`📨 Nuevo correo UID:${uid} de ${details.from} - ${details.subject}`);
+          const from = msg.envelope.from?.[0]?.address || 'Remitente desconocido';
+          const subject = msg.envelope.subject || 'Nuevo correo';
+          console.log(`📨 Nuevo correo UID:${uid} de ${from} - ${subject}`);
 
           // Notificar por WebSocket
           if (ws.readyState === WebSocket.OPEN) {
@@ -233,44 +219,38 @@ async function startPolling(ws, email, password) {
               type: 'new_email',
               email: email,
               timestamp: new Date().toISOString(),
-              from: details.from,
-              subject: details.subject,
+              from: from,
+              subject: subject,
               uid: uid
             }));
           }
 
           // Enviar notificación push
           await sendPushNotification(email, {
-            title: `📧 Nuevo correo de ${details.from}`,
-            body: details.subject,
-            data: { type: 'new_email', from: details.from, subject: details.subject, uid: uid }
+            title: `📧 Nuevo correo de ${from}`,
+            body: subject,
+            data: { type: 'new_email', from: from, subject: subject, uid: uid }
           });
         }
 
         // Actualizar la lista de UIDs anteriores
         state.lastUids = new Set(currentUids);
       } else {
-        console.log(`🔍 Polling para ${email}... sin cambios`);
+        console.log(`🔍 Polling para ${email}... sin cambios (${currentUids.length} mensajes)`);
       }
     } catch (e) {
       console.log(`⚠️ Polling error para ${email}:`, e.message);
-      state.isConnected = false;
     }
   };
 
-  // Obtener UIDs iniciales
-  const initialUids = await getUids(client);
-  state.lastUids = new Set(initialUids);
-  console.log(`✅ Polling iniciado para ${email} (${initialUids.length} mensajes iniciales)`);
-
   // Ejecutar poll inmediatamente y luego cada 10 segundos
   await poll();
-  state.interval = setInterval(poll, 10000);
-  console.log(`✅ Polling loop iniciado para ${email} (intervalo 10s)`);
+  state.interval = setInterval(poll, 10000); // 10 segundos
+  console.log(`✅ Polling loop iniciado para ${email} (cada 10s)`);
 }
 
 // ============================================================
-//  FCM PUSH NOTIFICATIONS
+//  FCM PUSH NOTIFICATIONS (sin cambios)
 // ============================================================
 async function sendPushNotification(email, payload) {
   try {
@@ -405,7 +385,7 @@ function getAutoConfig(email) {
 }
 
 // ------------------------------------------------------------
-//  1. LOGIN / VERIFICACIÓN
+//  LOGIN / VERIFICACIÓN
 // ------------------------------------------------------------
 const handleAuth = (req, res) => {
     const { email, password, host, port } = req.body;
@@ -477,7 +457,7 @@ app.post('/api/verify', handleAuth);
 app.get('/ping', (req, res) => res.json({ alive: true }));
 
 // ------------------------------------------------------------
-//  2. ENVÍO DE CORREO SMTP
+//  ENVÍO DE CORREO SMTP
 // ------------------------------------------------------------
 app.post('/api/send-email', async (req, res) => {
     const { email, password, host, port, to, subject, body, attachments } = req.body;
@@ -515,7 +495,7 @@ app.post('/api/send-email', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  3. GUARDAR EN ENVIADOS
+//  GUARDAR EN ENVIADOS
 // ------------------------------------------------------------
 app.post('/api/save-to-sent', async (req, res) => {
     const { email, password, host, port, to, subject, body } = req.body;

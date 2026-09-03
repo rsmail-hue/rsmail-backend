@@ -47,7 +47,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
-//  POLLING POR CUENTA (comparación de UIDs)
+//  POLLING POR CUENTA (usando fetch en lugar de search)
 // ------------------------------------------------------------
 const pollingStates = new Map(); // email -> { lastUids: Set, interval, client, ws }
 
@@ -112,9 +112,8 @@ async function startPolling(ws, email, password) {
 
   const auto = getAutoConfig(email);
   let client = null;
-  let lastUids = new Set(); // Guardar UIDs anteriores
 
-  // Conectar IMAP
+  // Conectar IMAP (intentar SSL directo primero)
   try {
     client = await connectImap(email, password, auto.imapHost, 993, true);
     console.log(`✅ IMAP conectado (SSL) para ${email}`);
@@ -144,15 +143,25 @@ async function startPolling(ws, email, password) {
   };
   pollingStates.set(email, state);
 
-  // Función para obtener todos los UIDs de la bandeja
+  // Función para obtener todos los UIDs usando fetch
   async function getUids(client) {
     try {
       await client.mailboxOpen('INBOX');
-      const result = await client.search({ uid: true });
-      return result || [];
+      const results = await client.fetch('1:*', { uid: true });
+      if (!results || results.length === 0) {
+        return [];
+      }
+      return results.map(msg => msg.uid).filter(uid => uid !== undefined);
     } catch (e) {
       console.log(`⚠️ Error al obtener UIDs para ${email}:`, e.message);
-      return [];
+      // Si falla, intentamos con search como fallback
+      try {
+        const result = await client.search({ uid: true });
+        return result || [];
+      } catch (e2) {
+        console.log(`⚠️ Falló también search para ${email}:`, e2.message);
+        return [];
+      }
     }
   }
 
@@ -173,7 +182,7 @@ async function startPolling(ws, email, password) {
     return null;
   }
 
-  // Función de polling
+  // Función de polling (intervalo reducido a 10 segundos)
   const poll = async () => {
     try {
       let currentClient = state.client;
@@ -254,10 +263,10 @@ async function startPolling(ws, email, password) {
   state.lastUids = new Set(initialUids);
   console.log(`✅ Polling iniciado para ${email} (${initialUids.length} mensajes iniciales)`);
 
-  // Ejecutar poll inmediatamente y luego cada 15 segundos
+  // Ejecutar poll inmediatamente y luego cada 10 segundos
   await poll();
-  state.interval = setInterval(poll, 15000);
-  console.log(`✅ Polling loop iniciado para ${email}`);
+  state.interval = setInterval(poll, 10000);
+  console.log(`✅ Polling loop iniciado para ${email} (intervalo 10s)`);
 }
 
 // ============================================================
@@ -396,7 +405,7 @@ function getAutoConfig(email) {
 }
 
 // ------------------------------------------------------------
-//  1. LOGIN / VERIFICACIÓN (sin cambios)
+//  1. LOGIN / VERIFICACIÓN
 // ------------------------------------------------------------
 const handleAuth = (req, res) => {
     const { email, password, host, port } = req.body;
@@ -576,7 +585,7 @@ app.post('/api/folders', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  5. OBTENER MENSAJES (con corrección de flags)
+//  5. OBTENER MENSAJES
 // ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
     const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
@@ -806,4 +815,4 @@ app.post('/api/download-attachment', async (req, res) => {
 //  INICIAR SERVIDOR
 // ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`✅ Backend RSMAIL en puerto ${PORT} con polling robusto`));
+server.listen(PORT, () => console.log(`✅ Backend RSMAIL en puerto ${PORT} con polling optimizado`));

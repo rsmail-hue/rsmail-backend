@@ -311,28 +311,27 @@ app.post('/api/fcm-token/remove', async (req, res) => {
   }
 });
 
-app.post('/api/calendar-notify', async (req, res) => {
-  const { email, eventTitle, eventDate } = req.body;
-  if (!email) return res.status(400).json({ success: false, error: 'Email requerido' });
+// ============================================================
+//  ENDPOINT TEMPORAL PARA PROBAR TOKEN FCM
+// ============================================================
+app.post('/api/test-token', async (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(400).json({ success: false, error: 'Token requerido' });
 
-  await sendPushNotification(email, {
-    title: `📅 Recordatorio: ${eventTitle || 'Evento'}`,
-    body: `Programado para ${eventDate || 'próximamente'}`,
-    data: { type: 'calendar_event' }
-  });
-  res.json({ success: true });
-});
-
-app.post('/api/note-notify', async (req, res) => {
-  const { email, noteTitle, senderEmail } = req.body;
-  if (!email) return res.status(400).json({ success: false, error: 'Email requerido' });
-
-  await sendPushNotification(email, {
-    title: `📝 Nota compartida por ${senderEmail || 'Alguien'}`,
-    body: `"${noteTitle || 'sin título'}"`,
-    data: { type: 'note_shared' }
-  });
-  res.json({ success: true });
+  try {
+    await admin.messaging().send({
+      token,
+      notification: {
+        title: 'Test RSMail',
+        body: 'Si ves esto, el token es válido',
+      },
+    });
+    console.log('✅ Token válido y notificación enviada');
+    res.json({ success: true, message: 'Notificación enviada correctamente' });
+  } catch (e) {
+    console.error('❌ Error enviando test:', e.message);
+    res.status(400).json({ success: false, error: e.message });
+  }
 });
 
 // ------------------------------------------------------------

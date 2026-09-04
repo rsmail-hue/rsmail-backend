@@ -14,16 +14,20 @@ const admin = require('firebase-admin');
 if (!admin.apps.length) {
   if (process.env.FIREBASE_PRIVATE_KEY) {
     try {
+      const formattedKey = process.env.FIREBASE_PRIVATE_KEY
+        .replace(/^"|"$/g, '')
+        .replace(/\\n/g, '\n');
+
       admin.initializeApp({
         credential: admin.credential.cert({
           projectId: process.env.FIREBASE_PROJECT_ID,
-          privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
           clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+          privateKey: formattedKey,
         }),
       });
       console.log('✅ Firebase Admin inicializado con variables de entorno');
     } catch (e) {
-      console.error('❌ Error con variables de entorno:', e.message);
+      console.error('❌ Error al inicializar Firebase con Variables de Entorno:', e.message);
     }
   } else {
     try {
@@ -33,7 +37,7 @@ if (!admin.apps.length) {
       });
       console.log('✅ Firebase Admin inicializado con serviceAccountKey.json');
     } catch (e) {
-      console.error('⚠️ No se encontró serviceAccountKey.json. FCM no disponible.');
+      console.error('⚠️ No se encontró serviceAccountKey.json ni variables de entorno válidas.');
     }
   }
 }
@@ -634,7 +638,7 @@ app.post('/api/message-detail', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  7. ELIMINAR / MOVER A PAPELERA
+//  ELIMINAR / MOVER A PAPELERA
 // ------------------------------------------------------------
 app.post('/api/delete-message', async (req, res) => {
   const { email, password, host, port, uid, folder = 'INBOX' } = req.body;
@@ -695,7 +699,7 @@ app.post('/api/delete-message', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  8. MOVER MENSAJE GENÉRICO
+//  MOVER MENSAJE GENÉRICO
 // ------------------------------------------------------------
 app.post('/api/move-message', async (req, res) => {
   const { email, password, host, port, uid, fromFolder, toFolder } = req.body;
@@ -716,7 +720,7 @@ app.post('/api/move-message', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  9‑12. RESTO DE ENDPOINTS
+//  ACCIONES SOBRE MENSAJES (LEÍDO Y MARCADOS)
 // ------------------------------------------------------------
 app.post('/api/toggle-read', async (req, res) => {
   const { email, password, host, port, uid, folder = 'INBOX', read } = req.body;
@@ -796,4 +800,4 @@ app.post('/api/download-attachment', async (req, res) => {
 //  INICIAR SERVIDOR
 // ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`✅ Backend RSMAIL en puerto ${PORT} con polling robusto`));
+server.listen(PORT, () => console.log(`✅ Backend RSMAIL en puerto ${PORT} activo`));

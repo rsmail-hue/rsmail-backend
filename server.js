@@ -311,9 +311,23 @@ app.post('/api/fcm-token/remove', async (req, res) => {
   }
 });
 
-// ============================================================
+// ------------------------------------------------------------
+//  ENDPOINT PARA LIMPIAR TOKENS ANTIGUOS
+// ------------------------------------------------------------
+app.post('/api/clean-fcm-tokens', async (req, res) => {
+  if (!db) return res.status(500).json({ success: false, error: 'Firestore no disponible' });
+  try {
+    const snapshot = await db.collection('fcm_tokens').get();
+    snapshot.forEach(doc => doc.ref.delete());
+    res.json({ success: true, deleted: snapshot.size });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ------------------------------------------------------------
 //  ENDPOINT TEMPORAL PARA PROBAR TOKEN FCM
-// ============================================================
+// ------------------------------------------------------------
 app.post('/api/test-token', async (req, res) => {
   const { token } = req.body;
   if (!token) return res.status(400).json({ success: false, error: 'Token requerido' });

@@ -265,7 +265,10 @@ async function sendPushNotification(email, payload) {
     if (response.failureCount > 0) {
       const failedTokens = [];
       response.responses.forEach((resp, idx) => {
-        if (!resp.success) failedTokens.push(tokens[idx]);
+        if (!resp.success) {
+          console.log(`❌ Token fallido: ${tokens[idx]} -> ${resp.error?.message}`);
+          failedTokens.push(tokens[idx]);
+        }
       });
       for (const token of failedTokens) {
         const snapshots = await db.collection('fcm_tokens').where('token', '==', token).get();
@@ -285,11 +288,16 @@ app.post('/api/fcm-token', async (req, res) => {
   const { email, token } = req.body;
   if (!email || !token || !db) return res.status(400).json({ success: false, error: 'Email y token requeridos' });
 
+  // 🔥 Imprimir token recibido
+  console.log('📥 Token recibido:', token);
+
   try {
     const existing = await db.collection('fcm_tokens').where('email', '==', email).where('token', '==', token).get();
     if (existing.empty) {
       await db.collection('fcm_tokens').add({ email, token, createdAt: admin.firestore.FieldValue.serverTimestamp() });
       console.log(`📱 Token FCM guardado para ${email}`);
+    } else {
+      console.log('ℹ️ Token ya existente en Firestore');
     }
     res.json({ success: true });
   } catch (e) {

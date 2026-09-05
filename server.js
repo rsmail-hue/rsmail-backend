@@ -217,7 +217,7 @@ async function startPolling(ws, email, password) {
           await sendPushNotification(email, {
             title: `📧 Nuevo correo de ${from}`,
             body: subject,
-            data: { type: 'new_email', from, subject, uid: String(uid) }
+            data: { type: 'new_email', sender: from, subject, uid: String(uid) }
           });
         }
 
@@ -288,17 +288,20 @@ app.post('/api/fcm-token', async (req, res) => {
   const { email, token } = req.body;
   if (!email || !token || !db) return res.status(400).json({ success: false, error: 'Email y token requeridos' });
 
-  // 🔥 Imprimir token recibido
   console.log('📥 Token recibido:', token);
 
   try {
-    const existing = await db.collection('fcm_tokens').where('email', '==', email).where('token', '==', token).get();
-    if (existing.empty) {
-      await db.collection('fcm_tokens').add({ email, token, createdAt: admin.firestore.FieldValue.serverTimestamp() });
-      console.log(`📱 Token FCM guardado para ${email}`);
-    } else {
-      console.log('ℹ️ Token ya existente en Firestore');
-    }
+    // Eliminar tokens anteriores del mismo email
+    const existing = await db.collection('fcm_tokens').where('email', '==', email).get();
+    existing.forEach(doc => doc.ref.delete());
+
+    // Guardar el token nuevo
+    await db.collection('fcm_tokens').add({
+      email,
+      token,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    console.log(`📱 Token FCM guardado para ${email}`);
     res.json({ success: true });
   } catch (e) {
     console.error('❌ Error guardando token FCM:', e);

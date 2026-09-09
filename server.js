@@ -14,9 +14,8 @@ const admin = require('firebase-admin');
 if (!admin.apps.length) {
   if (process.env.FIREBASE_PRIVATE_KEY) {
     try {
-      const formattedKey = process.env.FIREBASE_PRIVATE_KEY
-        .replace(/^"|"$/g, '')
-        .replace(/\\n/g, '\n');
+      let formattedKey = process.env.FIREBASE_PRIVATE_KEY;
+      formattedKey = formattedKey.replace(/^"|"$/g, '').replace(/\\n/g, '\n');
 
       admin.initializeApp({
         credential: admin.credential.cert({
@@ -25,7 +24,7 @@ if (!admin.apps.length) {
           privateKey: formattedKey,
         }),
       });
-      console.log('✅ Firebase Admin inicializado con variables de entorno en Render');
+      console.log('✅ Firebase Admin inicializado correctamente con variables de entorno');
     } catch (e) {
       console.error('❌ Error al inicializar Firebase con Variables de Entorno:', e.message);
     }
@@ -37,10 +36,11 @@ if (!admin.apps.length) {
       });
       console.log('✅ Firebase Admin inicializado con serviceAccountKey.json');
     } catch (e) {
-      console.error('⚠️ No se encontró serviceAccountKey.json ni variables de entorno válidas.');
+      console.error('⚠️ No se encontraron credenciales de Firebase. Notificaciones deshabilitadas.');
     }
   }
 }
+
 const db = admin.apps.length ? admin.firestore() : null;
 
 const app = express();
@@ -51,9 +51,9 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
-//  POLLING Y CONEXIÓN IMAP OPTIMIZADOS PARA RENDER
+//  CONEXIÓN Y TRABAJADOR IMAP PERSISTENTE (IDLE)
 // ------------------------------------------------------------
-const pollingStates = new Map();
+const activeWorkers = new Map();
 
 async function connectImap(email, password, host, port, secure) {
   const config = {
@@ -67,146 +67,158 @@ async function connectImap(email, password, host, port, secure) {
       minVersion: 'TLSv1.2',
       servername: host
     },
-    connectionTimeout: 25000,
+    connectionTimeout: 30000,
     greetingTimeout: 20000,
-    socketTimeout: 25000,
+    socketTimeout: 35000,
   };
-  console.log(`🔄 Conectando IMAP a ${host}:${port} (secure=${secure})`);
+  console.log(`🔄 Estableciendo conexión IMAP persistente con ${host}:${port}`);
   const client = new ImapFlow(config);
   await client.connect();
   return client;
 }
 
-wss.on('connection', (ws, req) => {
-  console.log('🔌 Nuevo cliente WebSocket conectado');
-  let email = null;
-  let password = null;
+wss.on('connection', (ws) => {
+  console.log('🔌 Nuevo cliente WebSocket conectado desde la app');
+  let userEmail = null;
 
   ws.on('message', async (message) => {
     try {
       const data = JSON.parse(message);
       if (data.type === 'login') {
-        email = data.email;
-        password = data.password;
-        console.log(`📧 WebSocket login para ${email}`);
-        startPolling(ws, email, password);
+        userEmail = data.email;
+        console.log(`📧 Login WebSocket registrado para ${userEmail}`);
+        startImapWorker(ws, data.email, data.password);
       }
     } catch (e) {
-      console.error('❌ Error en WebSocket:', e);
+      console.error('❌ Error procesando mensaje WebSocket:', e.message);
     }
   });
 
   ws.on('close', () => {
-    console.log('🔌 Cliente WebSocket desconectado');
-    if (email && pollingStates.has(email)) {
-      const state = pollingStates.get(email);
-      if (state.interval) clearInterval(state.interval);
-      pollingStates.delete(email);
+    console.log(`🔌 Cliente WebSocket desconectado (${userEmail || 'Desconocido'})`);
+    if (userEmail && activeWorkers.has(userEmail)) {
+      const worker = activeWorkers.get(userEmail);
+      worker.active = false;
+      if (worker.client) {
+        worker.client.logout().catch(() => {});
+      }
+      activeWorkers.delete(userEmail);
+      console.log(`🛑 Trabajo IMAP detenido para ${userEmail}`);
     }
   });
 });
 
-async function startPolling(ws, email, password) {
-  if (pollingStates.has(email)) {
-    const old = pollingStates.get(email);
-    if (old.interval) clearInterval(old.interval);
-    pollingStates.delete(email);
+async function startImapWorker(ws, email, password) {
+  // Limpiar cualquier hilo previo activo para evitar duplicados
+  if (activeWorkers.has(email)) {
+    const old = activeWorkers.get(email);
+    old.active = false;
+    if (old.client) old.client.logout().catch(() => {});
+    activeWorkers.delete(email);
   }
 
   const auto = getAutoConfig(email);
   const host = auto ? auto.imapHost : 'mail.' + email.split('@')[1];
 
-  let maxUid = 0;
-  let client;
-  try {
-    try {
-      client = await connectImap(email, password, host, 993, true);
-    } catch (err) {
-      client = await connectImap(email, password, host, 143, false);
-    }
-
-    const lock = await client.getMailboxLock('INBOX');
-    try {
-      const iter = client.fetch('1:*', { uid: true });
-      for await (const msg of iter) {
-        if (msg.uid && msg.uid > maxUid) maxUid = msg.uid;
-      }
-    } finally {
-      lock.release();
-      await client.logout().catch(() => {});
-    }
-    console.log(`📊 Conexión inicial exitosa para ${email}. Último UID detectado: ${maxUid}`);
-  } catch (e) {
-    console.log(`⚠️ No se pudo obtener el UID inicial para ${email}: ${e.message}`);
-  }
-
-  const state = {
-    interval: null,
+  const workerState = {
     ws,
     email,
     password,
     host,
-    maxUid,
-    isBusy: false
+    maxUid: 0,
+    client: null,
+    active: true
   };
-  pollingStates.set(email, state);
+  
+  activeWorkers.set(email, workerState);
+  runImapLoop(workerState);
+}
 
-  const poll = async () => {
-    if (state.isBusy) return;
-    state.isBusy = true;
-
-    let newClient;
+async function runImapLoop(state) {
+  while (state.active) {
+    let lock = null;
     try {
       try {
-        newClient = await connectImap(email, password, state.host, 993, true);
+        state.client = await connectImap(state.email, state.password, state.host, 993, true);
       } catch (err) {
-        newClient = await connectImap(email, password, state.host, 143, false);
+        console.log(`⚠️ Falló puerto 993 para ${state.email}, reintentando puerto 143...`);
+        state.client = await connectImap(state.email, state.password, state.host, 143, false);
       }
 
-      const pollLock = await newClient.getMailboxLock('INBOX');
-      try {
-        const range = state.maxUid > 0 ? `${state.maxUid + 1}:*` : '1:*';
-        const iter = newClient.fetch(range, { uid: true, envelope: true });
+      lock = await state.client.getMailboxLock('INBOX');
 
-        for await (const msg of iter) {
-          if (msg.uid && msg.uid > state.maxUid) {
-            state.maxUid = msg.uid;
-            const from = msg.envelope?.from?.[0]?.address || 'Remitente desconocido';
-            const subject = msg.envelope?.subject || 'Nuevo correo';
-
-            console.log(`📨 ¡Nuevo correo detectado! UID:${msg.uid} de ${from} - ${subject}`);
-
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({
-                type: 'new_email',
-                email,
-                timestamp: new Date().toISOString(),
-                from,
-                subject,
-                uid: msg.uid
-              }));
-            }
-
-            await sendPushNotification(email, {
-              title: `📧 Nuevo correo de ${from}`,
-              body: subject,
-              data: { type: 'new_email', sender: from, subject, uid: String(msg.uid) }
-            });
-          }
+      // Obtener el UID actual más alto
+      const iter = state.client.fetch('1:*', { uid: true });
+      for await (const msg of iter) {
+        if (msg.uid && msg.uid > state.maxUid) {
+          state.maxUid = msg.uid;
         }
-      } finally {
-        pollLock.release();
-        await newClient.logout().catch(() => {});
       }
-    } catch (e) {
-      console.log(`⚠️ Polling error para ${email}:`, e.message);
-    } finally {
-      state.isBusy = false;
-    }
-  };
+      console.log(`📊 Escucha IMAP (IDLE) lista para ${state.email}. Último UID conocido: ${state.maxUid}`);
 
-  state.interval = setInterval(poll, 20000);
-  console.log(`✅ Polling optimizado iniciado para ${email} (cada 20s)`);
+      // Evento en tiempo real al recibir un mensaje
+      const onExists = async () => {
+        if (!state.active) return;
+        try {
+          const range = state.maxUid > 0 ? `${state.maxUid + 1}:*` : '1:*';
+          const newIter = state.client.fetch(range, { uid: true, envelope: true });
+
+          for await (const msg of newIter) {
+            if (msg.uid && msg.uid > state.maxUid) {
+              state.maxUid = msg.uid;
+              const from = msg.envelope?.from?.[0]?.address || 'Remitente desconocido';
+              const subject = msg.envelope?.subject || 'Nuevo correo';
+
+              console.log(`📨 ¡Nuevo correo recibido! UID:${msg.uid} de ${from} - ${subject}`);
+
+              if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+                state.ws.send(JSON.stringify({
+                  type: 'new_email',
+                  email: state.email,
+                  timestamp: new Date().toISOString(),
+                  from,
+                  subject,
+                  uid: msg.uid
+                }));
+              }
+
+              await sendPushNotification(state.email, {
+                title: `📧 Nuevo correo de ${from}`,
+                body: subject,
+                data: { type: 'new_email', sender: from, subject, uid: String(msg.uid) }
+              });
+            }
+          }
+        } catch (e) {
+          console.error(`⚠️ Error al procesar evento nuevo correo para ${state.email}:`, e.message);
+        }
+      };
+
+      state.client.on('exists', onExists);
+
+      // Mantener en reposo (IDLE) esperando eventos sin desconectar
+      while (state.active && state.client.usable) {
+        await state.client.idle();
+      }
+
+    } catch (e) {
+      if (state.active) {
+        console.log(`⚠️ Conexión IMAP interrumpida para ${state.email}: ${e.message}`);
+      }
+    } finally {
+      if (lock) lock.release();
+      if (state.client) {
+        await state.client.logout().catch(() => {});
+        state.client = null;
+      }
+    }
+
+    // Esperar 15 segundos antes de reintentar en caso de desconexión del servidor
+    if (state.active) {
+      console.log(`⏳ Reagendando reconexión IMAP para ${state.email} en 15 segundos...`);
+      await new Promise(r => setTimeout(r, 15000));
+    }
+  }
 }
 
 // ------------------------------------------------------------
@@ -214,13 +226,13 @@ async function startPolling(ws, email, password) {
 // ------------------------------------------------------------
 async function sendPushNotification(email, payload) {
   if (!db) {
-    console.log(`⚠️ Base de datos Firestore no disponible. No se envió push a ${email}`);
+    console.log(`❌ Firestore no está inicializado. No se puede enviar notificación push a ${email}`);
     return;
   }
   try {
     const tokensSnapshot = await db.collection('fcm_tokens').where('email', '==', email).get();
     if (tokensSnapshot.empty) {
-      console.log(`📴 No hay tokens FCM registrados en Firestore para ${email}`);
+      console.log(`📴 No se encontró token FCM en Firestore para la cuenta ${email}`);
       return;
     }
 
@@ -230,20 +242,20 @@ async function sendPushNotification(email, payload) {
     const message = {
       notification: {
         title: payload.title || 'RSMAIL',
-        body: payload.body || 'Tienes una nueva notificación',
+        body: payload.body || 'Nueva notificación recibida',
       },
       data: payload.data || { type: 'general' },
       tokens,
     };
 
     const response = await admin.messaging().sendEachForMulticast(message);
-    console.log(`📨 Notificación push enviada a ${tokens.length} dispositivo(s) para ${email}`);
+    console.log(`🚀 Notificación Push enviada con éxito a ${tokens.length} dispositivo(s) para ${email}`);
 
     if (response.failureCount > 0) {
       const failedTokens = [];
       response.responses.forEach((resp, idx) => {
         if (!resp.success) {
-          console.log(`❌ Token fallido: ${tokens[idx]} -> ${resp.error?.message}`);
+          console.log(`❌ Token rechazado por FCM: ${tokens[idx]} -> ${resp.error?.message}`);
           failedTokens.push(tokens[idx]);
         }
       });
@@ -251,21 +263,19 @@ async function sendPushNotification(email, payload) {
         const snapshots = await db.collection('fcm_tokens').where('token', '==', token).get();
         snapshots.forEach(doc => doc.ref.delete());
       }
-      console.log(`🧹 Eliminados ${failedTokens.length} tokens inválidos`);
     }
   } catch (e) {
-    console.error('❌ Error enviando push notification:', e);
+    console.error('❌ Error crítico enviando notificación Push:', e.message);
   }
 }
 
 // ------------------------------------------------------------
-//  ENDPOINTS FCM Y NOTIFICACIONES GENERALES (EMAIL / CALENDARIO)
+//  ENDPOINTS FCM Y CALENDARIO
 // ------------------------------------------------------------
 app.post('/api/fcm-token', async (req, res) => {
   const { email, token } = req.body;
-  if (!email || !token || !db) return res.status(400).json({ success: false, error: 'Email, token o Firestore no disponible' });
-
-  console.log('📥 Token FCM recibido:', token, 'para email:', email);
+  if (!email || !token) return res.status(400).json({ success: false, error: 'Email y token requeridos' });
+  if (!db) return res.status(500).json({ success: false, error: 'Firestore no está disponible en el backend' });
 
   try {
     const existing = await db.collection('fcm_tokens').where('email', '==', email).get();
@@ -276,28 +286,14 @@ app.post('/api/fcm-token', async (req, res) => {
       token,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
-    console.log(`📱 Token FCM guardado correctamente para ${email}`);
+    console.log(`📱 Token FCM guardado en Firestore para ${email}`);
     res.json({ success: true });
   } catch (e) {
-    console.error('❌ Error guardando token FCM:', e);
+    console.error('❌ Error en /api/fcm-token:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
-app.post('/api/fcm-token/remove', async (req, res) => {
-  const { token } = req.body;
-  if (!token || !db) return res.status(400).json({ success: false, error: 'Token requerido' });
-
-  try {
-    const snapshot = await db.collection('fcm_tokens').where('token', '==', token).get();
-    snapshot.forEach(doc => doc.ref.delete());
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// Endpoint genérico para enviar notificaciones push (p. ej. eventos de Calendario)
 app.post('/api/send-notification', async (req, res) => {
   const { email, title, body, data } = req.body;
   if (!email) return res.status(400).json({ success: false, error: 'Email requerido' });
@@ -305,21 +301,10 @@ app.post('/api/send-notification', async (req, res) => {
   try {
     await sendPushNotification(email, {
       title: title || '📅 Recordatorio de Calendario',
-      body: body || 'Tienes un evento próximo',
+      body: body || 'Tienes un evento programado',
       data: data || { type: 'calendar' }
     });
-    res.json({ success: true, message: 'Notificación enviada' });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.post('/api/clean-fcm-tokens', async (req, res) => {
-  if (!db) return res.status(500).json({ success: false, error: 'Firestore no disponible' });
-  try {
-    const snapshot = await db.collection('fcm_tokens').get();
-    snapshot.forEach(doc => doc.ref.delete());
-    res.json({ success: true, deleted: snapshot.size });
+    res.json({ success: true });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -333,14 +318,12 @@ app.post('/api/test-token', async (req, res) => {
     await admin.messaging().send({
       token,
       notification: {
-        title: 'Test RSMail',
-        body: 'Si ves esto, las notificaciones push funcionan correctamente',
+        title: 'Prueba RSMAIL',
+        body: 'Notificaciones push operativas',
       },
     });
-    console.log('✅ Token válido y notificación de prueba enviada');
-    res.json({ success: true, message: 'Notificación enviada correctamente' });
+    res.json({ success: true, message: 'Notificación de prueba enviada' });
   } catch (e) {
-    console.error('❌ Error enviando test:', e.message);
     res.status(400).json({ success: false, error: e.message });
   }
 });
@@ -359,7 +342,7 @@ function getAutoConfig(email) {
 }
 
 // ------------------------------------------------------------
-//  LOGIN / VERIFICACIÓN
+//  LOGIN Y RUTAS REST
 // ------------------------------------------------------------
 const handleAuth = (req, res) => {
   const { email, password, host, port } = req.body;
@@ -396,12 +379,6 @@ const handleAuth = (req, res) => {
           smtpHost: auto.smtpHost,
           smtpPort: auto.smtpPort,
           smtpSecurity: 'starttls'
-        },
-        config: {
-          imapHost: targetHost,
-          imapPort: targetPort,
-          smtpHost: auto.smtpHost,
-          smtpPort: auto.smtpPort
         }
       });
     }
@@ -430,9 +407,6 @@ app.post('/api/login', handleAuth);
 app.post('/api/verify', handleAuth);
 app.get('/ping', (req, res) => res.json({ alive: true }));
 
-// ------------------------------------------------------------
-//  ENVÍO DE CORREO SMTP
-// ------------------------------------------------------------
 app.post('/api/send-email', async (req, res) => {
   const { email, password, host, port, to, subject, body, attachments } = req.body;
   if (!email || !password || !to) return res.status(400).json({ success: false, error: 'Faltan campos obligatorios' });
@@ -468,9 +442,6 @@ app.post('/api/send-email', async (req, res) => {
   }
 });
 
-// ------------------------------------------------------------
-//  GUARDAR EN ENVIADOS
-// ------------------------------------------------------------
 app.post('/api/save-to-sent', async (req, res) => {
   const { email, password, host, port, to, subject, body } = req.body;
   if (!email || !password) return res.status(400).json({ success: false, error: 'Parámetros insuficientes' });
@@ -488,7 +459,6 @@ app.post('/api/save-to-sent', async (req, res) => {
     }
 
     const list = await client.list();
-
     let sentFolder = list.find(f =>
       f.specialUse === '\\Sent' ||
       /^sent$/i.test(f.name) ||
@@ -517,15 +487,11 @@ app.post('/api/save-to-sent', async (req, res) => {
 
     res.json({ success: true, message: 'Guardado en Enviados' });
   } catch (e) {
-    console.error('❌ Error en save-to-sent:', e.message);
     if (client) await client.logout().catch(() => {});
-    res.status(500).json({ success: false, error: 'Error al guardar en Enviados: ' + e.message });
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 
-// ------------------------------------------------------------
-//  OBTENER CARPETAS
-// ------------------------------------------------------------
 app.post('/api/folders', async (req, res) => {
   const { email, password, host, port } = req.body;
   const auto = getAutoConfig(email);
@@ -548,9 +514,6 @@ app.post('/api/folders', async (req, res) => {
   }
 });
 
-// ------------------------------------------------------------
-//  OBTENER MENSAJES
-// ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
   const auto = getAutoConfig(email);
@@ -591,15 +554,11 @@ app.post('/api/messages', async (req, res) => {
     messages.sort((a, b) => new Date(b.date) - new Date(a.date));
     res.json({ success: true, messages, total: messages.length });
   } catch (err) {
-    console.error('❌ Error en /api/messages:', err.message);
     if (client) await client.logout().catch(() => {});
     res.status(500).json({ success: false, error: err.message, messages: [] });
   }
 });
 
-// ------------------------------------------------------------
-//  DETALLE DEL CORREO
-// ------------------------------------------------------------
 app.post('/api/message-detail', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', uid } = req.body;
   if (!uid) return res.status(400).json({ success: false, error: 'UID requerido' });
@@ -651,9 +610,6 @@ app.post('/api/message-detail', async (req, res) => {
   }
 });
 
-// ------------------------------------------------------------
-//  ELIMINAR / MOVER A PAPELERA
-// ------------------------------------------------------------
 app.post('/api/delete-message', async (req, res) => {
   const { email, password, host, port, uid, folder = 'INBOX' } = req.body;
   if (!uid) return res.status(400).json({ success: false, error: 'Falta UID' });
@@ -670,7 +626,6 @@ app.post('/api/delete-message', async (req, res) => {
     }
 
     const lock = await client.getMailboxLock(folder);
-
     try {
       const isAlreadyTrash = folder.toLowerCase().includes('trash') || folder.toLowerCase().includes('papelera');
       if (isAlreadyTrash) {
@@ -681,21 +636,8 @@ app.post('/api/delete-message', async (req, res) => {
           f.specialUse === '\\Trash' ||
           /^trash$/i.test(f.name) ||
           /papelera/i.test(f.name) ||
-          /inbox\.trash/i.test(f.path) ||
-          /inbox\/trash/i.test(f.path)
-        )?.path;
-
-        if (!trashFolder) {
-          const candidates = ['INBOX.Trash', 'Trash', 'Papelera'];
-          for (const cand of candidates) {
-            try {
-              await client.mailboxCreate(cand);
-              trashFolder = cand;
-              break;
-            } catch (createErr) {}
-          }
-          if (!trashFolder) throw new Error('No se encontró ni se pudo crear la carpeta de Papelera');
-        }
+          /inbox\.trash/i.test(f.path)
+        )?.path || 'Trash';
 
         await client.messageMove(String(uid), trashFolder, { uid: true });
       }
@@ -704,38 +646,6 @@ app.post('/api/delete-message', async (req, res) => {
     }
 
     await client.logout();
-    res.json({ success: true, message: 'Mensaje procesado correctamente' });
-  } catch (e) {
-    console.error('❌ Error en delete-message:', e.message);
-    if (client) await client.logout().catch(() => {});
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// ------------------------------------------------------------
-//  MOVER MENSAJE GENÉRICO
-// ------------------------------------------------------------
-app.post('/api/move-message', async (req, res) => {
-  const { email, password, host, port, uid, fromFolder, toFolder } = req.body;
-  if (!uid || !fromFolder || !toFolder) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
-  const auto = getAutoConfig(email);
-  const targetHost = host || auto.imapHost;
-
-  let client;
-  try {
-    try {
-      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
-    } catch (err) {
-      client = await connectImap(email, password, targetHost, 143, false);
-    }
-
-    const lock = await client.getMailboxLock(fromFolder);
-    try {
-      await client.messageMove(String(uid), toFolder, { uid: true });
-    } finally {
-      lock.release();
-    }
-    await client.logout();
     res.json({ success: true });
   } catch (e) {
     if (client) await client.logout().catch(() => {});
@@ -743,9 +653,6 @@ app.post('/api/move-message', async (req, res) => {
   }
 });
 
-// ------------------------------------------------------------
-//  ACCIONES SOBRE MENSAJES (LEÍDO Y MARCADOS)
-// ------------------------------------------------------------
 app.post('/api/toggle-read', async (req, res) => {
   const { email, password, host, port, uid, folder = 'INBOX', read } = req.body;
   if (uid == null) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
@@ -804,52 +711,6 @@ app.post('/api/toggle-flagged', async (req, res) => {
   }
 });
 
-app.post('/api/create-folder', async (req, res) => {
-  const { email, password, host, port, folderName } = req.body;
-  if (!folderName) return res.status(400).json({ success: false, error: 'Falta folderName' });
-  const auto = getAutoConfig(email);
-  const targetHost = host || auto.imapHost;
-
-  let client;
-  try {
-    try {
-      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
-    } catch (err) {
-      client = await connectImap(email, password, targetHost, 143, false);
-    }
-
-    await client.mailboxCreate(folderName);
-    await client.logout();
-    res.json({ success: true });
-  } catch (e) {
-    if (client) await client.logout().catch(() => {});
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.post('/api/delete-folder', async (req, res) => {
-  const { email, password, host, port, folderName } = req.body;
-  if (!folderName) return res.status(400).json({ success: false, error: 'Falta folderName' });
-  const auto = getAutoConfig(email);
-  const targetHost = host || auto.imapHost;
-
-  let client;
-  try {
-    try {
-      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
-    } catch (err) {
-      client = await connectImap(email, password, targetHost, 143, false);
-    }
-
-    await client.mailboxDelete(folderName);
-    await client.logout();
-    res.json({ success: true });
-  } catch (e) {
-    if (client) await client.logout().catch(() => {});
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
 app.post('/api/download-attachment', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', uid, partId } = req.body;
   if (!uid || !partId) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
@@ -884,4 +745,4 @@ app.post('/api/download-attachment', async (req, res) => {
 //  INICIAR SERVIDOR
 // ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`✅ Backend RSMAIL activo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`✅ Servidor backend RSMAIL activo en puerto ${PORT}`));

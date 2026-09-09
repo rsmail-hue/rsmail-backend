@@ -163,12 +163,21 @@ function startImapWorker(email, password, customHost, ws = null) {
 }
 
 async function processEmailsInRange(state, startUid, endUidNext) {
+  const safeStartUid = Math.max(1, startUid || 1);
+  const safeEndUid = endUidNext - 1;
+
+  if (safeStartUid > safeEndUid) {
+    state.lastUidNext = endUidNext;
+    await saveLastUid(state.email, endUidNext);
+    return;
+  }
+
   try {
-    const fetchRange = `${startUid}:*`;
-    const newIter = state.client.fetch(fetchRange, { uid: true, envelope: true });
+    const fetchRange = `${safeStartUid}:${safeEndUid}`;
+    const newIter = state.client.fetch(fetchRange, { uid: true, envelope: true }, { uid: true });
 
     for await (const msg of newIter) {
-      if (msg.uid && msg.uid >= startUid && msg.uid < endUidNext) {
+      if (msg.uid && msg.uid >= safeStartUid && msg.uid < endUidNext) {
         const from = msg.envelope?.from?.[0]?.address || 'Remitente desconocido';
         const subject = msg.envelope?.subject || 'Nuevo correo';
 
@@ -192,10 +201,11 @@ async function processEmailsInRange(state, startUid, endUidNext) {
         });
       }
     }
-    state.lastUidNext = endUidNext;
-    await saveLastUid(state.email, endUidNext);
   } catch (err) {
     console.error(`❌ Error al procesar correos para ${state.email}:`, err.message);
+  } finally {
+    state.lastUidNext = endUidNext;
+    await saveLastUid(state.email, endUidNext);
   }
 }
 
@@ -217,7 +227,7 @@ async function runImapLoop(state) {
 
       const savedUid = await getSavedLastUid(state.email);
 
-      if (savedUid && savedUid < currentUidNext) {
+      if (savedUid && savedUid > 0 && savedUid < currentUidNext) {
         console.log(`🔎 Recuperando correos no notificados entre UID ${savedUid} y ${currentUidNext - 1}...`);
         await processEmailsInRange(state, savedUid, currentUidNext);
       } else {

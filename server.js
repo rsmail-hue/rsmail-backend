@@ -51,11 +51,10 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
-//  POLLING POR CUENTA (CORREGIDO CON LOCKS)
+//  POLLING Y CONEXIÓN IMAP OPTIMIZADOS
 // ------------------------------------------------------------
 const pollingStates = new Map();
 
-// Conexión IMAP con fallback
 async function connectImap(email, password, host, port, secure) {
   const config = {
     host,
@@ -71,24 +70,6 @@ async function connectImap(email, password, host, port, secure) {
   const client = new ImapFlow(config);
   await client.connect();
   return client;
-}
-
-// Obtener UIDs y sobres de todos los mensajes abriendo el Lock correctamente
-async function fetchAllMessages(client) {
-  const messages = [];
-  let lock;
-  try {
-    lock = await client.getMailboxLock('INBOX');
-    const iter = client.fetch('1:*', { uid: true, envelope: true });
-    for await (const msg of iter) {
-      messages.push(msg);
-    }
-  } catch (e) {
-    console.log('⚠️ Error en fetchAllMessages:', e.message);
-  } finally {
-    if (lock) lock.release();
-  }
-  return messages;
 }
 
 wss.on('connection', (ws, req) => {
@@ -130,35 +111,29 @@ async function startPolling(ws, email, password) {
   const auto = getAutoConfig(email);
   const host = auto ? auto.imapHost : 'mail.' + email.split('@')[1];
 
+  let maxUid = 0;
   let client;
   try {
-    client = await connectImap(email, password, host, 993, true);
-    console.log(`✅ IMAP conectado (SSL) para ${email}`);
-  } catch (err) {
-    console.log(`⚠️ Falló SSL directo para ${email}, intentando puerto 143...`);
     try {
+      client = await connectImap(email, password, host, 993, true);
+    } catch (err) {
       client = await connectImap(email, password, host, 143, false);
-      console.log(`✅ IMAP conectado (STARTTLS 143) para ${email}`);
-    } catch (err2) {
-      console.error(`❌ No se pudo conectar IMAP para ${email}:`, err2.message);
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'error', message: 'Error al conectar con el servidor de correo' }));
-      }
-      return;
     }
-  }
 
-  let initialUids = [];
-  try {
-    const messages = await fetchAllMessages(client);
-    initialUids = messages.map(m => m.uid).filter(u => u !== undefined);
-    console.log(`📊 INBOX tiene ${initialUids.length} mensajes para ${email}`);
+    const lock = await client.getMailboxLock('INBOX');
+    try {
+      const iter = client.fetch('1:*', { uid: true });
+      for await (const msg of iter) {
+        if (msg.uid && msg.uid > maxUid) maxUid = msg.uid;
+      }
+    } finally {
+      lock.release();
+      await client.logout().catch(() => {});
+    }
+    console.log(`📊 Conexión inicial exitosa para ${email}. Último UID detectado: ${maxUid}`);
   } catch (e) {
-    console.log(`⚠️ Error al obtener UIDs iniciales: ${e.message}`);
-    initialUids = [];
+    console.log(`⚠️ No se pudo obtener el UID inicial para ${email}: ${e.message}`);
   }
-
-  await client.logout().catch(() => {});
 
   const state = {
     interval: null,
@@ -166,74 +141,72 @@ async function startPolling(ws, email, password) {
     email,
     password,
     host,
-    lastUids: new Set(initialUids),
+    maxUid,
+    isBusy: false
   };
   pollingStates.set(email, state);
-  console.log(`✅ Polling iniciado para ${email} (${initialUids.length} mensajes iniciales)`);
 
   const poll = async () => {
+    if (state.isBusy) return;
+    state.isBusy = true;
+
+    let newClient;
     try {
-      let newClient;
       try {
         newClient = await connectImap(email, password, state.host, 993, true);
       } catch (err) {
         newClient = await connectImap(email, password, state.host, 143, false);
       }
 
-      const messages = await fetchAllMessages(newClient);
-      await newClient.logout().catch(() => {});
+      const pollLock = await newClient.getMailboxLock('INBOX');
+      try {
+        const range = state.maxUid > 0 ? `${state.maxUid + 1}:*` : '1:*';
+        const iter = newClient.fetch(range, { uid: true, envelope: true });
 
-      if (messages.length === 0) {
-        return;
-      }
+        for await (const msg of iter) {
+          if (msg.uid && msg.uid > state.maxUid) {
+            state.maxUid = msg.uid;
+            const from = msg.envelope?.from?.[0]?.address || 'Remitente desconocido';
+            const subject = msg.envelope?.subject || 'Nuevo correo';
 
-      const currentUids = messages.map(m => m.uid).filter(u => u !== undefined);
-      const newUids = currentUids.filter(uid => !state.lastUids.has(uid));
+            console.log(`📨 ¡Nuevo correo detectado! UID:${msg.uid} de ${from} - ${subject}`);
 
-      if (newUids.length > 0) {
-        console.log(`📨 ${newUids.length} nuevo(s) correo(s) detectado(s) para ${email}`);
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                type: 'new_email',
+                email,
+                timestamp: new Date().toISOString(),
+                from,
+                subject,
+                uid: msg.uid
+              }));
+            }
 
-        for (const uid of newUids) {
-          const msg = messages.find(m => m.uid === uid);
-          if (!msg) continue;
-
-          const from = msg.envelope.from?.[0]?.address || 'Remitente desconocido';
-          const subject = msg.envelope.subject || 'Nuevo correo';
-          console.log(`📨 Nuevo correo UID:${uid} de ${from} - ${subject}`);
-
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({
-              type: 'new_email',
-              email,
-              timestamp: new Date().toISOString(),
-              from,
-              subject,
-              uid
-            }));
+            await sendPushNotification(email, {
+              title: `📧 Nuevo correo de ${from}`,
+              body: subject,
+              data: { type: 'new_email', sender: from, subject, uid: String(msg.uid) }
+            });
           }
-
-          await sendPushNotification(email, {
-            title: `📧 Nuevo correo de ${from}`,
-            body: subject,
-            data: { type: 'new_email', sender: from, subject, uid: String(uid) }
-          });
         }
-
-        state.lastUids = new Set(currentUids);
+      } finally {
+        pollLock.release();
+        await newClient.logout().catch(() => {});
       }
     } catch (e) {
       console.log(`⚠️ Polling error para ${email}:`, e.message);
+    } finally {
+      state.isBusy = false;
     }
   };
 
-  await poll();
-  state.interval = setInterval(poll, 10000);
-  console.log(`✅ Polling loop iniciado para ${email} (cada 10s)`);
+  state.interval = setInterval(poll, 20000);
+  console.log(`✅ Polling optimizado iniciado para ${email} (cada 20s)`);
 }
 
-// ============================================================
+// ------------------------------------------------------------
 //  FCM PUSH NOTIFICATIONS
-// ============================================================
+// ------------------------------------------------------------
 async function sendPushNotification(email, payload) {
   if (!db) return;
   try {
@@ -277,9 +250,9 @@ async function sendPushNotification(email, payload) {
   }
 }
 
-// ============================================================
+// ------------------------------------------------------------
 //  ENDPOINTS FCM
-// ============================================================
+// ------------------------------------------------------------
 app.post('/api/fcm-token', async (req, res) => {
   const { email, token } = req.body;
   if (!email || !token || !db) return res.status(400).json({ success: false, error: 'Email y token requeridos' });

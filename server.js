@@ -51,6 +51,32 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
+//  PERSISTENCIA DE ESTADO DE NAVEGACIÓN (FIRESTORE)
+// ------------------------------------------------------------
+async function getSavedLastUid(email) {
+  if (!db) return null;
+  try {
+    const doc = await db.collection('user_states').doc(email).get();
+    if (doc.exists) return doc.data().lastUid || null;
+  } catch (e) {
+    console.error(`⚠️ Error al leer lastUid de Firestore para ${email}:`, e.message);
+  }
+  return null;
+}
+
+async function saveLastUid(email, uid) {
+  if (!db) return;
+  try {
+    await db.collection('user_states').doc(email).set({
+      lastUid: uid,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (e) {
+    console.error(`⚠️ Error al guardar lastUid en Firestore para ${email}:`, e.message);
+  }
+}
+
+// ------------------------------------------------------------
 //  CONEXIÓN Y MONITOR IMAP PERSISTENTE
 // ------------------------------------------------------------
 const activeWorkers = new Map();
@@ -134,6 +160,43 @@ function startImapWorker(ws, email, password, customHost) {
   runImapLoop(workerState);
 }
 
+async function processEmailsInRange(state, startUid, endUidNext) {
+  try {
+    const fetchRange = `${startUid}:*`;
+    const newIter = state.client.fetch(fetchRange, { uid: true, envelope: true });
+
+    for await (const msg of newIter) {
+      if (msg.uid && msg.uid >= startUid && msg.uid < endUidNext) {
+        const from = msg.envelope?.from?.[0]?.address || 'Remitente desconocido';
+        const subject = msg.envelope?.subject || 'Nuevo correo';
+
+        console.log(`🔔 ¡Nuevo correo detectado y notificado! UID:${msg.uid} | De: ${from} | Asunto: ${subject}`);
+
+        if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+          state.ws.send(JSON.stringify({
+            type: 'new_email',
+            email: state.email,
+            timestamp: new Date().toISOString(),
+            from,
+            subject,
+            uid: msg.uid
+          }));
+        }
+
+        await sendPushNotification(state.email, {
+          title: `📧 Nuevo correo de ${from}`,
+          body: subject,
+          data: { type: 'new_email', sender: from, subject, uid: String(msg.uid) }
+        });
+      }
+    }
+    state.lastUidNext = endUidNext;
+    await saveLastUid(state.email, endUidNext);
+  } catch (err) {
+    console.error(`❌ Error extrayendo correos para ${state.email}:`, err.message);
+  }
+}
+
 async function runImapLoop(state) {
   while (state.active) {
     let lock = null;
@@ -147,8 +210,20 @@ async function runImapLoop(state) {
 
       lock = await state.client.getMailboxLock('INBOX');
 
-      const statusInit = await state.client.status('INBOX', { uidNext: true, messages: true });
-      state.lastUidNext = statusInit.uidNext || 1;
+      const statusInit = await state.client.status('INBOX', { uidNext: true });
+      const currentUidNext = statusInit.uidNext || 1;
+
+      // Recuperar último UID procesado
+      const savedUid = await getSavedLastUid(state.email);
+
+      if (savedUid && savedUid < currentUidNext) {
+        console.log(`🔎 Recuperando correos no notificados entre UID ${savedUid} y ${currentUidNext - 1}...`);
+        await processEmailsInRange(state, savedUid, currentUidNext);
+      } else {
+        state.lastUidNext = currentUidNext;
+        await saveLastUid(state.email, currentUidNext);
+      }
+
       console.log(`📊 Monitor activo para ${state.email}. Próximo UID esperado: ${state.lastUidNext}`);
 
       while (state.active && state.client.usable) {
@@ -159,38 +234,8 @@ async function runImapLoop(state) {
         const currentStatus = await state.client.status('INBOX', { uidNext: true });
         
         if (currentStatus.uidNext && currentStatus.uidNext > state.lastUidNext) {
-          const fetchRange = `${state.lastUidNext}:*`;
-          console.log(`📨 Detectado cambio en bandeja para ${state.email}. Buscando correos en rango ${fetchRange}`);
-
-          const newIter = state.client.fetch(fetchRange, { uid: true, envelope: true });
-
-          for await (const msg of newIter) {
-            if (msg.uid && msg.uid >= state.lastUidNext) {
-              const from = msg.envelope?.from?.[0]?.address || 'Remitente desconocido';
-              const subject = msg.envelope?.subject || 'Nuevo correo';
-
-              console.log(`🔔 ¡Nuevo correo procesado! UID:${msg.uid} | De: ${from} | Asunto: ${subject}`);
-
-              if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-                state.ws.send(JSON.stringify({
-                  type: 'new_email',
-                  email: state.email,
-                  timestamp: new Date().toISOString(),
-                  from,
-                  subject,
-                  uid: msg.uid
-                }));
-              }
-
-              await sendPushNotification(state.email, {
-                title: `📧 Nuevo correo de ${from}`,
-                body: subject,
-                data: { type: 'new_email', sender: from, subject, uid: String(msg.uid) }
-              });
-            }
-          }
-
-          state.lastUidNext = currentStatus.uidNext;
+          console.log(`📨 Cambio en bandeja para ${state.email}. Procesando rango ${state.lastUidNext} a ${currentStatus.uidNext - 1}`);
+          await processEmailsInRange(state, state.lastUidNext, currentStatus.uidNext);
         }
       }
 

@@ -25,7 +25,7 @@ if (!admin.apps.length) {
           privateKey: formattedKey,
         }),
       });
-      console.log('✅ Firebase Admin inicializado con variables de entorno');
+      console.log('✅ Firebase Admin inicializado con variables de entorno en Render');
     } catch (e) {
       console.error('❌ Error al inicializar Firebase con Variables de Entorno:', e.message);
     }
@@ -51,7 +51,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
-//  POLLING Y CONEXIÓN IMAP OPTIMIZADOS
+//  POLLING Y CONEXIÓN IMAP OPTIMIZADOS PARA RENDER
 // ------------------------------------------------------------
 const pollingStates = new Map();
 
@@ -62,9 +62,14 @@ async function connectImap(email, password, host, port, secure) {
     secure,
     auth: { user: email, pass: password },
     logger: false,
-    tls: { rejectUnauthorized: false },
-    connectionTimeout: 15000,
-    authTimeout: 15000,
+    tls: { 
+      rejectUnauthorized: false,
+      minVersion: 'TLSv1.2',
+      servername: host
+    },
+    connectionTimeout: 25000,
+    greetingTimeout: 20000,
+    socketTimeout: 25000,
   };
   console.log(`🔄 Conectando IMAP a ${host}:${port} (secure=${secure})`);
   const client = new ImapFlow(config);
@@ -208,11 +213,14 @@ async function startPolling(ws, email, password) {
 //  FCM PUSH NOTIFICATIONS
 // ------------------------------------------------------------
 async function sendPushNotification(email, payload) {
-  if (!db) return;
+  if (!db) {
+    console.log(`⚠️ Base de datos Firestore no disponible. No se envió push a ${email}`);
+    return;
+  }
   try {
     const tokensSnapshot = await db.collection('fcm_tokens').where('email', '==', email).get();
     if (tokensSnapshot.empty) {
-      console.log(`📴 No hay tokens FCM para ${email}`);
+      console.log(`📴 No hay tokens FCM registrados en Firestore para ${email}`);
       return;
     }
 
@@ -229,7 +237,7 @@ async function sendPushNotification(email, payload) {
     };
 
     const response = await admin.messaging().sendEachForMulticast(message);
-    console.log(`📨 Notificación push enviada a ${tokens.length} dispositivos para ${email}`);
+    console.log(`📨 Notificación push enviada a ${tokens.length} dispositivo(s) para ${email}`);
 
     if (response.failureCount > 0) {
       const failedTokens = [];
@@ -251,13 +259,13 @@ async function sendPushNotification(email, payload) {
 }
 
 // ------------------------------------------------------------
-//  ENDPOINTS FCM
+//  ENDPOINTS FCM Y NOTIFICACIONES GENERALES (EMAIL / CALENDARIO)
 // ------------------------------------------------------------
 app.post('/api/fcm-token', async (req, res) => {
   const { email, token } = req.body;
-  if (!email || !token || !db) return res.status(400).json({ success: false, error: 'Email y token requeridos' });
+  if (!email || !token || !db) return res.status(400).json({ success: false, error: 'Email, token o Firestore no disponible' });
 
-  console.log('📥 Token recibido:', token);
+  console.log('📥 Token FCM recibido:', token, 'para email:', email);
 
   try {
     const existing = await db.collection('fcm_tokens').where('email', '==', email).get();
@@ -268,7 +276,7 @@ app.post('/api/fcm-token', async (req, res) => {
       token,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
-    console.log(`📱 Token FCM guardado para ${email}`);
+    console.log(`📱 Token FCM guardado correctamente para ${email}`);
     res.json({ success: true });
   } catch (e) {
     console.error('❌ Error guardando token FCM:', e);
@@ -284,6 +292,23 @@ app.post('/api/fcm-token/remove', async (req, res) => {
     const snapshot = await db.collection('fcm_tokens').where('token', '==', token).get();
     snapshot.forEach(doc => doc.ref.delete());
     res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Endpoint genérico para enviar notificaciones push (p. ej. eventos de Calendario)
+app.post('/api/send-notification', async (req, res) => {
+  const { email, title, body, data } = req.body;
+  if (!email) return res.status(400).json({ success: false, error: 'Email requerido' });
+
+  try {
+    await sendPushNotification(email, {
+      title: title || '📅 Recordatorio de Calendario',
+      body: body || 'Tienes un evento próximo',
+      data: data || { type: 'calendar' }
+    });
+    res.json({ success: true, message: 'Notificación enviada' });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -309,10 +334,10 @@ app.post('/api/test-token', async (req, res) => {
       token,
       notification: {
         title: 'Test RSMail',
-        body: 'Si ves esto, el token es válido',
+        body: 'Si ves esto, las notificaciones push funcionan correctamente',
       },
     });
-    console.log('✅ Token válido y notificación enviada');
+    console.log('✅ Token válido y notificación de prueba enviada');
     res.json({ success: true, message: 'Notificación enviada correctamente' });
   } catch (e) {
     console.error('❌ Error enviando test:', e.message);
@@ -457,25 +482,9 @@ app.post('/api/save-to-sent', async (req, res) => {
   let client;
   try {
     try {
-      client = new ImapFlow({
-        host: targetHost,
-        port: targetPort,
-        secure: true,
-        auth: { user: email, pass: password },
-        logger: false,
-        tls: { rejectUnauthorized: false }
-      });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, targetPort, true);
     } catch (err) {
-      client = new ImapFlow({
-        host: targetHost,
-        port: 143,
-        secure: false,
-        auth: { user: email, pass: password },
-        logger: false,
-        tls: { rejectUnauthorized: false }
-      });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, 143, false);
     }
 
     const list = await client.list();
@@ -524,25 +533,9 @@ app.post('/api/folders', async (req, res) => {
   let client;
   try {
     try {
-      client = new ImapFlow({
-        host: targetHost,
-        port: Number(port) || auto.imapPort,
-        secure: true,
-        auth: { user: email, pass: password },
-        logger: false,
-        tls: { rejectUnauthorized: false }
-      });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
     } catch (err) {
-      client = new ImapFlow({
-        host: targetHost,
-        port: 143,
-        secure: false,
-        auth: { user: email, pass: password },
-        logger: false,
-        tls: { rejectUnauthorized: false }
-      });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, 143, false);
     }
 
     const list = await client.list();
@@ -565,25 +558,9 @@ app.post('/api/messages', async (req, res) => {
   let client;
   try {
     try {
-      client = new ImapFlow({
-        host: targetHost,
-        port: Number(port) || 993,
-        secure: true,
-        auth: { user: email, pass: password },
-        logger: false,
-        tls: { rejectUnauthorized: false }
-      });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, Number(port) || 993, true);
     } catch (err) {
-      client = new ImapFlow({
-        host: targetHost,
-        port: 143,
-        secure: false,
-        auth: { user: email, pass: password },
-        logger: false,
-        tls: { rejectUnauthorized: false }
-      });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, 143, false);
     }
     const lock = await client.getMailboxLock(folder);
     const messages = [];
@@ -632,25 +609,9 @@ app.post('/api/message-detail', async (req, res) => {
   let client;
   try {
     try {
-      client = new ImapFlow({
-        host: targetHost,
-        port: Number(port) || auto.imapPort,
-        secure: true,
-        auth: { user: email, pass: password },
-        logger: false,
-        tls: { rejectUnauthorized: false }
-      });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
     } catch (err) {
-      client = new ImapFlow({
-        host: targetHost,
-        port: 143,
-        secure: false,
-        auth: { user: email, pass: password },
-        logger: false,
-        tls: { rejectUnauthorized: false }
-      });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, 143, false);
     }
 
     const lock = await client.getMailboxLock(folder);
@@ -703,25 +664,9 @@ app.post('/api/delete-message', async (req, res) => {
   let client;
   try {
     try {
-      client = new ImapFlow({
-        host: targetHost,
-        port: Number(port) || auto.imapPort,
-        secure: true,
-        auth: { user: email, pass: password },
-        logger: false,
-        tls: { rejectUnauthorized: false }
-      });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
     } catch (err) {
-      client = new ImapFlow({
-        host: targetHost,
-        port: 143,
-        secure: false,
-        auth: { user: email, pass: password },
-        logger: false,
-        tls: { rejectUnauthorized: false }
-      });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, 143, false);
     }
 
     const lock = await client.getMailboxLock(folder);
@@ -779,11 +724,9 @@ app.post('/api/move-message', async (req, res) => {
   let client;
   try {
     try {
-      client = new ImapFlow({ host: targetHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
     } catch (err) {
-      client = new ImapFlow({ host: targetHost, port: 143, secure: false, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, 143, false);
     }
 
     const lock = await client.getMailboxLock(fromFolder);
@@ -812,11 +755,9 @@ app.post('/api/toggle-read', async (req, res) => {
   let client;
   try {
     try {
-      client = new ImapFlow({ host: targetHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
     } catch (err) {
-      client = new ImapFlow({ host: targetHost, port: 143, secure: false, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, 143, false);
     }
 
     const lock = await client.getMailboxLock(folder);
@@ -843,11 +784,9 @@ app.post('/api/toggle-flagged', async (req, res) => {
   let client;
   try {
     try {
-      client = new ImapFlow({ host: targetHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
     } catch (err) {
-      client = new ImapFlow({ host: targetHost, port: 143, secure: false, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, 143, false);
     }
 
     const lock = await client.getMailboxLock(folder);
@@ -874,11 +813,9 @@ app.post('/api/create-folder', async (req, res) => {
   let client;
   try {
     try {
-      client = new ImapFlow({ host: targetHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
     } catch (err) {
-      client = new ImapFlow({ host: targetHost, port: 143, secure: false, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, 143, false);
     }
 
     await client.mailboxCreate(folderName);
@@ -899,11 +836,9 @@ app.post('/api/delete-folder', async (req, res) => {
   let client;
   try {
     try {
-      client = new ImapFlow({ host: targetHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
     } catch (err) {
-      client = new ImapFlow({ host: targetHost, port: 143, secure: false, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, 143, false);
     }
 
     await client.mailboxDelete(folderName);
@@ -924,11 +859,9 @@ app.post('/api/download-attachment', async (req, res) => {
   let client;
   try {
     try {
-      client = new ImapFlow({ host: targetHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
     } catch (err) {
-      client = new ImapFlow({ host: targetHost, port: 143, secure: false, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-      await client.connect();
+      client = await connectImap(email, password, targetHost, 143, false);
     }
 
     const lock = await client.getMailboxLock(folder);
@@ -951,4 +884,4 @@ app.post('/api/download-attachment', async (req, res) => {
 //  INICIAR SERVIDOR
 // ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`✅ Backend RSMAIL en puerto ${PORT} activo`));
+server.listen(PORT, () => console.log(`✅ Backend RSMAIL activo en puerto ${PORT}`));

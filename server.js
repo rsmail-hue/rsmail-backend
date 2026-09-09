@@ -7,6 +7,7 @@ const nodemailer = require('nodemailer');
 const WebSocket = require('ws');
 const http = require('http');
 const admin = require('firebase-admin');
+const cron = require('node-cron');
 
 // ------------------------------------------------------------
 //  FIREBASE ADMIN (FCM)
@@ -24,7 +25,7 @@ if (!admin.apps.length) {
           privateKey: formattedKey,
         }),
       });
-      console.log('✅ Firebase Admin inicializado correctamente con variables de entorno');
+      console.log('✅ Firebase Admin inicializado con variables de entorno');
     } catch (e) {
       console.error('❌ Error al inicializar Firebase con Variables de Entorno:', e.message);
     }
@@ -36,7 +37,7 @@ if (!admin.apps.length) {
       });
       console.log('✅ Firebase Admin inicializado con serviceAccountKey.json');
     } catch (e) {
-      console.error('⚠️ No se encontraron credenciales de Firebase. Notificaciones deshabilitadas.');
+      console.error('⚠️ No se encontraron credenciales de Firebase. Push deshabilitadas.');
     }
   }
 }
@@ -100,7 +101,7 @@ async function connectImap(email, password, host, port, secure) {
 }
 
 // ------------------------------------------------------------
-//  GESTIÓN DE WEBSOCKETS (SÓLO PARA VISTA EN VIVO)
+//  GESTIÓN DE WEBSOCKETS (CORREO EN VIVO)
 // ------------------------------------------------------------
 wss.on('connection', (ws) => {
   console.log('🔌 Nuevo cliente WebSocket conectado desde la app');
@@ -181,7 +182,7 @@ async function processEmailsInRange(state, startUid, endUidNext) {
         const from = msg.envelope?.from?.[0]?.address || 'Remitente desconocido';
         const subject = msg.envelope?.subject || 'Nuevo correo';
 
-        console.log(`🔔 ¡Nuevo correo detectado y notificado! UID:${msg.uid} | De: ${from} | Asunto: ${subject}`);
+        console.log(`🔔 Correo entrante detectado -> UID:${msg.uid} | De: ${from} | Asunto: ${subject}`);
 
         if (state.ws && state.ws.readyState === WebSocket.OPEN) {
           state.ws.send(JSON.stringify({
@@ -270,17 +271,68 @@ async function runImapLoop(state) {
 }
 
 // ------------------------------------------------------------
-//  FCM PUSH NOTIFICATIONS
+//  CRON JOB: PROGRAMADOR DE NOTIFICACIONES DE CALENDARIO
+// ------------------------------------------------------------
+cron.schedule('* * * * *', async () => {
+  if (!db) return;
+
+  try {
+    const now = new Date();
+    const in24Hours = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+
+    // Buscar eventos próximos programados en Firestore
+    const snapshot = await db.collection('calendar_events')
+      .where('eventTime', '<=', in24Hours)
+      .where('eventTime', '>=', now)
+      .get();
+
+    if (snapshot.empty) return;
+
+    for (const doc of snapshot.docs) {
+      const event = doc.data();
+      const eventDate = event.eventTime.toDate ? event.eventTime.toDate() : new Date(event.eventTime);
+      const diffMs = eventDate.getTime() - now.getTime();
+      const diffHours = diffMs / (1000 * 60 * 60);
+
+      const formattedTime = eventDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+      // 1. RECORDATORIO 1 DÍA ANTES (24 HORAS)
+      if (!event.notified1Day && diffHours <= 24 && diffHours > 0.5) {
+        console.log(`📅 Enviando recordatorio (1 DÍA ANTES) para evento: ${event.title}`);
+        await sendPushNotification(event.email, {
+          title: `📅 Mañana: ${event.title}`,
+          body: `Tienes este evento programado para mañana a las ${formattedTime}`,
+          data: { type: 'calendar', eventId: doc.id, notice: '1day' }
+        });
+        await doc.ref.update({ notified1Day: true });
+      }
+
+      // 2. RECORDATORIO INMINENTE (15 MINUTOS ANTES)
+      if (!event.notifiedEvent && diffMs <= 15 * 60 * 1000 && diffMs > 0) {
+        console.log(`⏰ Enviando recordatorio (15 MINUTOS ANTES) para evento: ${event.title}`);
+        await sendPushNotification(event.email, {
+          title: `⏰ Comienza pronto: ${event.title}`,
+          body: event.description || `El evento comienza a las ${formattedTime}`,
+          data: { type: 'calendar', eventId: doc.id, notice: '15min' }
+        });
+        await doc.ref.update({ notifiedEvent: true });
+      }
+    }
+  } catch (e) {
+    console.error('❌ Error en Cron Job de Calendario:', e.message);
+  }
+});
+
+// ------------------------------------------------------------
+//  FCM PUSH NOTIFICATIONS (PRIORIDAD ALTA)
 // ------------------------------------------------------------
 async function sendPushNotification(email, payload) {
-  if (!db) {
-    console.log(`❌ Firestore no está inicializado. No se envió Push a ${email}`);
-    return;
-  }
+  if (!db) return;
+
   try {
     const tokensSnapshot = await db.collection('fcm_tokens').where('email', '==', email).get();
     if (tokensSnapshot.empty) {
-      console.log(`📴 No existe token FCM guardado para ${email}`);
+      console.log(`📴 Sin token FCM para ${email}`);
       return;
     }
 
@@ -290,9 +342,26 @@ async function sendPushNotification(email, payload) {
     const message = {
       notification: {
         title: payload.title || 'RSMAIL',
-        body: payload.body || 'Nueva notificación recibida',
+        body: payload.body || 'Nueva notificación',
       },
       data: payload.data || { type: 'general' },
+      android: {
+        priority: 'high',
+        notification: {
+          channelId: 'calendar_channel',
+          sound: 'default',
+          priority: 'max',
+          visibility: 'public'
+        }
+      },
+      apns: {
+        payload: {
+          aps: {
+            sound: 'default',
+            badge: 1
+          }
+        }
+      },
       tokens,
     };
 
@@ -302,10 +371,7 @@ async function sendPushNotification(email, payload) {
     if (response.failureCount > 0) {
       const failedTokens = [];
       response.responses.forEach((resp, idx) => {
-        if (!resp.success) {
-          console.log(`❌ Token expirado/inválido: ${tokens[idx]}`);
-          failedTokens.push(tokens[idx]);
-        }
+        if (!resp.success) failedTokens.push(tokens[idx]);
       });
       for (const token of failedTokens) {
         const snapshots = await db.collection('fcm_tokens').where('token', '==', token).get();
@@ -442,24 +508,6 @@ app.post('/api/send-notification', async (req, res) => {
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.post('/api/test-token', async (req, res) => {
-  const { token } = req.body;
-  if (!token) return res.status(400).json({ success: false, error: 'Token requerido' });
-
-  try {
-    await admin.messaging().send({
-      token,
-      notification: {
-        title: 'Prueba RSMAIL',
-        body: 'Notificaciones push plenamente operativas',
-      },
-    });
-    res.json({ success: true, message: 'Notificación de prueba enviada' });
-  } catch (e) {
-    res.status(400).json({ success: false, error: e.message });
   }
 });
 

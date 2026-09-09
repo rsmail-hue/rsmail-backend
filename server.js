@@ -128,22 +128,22 @@ async function startPolling(ws, email, password) {
   }
 
   const auto = getAutoConfig(email);
-  const host = auto ? auto.imapHost : 'imap.gmail.com';
+  const host = auto ? auto.imapHost : 'mail.' + email.split('@')[1];
 
-  // Conectar inicialmente para obtener UIDs
   let client;
   try {
     client = await connectImap(email, password, host, 993, true);
     console.log(`✅ IMAP conectado (SSL) para ${email}`);
   } catch (err) {
-    console.log(`⚠️ Falló SSL directo para ${email}: ${err.message}`);
+    console.log(`⚠️ Falló SSL directo para ${email}, intentando puerto 143...`);
     try {
       client = await connectImap(email, password, host, 143, false);
-      await client.startTls();
-      console.log(`✅ IMAP conectado (STARTTLS) para ${email}`);
+      console.log(`✅ IMAP conectado (STARTTLS 143) para ${email}`);
     } catch (err2) {
       console.error(`❌ No se pudo conectar IMAP para ${email}:`, err2.message);
-      ws.send(JSON.stringify({ type: 'error', message: 'Error al conectar con el servidor de correo' }));
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Error al conectar con el servidor de correo' }));
+      }
       return;
     }
   }
@@ -178,14 +178,12 @@ async function startPolling(ws, email, password) {
         newClient = await connectImap(email, password, state.host, 993, true);
       } catch (err) {
         newClient = await connectImap(email, password, state.host, 143, false);
-        await newClient.startTls();
       }
 
       const messages = await fetchAllMessages(newClient);
       await newClient.logout().catch(() => {});
 
       if (messages.length === 0) {
-        console.log(`ℹ️ No hay mensajes en INBOX para ${email}`);
         return;
       }
 
@@ -222,8 +220,6 @@ async function startPolling(ws, email, password) {
         }
 
         state.lastUids = new Set(currentUids);
-      } else {
-        console.log(`🔍 Polling para ${email}... sin cambios (${currentUids.length} mensajes)`);
       }
     } catch (e) {
       console.log(`⚠️ Polling error para ${email}:`, e.message);
@@ -291,11 +287,9 @@ app.post('/api/fcm-token', async (req, res) => {
   console.log('📥 Token recibido:', token);
 
   try {
-    // Eliminar tokens anteriores del mismo email
     const existing = await db.collection('fcm_tokens').where('email', '==', email).get();
     existing.forEach(doc => doc.ref.delete());
 
-    // Guardar el token nuevo
     await db.collection('fcm_tokens').add({
       email,
       token,
@@ -322,9 +316,6 @@ app.post('/api/fcm-token/remove', async (req, res) => {
   }
 });
 
-// ------------------------------------------------------------
-//  ENDPOINT PARA LIMPIAR TOKENS ANTIGUOS
-// ------------------------------------------------------------
 app.post('/api/clean-fcm-tokens', async (req, res) => {
   if (!db) return res.status(500).json({ success: false, error: 'Firestore no disponible' });
   try {
@@ -336,9 +327,6 @@ app.post('/api/clean-fcm-tokens', async (req, res) => {
   }
 });
 
-// ------------------------------------------------------------
-//  ENDPOINT TEMPORAL PARA PROBAR TOKEN FCM
-// ------------------------------------------------------------
 app.post('/api/test-token', async (req, res) => {
   const { token } = req.body;
   if (!token) return res.status(400).json({ success: false, error: 'Token requerido' });
@@ -490,17 +478,33 @@ app.post('/api/save-to-sent', async (req, res) => {
   if (!email || !password) return res.status(400).json({ success: false, error: 'Parámetros insuficientes' });
 
   const auto = getAutoConfig(email);
-  const client = new ImapFlow({
-    host: host || auto.imapHost,
-    port: Number(port) || auto.imapPort,
-    secure: true,
-    auth: { user: email, pass: password },
-    logger: false,
-    tls: { rejectUnauthorized: false }
-  });
+  const targetHost = host || auto.imapHost;
+  const targetPort = Number(port) || auto.imapPort;
 
+  let client;
   try {
-    await client.connect();
+    try {
+      client = new ImapFlow({
+        host: targetHost,
+        port: targetPort,
+        secure: true,
+        auth: { user: email, pass: password },
+        logger: false,
+        tls: { rejectUnauthorized: false }
+      });
+      await client.connect();
+    } catch (err) {
+      client = new ImapFlow({
+        host: targetHost,
+        port: 143,
+        secure: false,
+        auth: { user: email, pass: password },
+        logger: false,
+        tls: { rejectUnauthorized: false }
+      });
+      await client.connect();
+    }
+
     const list = await client.list();
 
     let sentFolder = list.find(f =>
@@ -532,6 +536,7 @@ app.post('/api/save-to-sent', async (req, res) => {
     res.json({ success: true, message: 'Guardado en Enviados' });
   } catch (e) {
     console.error('❌ Error en save-to-sent:', e.message);
+    if (client) await client.logout().catch(() => {});
     res.status(500).json({ success: false, error: 'Error al guardar en Enviados: ' + e.message });
   }
 });
@@ -542,14 +547,39 @@ app.post('/api/save-to-sent', async (req, res) => {
 app.post('/api/folders', async (req, res) => {
   const { email, password, host, port } = req.body;
   const auto = getAutoConfig(email);
-  const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+  const targetHost = host || auto.imapHost;
+  let client;
   try {
-    await client.connect();
+    try {
+      client = new ImapFlow({
+        host: targetHost,
+        port: Number(port) || auto.imapPort,
+        secure: true,
+        auth: { user: email, pass: password },
+        logger: false,
+        tls: { rejectUnauthorized: false }
+      });
+      await client.connect();
+    } catch (err) {
+      client = new ImapFlow({
+        host: targetHost,
+        port: 143,
+        secure: false,
+        auth: { user: email, pass: password },
+        logger: false,
+        tls: { rejectUnauthorized: false }
+      });
+      await client.connect();
+    }
+
     const list = await client.list();
     await client.logout();
     const folders = list.map(f => ({ name: f.name, path: f.path, specialUse: f.specialUse || '' }));
     res.json({ success: true, folders });
-  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+  } catch (err) {
+    if (client) await client.logout().catch(() => {});
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // ------------------------------------------------------------
@@ -558,11 +588,12 @@ app.post('/api/folders', async (req, res) => {
 app.post('/api/messages', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
   const auto = getAutoConfig(email);
+  const targetHost = host || auto.imapHost;
   let client;
   try {
     try {
       client = new ImapFlow({
-        host: host || auto.imapHost,
+        host: targetHost,
         port: Number(port) || 993,
         secure: true,
         auth: { user: email, pass: password },
@@ -572,7 +603,7 @@ app.post('/api/messages', async (req, res) => {
       await client.connect();
     } catch (err) {
       client = new ImapFlow({
-        host: host || auto.imapHost,
+        host: targetHost,
         port: 143,
         secure: false,
         auth: { user: email, pass: password },
@@ -580,7 +611,6 @@ app.post('/api/messages', async (req, res) => {
         tls: { rejectUnauthorized: false }
       });
       await client.connect();
-      await client.startTls();
     }
     const lock = await client.getMailboxLock(folder);
     const messages = [];
@@ -624,9 +654,32 @@ app.post('/api/message-detail', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', uid } = req.body;
   if (!uid) return res.status(400).json({ success: false, error: 'UID requerido' });
   const auto = getAutoConfig(email);
-  const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+  const targetHost = host || auto.imapHost;
+
+  let client;
   try {
-    await client.connect();
+    try {
+      client = new ImapFlow({
+        host: targetHost,
+        port: Number(port) || auto.imapPort,
+        secure: true,
+        auth: { user: email, pass: password },
+        logger: false,
+        tls: { rejectUnauthorized: false }
+      });
+      await client.connect();
+    } catch (err) {
+      client = new ImapFlow({
+        host: targetHost,
+        port: 143,
+        secure: false,
+        auth: { user: email, pass: password },
+        logger: false,
+        tls: { rejectUnauthorized: false }
+      });
+      await client.connect();
+    }
+
     const lock = await client.getMailboxLock(folder);
     let parsed;
     try {
@@ -658,7 +711,10 @@ app.post('/api/message-detail', async (req, res) => {
         attachments
       }
     });
-  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+  } catch (err) {
+    if (client) await client.logout().catch(() => {});
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // ------------------------------------------------------------
@@ -669,17 +725,32 @@ app.post('/api/delete-message', async (req, res) => {
   if (!uid) return res.status(400).json({ success: false, error: 'Falta UID' });
 
   const auto = getAutoConfig(email);
-  const client = new ImapFlow({
-    host: host || auto.imapHost,
-    port: Number(port) || auto.imapPort,
-    secure: true,
-    auth: { user: email, pass: password },
-    logger: false,
-    tls: { rejectUnauthorized: false }
-  });
+  const targetHost = host || auto.imapHost;
 
+  let client;
   try {
-    await client.connect();
+    try {
+      client = new ImapFlow({
+        host: targetHost,
+        port: Number(port) || auto.imapPort,
+        secure: true,
+        auth: { user: email, pass: password },
+        logger: false,
+        tls: { rejectUnauthorized: false }
+      });
+      await client.connect();
+    } catch (err) {
+      client = new ImapFlow({
+        host: targetHost,
+        port: 143,
+        secure: false,
+        auth: { user: email, pass: password },
+        logger: false,
+        tls: { rejectUnauthorized: false }
+      });
+      await client.connect();
+    }
+
     const lock = await client.getMailboxLock(folder);
 
     try {
@@ -718,6 +789,7 @@ app.post('/api/delete-message', async (req, res) => {
     res.json({ success: true, message: 'Mensaje procesado correctamente' });
   } catch (e) {
     console.error('❌ Error en delete-message:', e.message);
+    if (client) await client.logout().catch(() => {});
     res.status(500).json({ success: false, error: e.message });
   }
 });
@@ -729,9 +801,18 @@ app.post('/api/move-message', async (req, res) => {
   const { email, password, host, port, uid, fromFolder, toFolder } = req.body;
   if (!uid || !fromFolder || !toFolder) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
   const auto = getAutoConfig(email);
-  const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+  const targetHost = host || auto.imapHost;
+
+  let client;
   try {
-    await client.connect();
+    try {
+      client = new ImapFlow({ host: targetHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+      await client.connect();
+    } catch (err) {
+      client = new ImapFlow({ host: targetHost, port: 143, secure: false, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+      await client.connect();
+    }
+
     const lock = await client.getMailboxLock(fromFolder);
     try {
       await client.messageMove(String(uid), toFolder, { uid: true });
@@ -740,7 +821,10 @@ app.post('/api/move-message', async (req, res) => {
     }
     await client.logout();
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) {
+    if (client) await client.logout().catch(() => {});
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 // ------------------------------------------------------------
@@ -750,9 +834,18 @@ app.post('/api/toggle-read', async (req, res) => {
   const { email, password, host, port, uid, folder = 'INBOX', read } = req.body;
   if (uid == null) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
   const auto = getAutoConfig(email);
-  const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+  const targetHost = host || auto.imapHost;
+
+  let client;
   try {
-    await client.connect();
+    try {
+      client = new ImapFlow({ host: targetHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+      await client.connect();
+    } catch (err) {
+      client = new ImapFlow({ host: targetHost, port: 143, secure: false, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+      await client.connect();
+    }
+
     const lock = await client.getMailboxLock(folder);
     try {
       if (read) await client.messageFlagsAdd(String(uid), ['\\Seen'], { uid: true });
@@ -762,16 +855,28 @@ app.post('/api/toggle-read', async (req, res) => {
     }
     await client.logout();
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) {
+    if (client) await client.logout().catch(() => {});
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 app.post('/api/toggle-flagged', async (req, res) => {
   const { email, password, host, port, uid, folder = 'INBOX', flagged } = req.body;
   if (uid == null) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
   const auto = getAutoConfig(email);
-  const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+  const targetHost = host || auto.imapHost;
+
+  let client;
   try {
-    await client.connect();
+    try {
+      client = new ImapFlow({ host: targetHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+      await client.connect();
+    } catch (err) {
+      client = new ImapFlow({ host: targetHost, port: 143, secure: false, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+      await client.connect();
+    }
+
     const lock = await client.getMailboxLock(folder);
     try {
       if (flagged) await client.messageFlagsAdd(String(uid), ['\\Flagged'], { uid: true });
@@ -781,32 +886,78 @@ app.post('/api/toggle-flagged', async (req, res) => {
     }
     await client.logout();
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) {
+    if (client) await client.logout().catch(() => {});
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 app.post('/api/create-folder', async (req, res) => {
   const { email, password, host, port, folderName } = req.body;
   if (!folderName) return res.status(400).json({ success: false, error: 'Falta folderName' });
   const auto = getAutoConfig(email);
-  const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-  try { await client.connect(); await client.mailboxCreate(folderName); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  const targetHost = host || auto.imapHost;
+
+  let client;
+  try {
+    try {
+      client = new ImapFlow({ host: targetHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+      await client.connect();
+    } catch (err) {
+      client = new ImapFlow({ host: targetHost, port: 143, secure: false, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+      await client.connect();
+    }
+
+    await client.mailboxCreate(folderName);
+    await client.logout();
+    res.json({ success: true });
+  } catch (e) {
+    if (client) await client.logout().catch(() => {});
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 app.post('/api/delete-folder', async (req, res) => {
   const { email, password, host, port, folderName } = req.body;
   if (!folderName) return res.status(400).json({ success: false, error: 'Falta folderName' });
   const auto = getAutoConfig(email);
-  const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
-  try { await client.connect(); await client.mailboxDelete(folderName); await client.logout(); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  const targetHost = host || auto.imapHost;
+
+  let client;
+  try {
+    try {
+      client = new ImapFlow({ host: targetHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+      await client.connect();
+    } catch (err) {
+      client = new ImapFlow({ host: targetHost, port: 143, secure: false, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+      await client.connect();
+    }
+
+    await client.mailboxDelete(folderName);
+    await client.logout();
+    res.json({ success: true });
+  } catch (e) {
+    if (client) await client.logout().catch(() => {});
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 app.post('/api/download-attachment', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', uid, partId } = req.body;
   if (!uid || !partId) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
   const auto = getAutoConfig(email);
-  const client = new ImapFlow({ host: host || auto.imapHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+  const targetHost = host || auto.imapHost;
+
+  let client;
   try {
-    await client.connect();
+    try {
+      client = new ImapFlow({ host: targetHost, port: Number(port) || auto.imapPort, secure: true, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+      await client.connect();
+    } catch (err) {
+      client = new ImapFlow({ host: targetHost, port: 143, secure: false, auth: { user: email, pass: password }, logger: false, tls: { rejectUnauthorized: false } });
+      await client.connect();
+    }
+
     const lock = await client.getMailboxLock(folder);
     let msg;
     try {
@@ -817,7 +968,10 @@ app.post('/api/download-attachment', async (req, res) => {
     await client.logout();
     if (!msg?.bodyParts?.[partId]) return res.status(404).json({ success: false, error: 'Adjunto no encontrado' });
     res.json({ success: true, data: msg.bodyParts[partId].toString('base64') });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) {
+    if (client) await client.logout().catch(() => {});
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 // ------------------------------------------------------------

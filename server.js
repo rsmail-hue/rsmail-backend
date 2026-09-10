@@ -86,7 +86,7 @@ async function connectImap(email, password, host, port, secure) {
     secure,
     auth: { user: email, pass: password },
     logger: false,
-    tls: { 
+    tls: {
       rejectUnauthorized: false,
       minVersion: 'TLSv1.2',
       servername: host
@@ -96,6 +96,12 @@ async function connectImap(email, password, host, port, secure) {
     socketTimeout: 35000,
   };
   const client = new ImapFlow(config);
+
+  // 🛡️ Manejador global para evitar que un Socket timeout apague el servidor
+  client.on('error', (err) => {
+    console.error(`⚠️ Error en ImapFlow (controlado) para ${email}:`, err.message);
+  });
+
   await client.connect();
   return client;
 }
@@ -113,7 +119,7 @@ wss.on('connection', (ws) => {
       if (data.type === 'login') {
         userEmail = data.email;
         console.log(`📧 Login WebSocket registrado para ${userEmail}`);
-        
+
         if (activeWorkers.has(userEmail)) {
           const worker = activeWorkers.get(userEmail);
           worker.ws = ws;
@@ -244,7 +250,7 @@ async function runImapLoop(state) {
         if (!state.active || !state.client.usable) break;
 
         const currentStatus = await state.client.status('INBOX', { uidNext: true });
-        
+
         if (currentStatus.uidNext && currentStatus.uidNext > state.lastUidNext) {
           console.log(`📨 Cambio en bandeja para ${state.email}. Procesando rango ${state.lastUidNext} a ${currentStatus.uidNext - 1}`);
           await processEmailsInRange(state, state.lastUidNext, currentStatus.uidNext);
@@ -826,7 +832,7 @@ app.post('/api/download-attachment', async (req, res) => {
     try {
       client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
     } catch (err) {
-      client = await connectImap(email, password, targetHost, 143, false);
+      client = await connectImapp(email, password, targetHost, 143, false);
     }
 
     const lock = await client.getMailboxLock(folder);

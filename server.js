@@ -27,7 +27,7 @@ if (!admin.apps.length) {
       });
       console.log('✅ Firebase Admin inicializado con variables de entorno');
     } catch (e) {
-      console.error('❌ Error al inicializar Firebase con Variables de Entorno:', e.message);
+      console.error('❌ Error al inicializar Firebase:', e.message);
     }
   } else {
     try {
@@ -37,7 +37,7 @@ if (!admin.apps.length) {
       });
       console.log('✅ Firebase Admin inicializado con serviceAccountKey.json');
     } catch (e) {
-      console.error('⚠️ No se encontraron credenciales de Firebase. Push deshabilitadas.');
+      console.error('⚠️ Sin credenciales de Firebase. Push deshabilitadas.');
     }
   }
 }
@@ -52,7 +52,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
-//  PERSISTENCIA Y ESTADO DE WORKERS IMAP
+//  WORKERS IMAP PERSISTENTES
 // ------------------------------------------------------------
 const activeWorkers = new Map();
 
@@ -96,21 +96,18 @@ async function connectImap(email, password, host, port, secure) {
     socketTimeout: 35000,
   };
   const client = new ImapFlow(config);
-
-  // 🛡️ Manejador global para evitar que un Socket timeout apague el servidor
   client.on('error', (err) => {
-    console.error(`⚠️ Error en ImapFlow (controlado) para ${email}:`, err.message);
+    console.error(`⚠️ Error ImapFlow (${email}):`, err.message);
   });
-
   await client.connect();
   return client;
 }
 
 // ------------------------------------------------------------
-//  GESTIÓN DE WEBSOCKETS (CORREO EN VIVO)
+//  WEBSOCKETS
 // ------------------------------------------------------------
 wss.on('connection', (ws) => {
-  console.log('🔌 Nuevo cliente WebSocket conectado desde la app');
+  console.log('🔌 Nuevo WebSocket conectado');
   let userEmail = null;
 
   ws.on('message', async (message) => {
@@ -118,26 +115,23 @@ wss.on('connection', (ws) => {
       const data = JSON.parse(message);
       if (data.type === 'login') {
         userEmail = data.email;
-        console.log(`📧 Login WebSocket registrado para ${userEmail}`);
+        console.log(`📧 Login WebSocket para ${userEmail}`);
 
         if (activeWorkers.has(userEmail)) {
-          const worker = activeWorkers.get(userEmail);
-          worker.ws = ws;
+          activeWorkers.get(userEmail).ws = ws;
         } else {
           startImapWorker(data.email, data.password, data.imapHost, ws);
         }
       }
     } catch (e) {
-      console.error('❌ Error procesando mensaje WebSocket:', e.message);
+      console.error('❌ Error WebSocket:', e.message);
     }
   });
 
   ws.on('close', () => {
-    console.log(`🔌 Cliente WebSocket desconectado (${userEmail || 'Desconocido'})`);
+    console.log(`🔌 WebSocket desconectado (${userEmail || '?'})`);
     if (userEmail && activeWorkers.has(userEmail)) {
-      const worker = activeWorkers.get(userEmail);
-      worker.ws = null;
-      console.log(`🟢 Monitor IMAP continúa ejecutándose en segundo plano para ${userEmail}`);
+      activeWorkers.get(userEmail).ws = null;
     }
   });
 });
@@ -167,6 +161,7 @@ function startImapWorker(email, password, customHost, ws = null) {
 
   activeWorkers.set(email, workerState);
   runImapLoop(workerState);
+  console.log(`✅ Worker IMAP iniciado para ${email} en ${host}`);
 }
 
 async function processEmailsInRange(state, startUid, endUidNext) {
@@ -188,7 +183,7 @@ async function processEmailsInRange(state, startUid, endUidNext) {
         const from = msg.envelope?.from?.[0]?.address || 'Remitente desconocido';
         const subject = msg.envelope?.subject || 'Nuevo correo';
 
-        console.log(`🔔 Correo entrante detectado -> UID:${msg.uid} | De: ${from} | Asunto: ${subject}`);
+        console.log(`🔔 Correo entrante UID:${msg.uid} | De: ${from} | Asunto: ${subject}`);
 
         if (state.ws && state.ws.readyState === WebSocket.OPEN) {
           state.ws.send(JSON.stringify({
@@ -220,7 +215,7 @@ async function runImapLoop(state) {
   while (state.active) {
     let lock = null;
     try {
-      console.log(`🔄 [BACKGROUND] Conectando IMAP para monitoreo de ${state.email} (${state.host})...`);
+      console.log(`🔄 [BG] Conectando IMAP para ${state.email} (${state.host})...`);
       try {
         state.client = await connectImap(state.email, state.password, state.host, 993, true);
       } catch (err) {
@@ -235,14 +230,14 @@ async function runImapLoop(state) {
       const savedUid = await getSavedLastUid(state.email);
 
       if (savedUid && savedUid > 0 && savedUid < currentUidNext) {
-        console.log(`🔎 Recuperando correos no notificados entre UID ${savedUid} y ${currentUidNext - 1}...`);
+        console.log(`🔎 Recuperando correos entre UID ${savedUid} y ${currentUidNext - 1}...`);
         await processEmailsInRange(state, savedUid, currentUidNext);
       } else {
         state.lastUidNext = currentUidNext;
         await saveLastUid(state.email, currentUidNext);
       }
 
-      console.log(`📊 Monitor activo para ${state.email}. Próximo UID esperado: ${state.lastUidNext}`);
+      console.log(`📊 Monitor activo para ${state.email}. Próximo UID: ${state.lastUidNext}`);
 
       while (state.active && state.client.usable) {
         await new Promise(resolve => setTimeout(resolve, 8000));
@@ -252,14 +247,14 @@ async function runImapLoop(state) {
         const currentStatus = await state.client.status('INBOX', { uidNext: true });
 
         if (currentStatus.uidNext && currentStatus.uidNext > state.lastUidNext) {
-          console.log(`📨 Cambio en bandeja para ${state.email}. Procesando rango ${state.lastUidNext} a ${currentStatus.uidNext - 1}`);
+          console.log(`📨 Cambio en bandeja. Rango ${state.lastUidNext} a ${currentStatus.uidNext - 1}`);
           await processEmailsInRange(state, state.lastUidNext, currentStatus.uidNext);
         }
       }
 
     } catch (e) {
       if (state.active) {
-        console.log(`⚠️ Conexión IMAP caída para ${state.email}: ${e.message}`);
+        console.log(`⚠️ IMAP caído para ${state.email}: ${e.message}`);
       }
     } finally {
       if (lock) try { lock.release(); } catch (e) {}
@@ -270,79 +265,76 @@ async function runImapLoop(state) {
     }
 
     if (state.active) {
-      console.log(`⏳ Reconectando monitor IMAP para ${state.email} en 15 segundos...`);
+      console.log(`⏳ Reconectando IMAP ${state.email} en 15s...`);
       await new Promise(r => setTimeout(r, 15000));
     }
   }
 }
 
 // ------------------------------------------------------------
-//  CRON JOB: PROGRAMADOR DE NOTIFICACIONES DE CALENDARIO
+//  CRON: RECORDATORIOS DE CALENDARIO (SIN ÍNDICE)
 // ------------------------------------------------------------
 cron.schedule('* * * * *', async () => {
   if (!db) return;
 
   try {
     const now = new Date();
-    const in24Hours = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-
-    // Buscar eventos próximos programados en Firestore
-    const snapshot = await db.collection('calendar_events')
-      .where('eventTime', '<=', in24Hours)
-      .where('eventTime', '>=', now)
-      .get();
-
-    if (snapshot.empty) return;
+    const snapshot = await db.collection('calendar_events').get();
 
     for (const doc of snapshot.docs) {
       const event = doc.data();
-      const eventDate = event.eventTime.toDate ? event.eventTime.toDate() : new Date(event.eventTime);
+      const rawTime = event.eventTime;
+      const eventDate = rawTime?.toDate ? rawTime.toDate() : new Date(rawTime);
+
+      if (isNaN(eventDate.getTime())) continue;
+
       const diffMs = eventDate.getTime() - now.getTime();
       const diffHours = diffMs / (1000 * 60 * 60);
-
       const formattedTime = eventDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
-      // 1. RECORDATORIO 1 DÍA ANTES (24 HORAS)
+      if (!event.email) continue;
+
+      // 1 DÍA ANTES
       if (!event.notified1Day && diffHours <= 24 && diffHours > 0.5) {
-        console.log(`📅 Enviando recordatorio (1 DÍA ANTES) para evento: ${event.title}`);
+        console.log(`📅 Recordatorio 1 DÍA ANTES para: ${event.title}`);
         await sendPushNotification(event.email, {
           title: `📅 Mañana: ${event.title}`,
           body: `Tienes este evento programado para mañana a las ${formattedTime}`,
-          data: { 
-            type: 'calendar_event', 
-            eventId: doc.id, 
+          data: {
+            type: 'calendar_event',
+            eventId: doc.id,
             eventTitle: event.title,
             eventDate: formattedTime,
-            notice: '1day' 
+            notice: '1day'
           }
         });
         await doc.ref.update({ notified1Day: true });
       }
 
-      // 2. RECORDATORIO INMINENTE (15 MINUTOS ANTES)
+      // 15 MINUTOS ANTES
       if (!event.notifiedEvent && diffMs <= 15 * 60 * 1000 && diffMs > 0) {
-        console.log(`⏰ Enviando recordatorio (15 MINUTOS ANTES) para evento: ${event.title}`);
+        console.log(`⏰ Recordatorio 15 MIN ANTES para: ${event.title}`);
         await sendPushNotification(event.email, {
           title: `⏰ Comienza pronto: ${event.title}`,
           body: event.description || `El evento comienza a las ${formattedTime}`,
-          data: { 
-            type: 'calendar_event', 
-            eventId: doc.id, 
+          data: {
+            type: 'calendar_event',
+            eventId: doc.id,
             eventTitle: event.title,
             eventDate: formattedTime,
-            notice: '15min' 
+            notice: '15min'
           }
         });
         await doc.ref.update({ notifiedEvent: true });
       }
     }
   } catch (e) {
-    console.error('❌ Error en Cron Job de Calendario:', e.message);
+    console.error('❌ Error en Cron Job:', e.message);
   }
 });
 
 // ------------------------------------------------------------
-//  FCM PUSH NOTIFICATIONS (PRIORIDAD ALTA)
+//  FCM PUSH
 // ------------------------------------------------------------
 async function sendPushNotification(email, payload) {
   if (!db) return;
@@ -384,12 +376,15 @@ async function sendPushNotification(email, payload) {
     };
 
     const response = await admin.messaging().sendEachForMulticast(message);
-    console.log(`🚀 Notificación Push enviada a ${tokens.length} dispositivo(s) para ${email}`);
+    console.log(`🚀 Push enviado a ${tokens.length} dispositivo(s) para ${email}`);
 
     if (response.failureCount > 0) {
       const failedTokens = [];
       response.responses.forEach((resp, idx) => {
-        if (!resp.success) failedTokens.push(tokens[idx]);
+        if (!resp.success) {
+          console.log(`❌ Token fallido: ${resp.error?.message}`);
+          failedTokens.push(tokens[idx]);
+        }
       });
       for (const token of failedTokens) {
         const snapshots = await db.collection('fcm_tokens').where('token', '==', token).get();
@@ -397,12 +392,12 @@ async function sendPushNotification(email, payload) {
       }
     }
   } catch (e) {
-    console.error('❌ Error enviando notificación Push:', e.message);
+    console.error('❌ Error enviando Push:', e.message);
   }
 }
 
 // ------------------------------------------------------------
-//  CONFIGURACIÓN AUTOMÁTICA DE DOMINIOS
+//  AUTO-CONFIG
 // ------------------------------------------------------------
 function getAutoConfig(email) {
   const domain = email.split('@')[1]?.toLowerCase();
@@ -415,7 +410,7 @@ function getAutoConfig(email) {
 }
 
 // ------------------------------------------------------------
-//  AUTENTICACIÓN Y VERIFICACIÓN
+//  AUTH
 // ------------------------------------------------------------
 const handleAuth = (req, res) => {
   const { email, password, host, port } = req.body;
@@ -440,9 +435,7 @@ const handleAuth = (req, res) => {
     if (!responded) {
       responded = true;
       imap.end();
-
       startImapWorker(email, password, targetHost);
-
       return res.json({
         success: true,
         message: 'Autenticación exitosa',
@@ -472,7 +465,7 @@ const handleAuth = (req, res) => {
     if (!responded) {
       responded = true;
       imap.end();
-      return res.status(408).json({ success: false, error: 'Timeout de conexión IMAP' });
+      return res.status(408).json({ success: false, error: 'Timeout IMAP' });
     }
   }, 15000);
 
@@ -480,7 +473,7 @@ const handleAuth = (req, res) => {
 };
 
 // ------------------------------------------------------------
-//  ENDPOINTS API REST
+//  API REST
 // ------------------------------------------------------------
 app.post('/api/login', handleAuth);
 app.post('/api/verify', handleAuth);
@@ -531,7 +524,7 @@ app.post('/api/send-notification', async (req, res) => {
 
 app.post('/api/send-email', async (req, res) => {
   const { email, password, host, port, to, subject, body, attachments } = req.body;
-  if (!email || !password || !to) return res.status(400).json({ success: false, error: 'Faltan campos obligatorios' });
+  if (!email || !password || !to) return res.status(400).json({ success: false, error: 'Faltan campos' });
 
   const auto = getAutoConfig(email);
   const smtpHost = host || auto.smtpHost;
@@ -546,7 +539,7 @@ app.post('/api/send-email', async (req, res) => {
   });
 
   try {
-    const mailOptions = {
+    await transporter.sendMail({
       from: email,
       to,
       subject: subject || '(Sin asunto)',
@@ -555,9 +548,7 @@ app.post('/api/send-email', async (req, res) => {
         filename: att.filename,
         content: Buffer.from(att.content, 'base64')
       })) : []
-    };
-
-    await transporter.sendMail(mailOptions);
+    });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -867,4 +858,4 @@ app.post('/api/download-attachment', async (req, res) => {
 //  INICIAR SERVIDOR
 // ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`✅ Servidor backend RSMAIL activo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`✅ Backend RSMAIL activo en puerto ${PORT}`));

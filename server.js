@@ -308,7 +308,13 @@ cron.schedule('* * * * *', async () => {
         await sendPushNotification(event.email, {
           title: `📅 Mañana: ${event.title}`,
           body: `Tienes este evento programado para mañana a las ${formattedTime}`,
-          data: { type: 'calendar', eventId: doc.id, notice: '1day' }
+          data: { 
+            type: 'calendar_event', 
+            eventId: doc.id, 
+            eventTitle: event.title,
+            eventDate: formattedTime,
+            notice: '1day' 
+          }
         });
         await doc.ref.update({ notified1Day: true });
       }
@@ -319,7 +325,13 @@ cron.schedule('* * * * *', async () => {
         await sendPushNotification(event.email, {
           title: `⏰ Comienza pronto: ${event.title}`,
           body: event.description || `El evento comienza a las ${formattedTime}`,
-          data: { type: 'calendar', eventId: doc.id, notice: '15min' }
+          data: { 
+            type: 'calendar_event', 
+            eventId: doc.id, 
+            eventTitle: event.title,
+            eventDate: formattedTime,
+            notice: '15min' 
+          }
         });
         await doc.ref.update({ notifiedEvent: true });
       }
@@ -354,7 +366,7 @@ async function sendPushNotification(email, payload) {
       android: {
         priority: 'high',
         notification: {
-          channelId: 'calendar_channel',
+          channelId: 'rsmail_high_importance_channel',
           sound: 'default',
           priority: 'max',
           visibility: 'public'
@@ -509,7 +521,7 @@ app.post('/api/send-notification', async (req, res) => {
     await sendPushNotification(email, {
       title: title || '📅 Recordatorio',
       body: body || 'Evento programado',
-      data: data || { type: 'calendar' }
+      data: data || { type: 'calendar_event' }
     });
     res.json({ success: true });
   } catch (e) {
@@ -832,7 +844,7 @@ app.post('/api/download-attachment', async (req, res) => {
     try {
       client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
     } catch (err) {
-      client = await connectImapp(email, password, targetHost, 143, false);
+      client = await connectImap(email, password, targetHost, 143, false);
     }
 
     const lock = await client.getMailboxLock(folder);

@@ -1,4 +1,4 @@
-﻿const express = require('express');
+﻿﻿const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -196,10 +196,17 @@ async function processEmailsInRange(state, startUid, endUidNext) {
           }));
         }
 
+        // 🔥 NOTIFICACIÓN DE NUEVO CORREO (con folder para deep link)
         await sendPushNotification(state.email, {
           title: `📧 Nuevo correo de ${from}`,
           body: subject,
-          data: { type: 'new_email', sender: from, subject, uid: String(msg.uid) }
+          data: {
+            type: 'new_email',
+            sender: from,
+            subject,
+            uid: String(msg.uid),
+            folder: 'INBOX',
+          }
         });
       }
     }
@@ -294,6 +301,7 @@ cron.schedule('* * * * *', async () => {
 
       if (!event.email) continue;
 
+      // 🔥 RECORDATORIO 1 DÍA ANTES
       if (!event.notified1Day && diffHours <= 24 && diffHours > 0.5) {
         console.log(`📅 Recordatorio 1 DÍA ANTES para: ${event.title}`);
         await sendPushNotification(event.email, {
@@ -303,6 +311,7 @@ cron.schedule('* * * * *', async () => {
             type: 'calendar_event',
             eventId: doc.id,
             eventTitle: event.title,
+            eventTime: eventDate.toISOString(),
             eventDate: formattedTime,
             notice: '1day'
           }
@@ -310,6 +319,7 @@ cron.schedule('* * * * *', async () => {
         await doc.ref.update({ notified1Day: true });
       }
 
+      // 🔥 RECORDATORIO 15 MIN ANTES
       if (!event.notifiedEvent && diffMs <= 15 * 60 * 1000 && diffMs > 0) {
         console.log(`⏰ Recordatorio 15 MIN ANTES para: ${event.title}`);
         await sendPushNotification(event.email, {
@@ -319,6 +329,7 @@ cron.schedule('* * * * *', async () => {
             type: 'calendar_event',
             eventId: doc.id,
             eventTitle: event.title,
+            eventTime: eventDate.toISOString(),
             eventDate: formattedTime,
             notice: '15min'
           }
@@ -636,21 +647,17 @@ function detectAttachmentsFromStructure(structure) {
     const part = stack.pop();
     if (!part) continue;
 
-    // Disposition: "attachment" → adjunto clásico
     const disp = (part.disposition || '').toString().toLowerCase();
     if (disp === 'attachment') return true;
 
-    // Nombre de archivo en parámetros de disposición
     if (part.dispositionParameters && part.dispositionParameters.filename) {
       return true;
     }
 
-    // Nombre en parámetros (típico en adjuntos inline con name="...")
     if (part.parameters && part.parameters.name) {
       return true;
     }
 
-    // Recursión en hijos
     if (Array.isArray(part.childNodes)) {
       for (const child of part.childNodes) stack.push(child);
     }
@@ -685,7 +692,6 @@ app.post('/api/messages', async (req, res) => {
       );
 
       for await (const msg of iter) {
-        // 🔥 FIX: imapflow devuelve flags como Set, no como Array
         let flags = msg.flags;
         if (flags instanceof Set) {
           flags = Array.from(flags);
@@ -693,7 +699,6 @@ app.post('/api/messages', async (req, res) => {
           flags = [];
         }
 
-        // 🔥 NUEVO: detección real de adjuntos desde bodyStructure
         const hasAttachments = detectAttachmentsFromStructure(msg.bodyStructure);
 
         messages.push({

@@ -57,6 +57,148 @@ const wss = new WebSocket.Server({ server });
 const activeWorkers = new Map();
 
 // ------------------------------------------------------------
+//  AUTO-CONFIG UNIVERSAL (cualquier proveedor)
+// ------------------------------------------------------------
+function getAutoConfig(email) {
+  if (!email) return null;
+  const domain = email.split('@')[1]?.toLowerCase();
+  if (!domain) return null;
+
+  // 📧 Proveedores conocidos
+  if (domain === 'gmail.com' || domain === 'googlemail.com') {
+    return {
+      imapHost: 'imap.gmail.com', imapPort: 993,
+      smtpHost: 'smtp.gmail.com', smtpPort: 465, smtpSecure: true,
+      provider: 'gmail',
+    };
+  }
+  if (['outlook.com', 'hotmail.com', 'live.com', 'msn.com', 'outlook.es'].some(d => domain === d)) {
+    return {
+      imapHost: 'outlook.office365.com', imapPort: 993,
+      smtpHost: 'smtp.office365.com', smtpPort: 587, smtpSecure: false,
+      provider: 'outlook',
+    };
+  }
+  if (['office365.com', 'office.com'].some(d => domain.endsWith(d))) {
+    return {
+      imapHost: 'outlook.office365.com', imapPort: 993,
+      smtpHost: 'smtp.office365.com', smtpPort: 587, smtpSecure: false,
+      provider: 'office365',
+    };
+  }
+  if (domain.includes('yahoo.')) {
+    return {
+      imapHost: 'imap.mail.yahoo.com', imapPort: 993,
+      smtpHost: 'smtp.mail.yahoo.com', smtpPort: 465, smtpSecure: true,
+      provider: 'yahoo',
+    };
+  }
+  if (domain.includes('zoho.')) {
+    return {
+      imapHost: 'imap.zoho.com', imapPort: 993,
+      smtpHost: 'smtp.zoho.com', smtpPort: 465, smtpSecure: true,
+      provider: 'zoho',
+    };
+  }
+  if (domain === 'icloud.com' || domain === 'me.com' || domain === 'mac.com') {
+    return {
+      imapHost: 'imap.mail.me.com', imapPort: 993,
+      smtpHost: 'smtp.mail.me.com', smtpPort: 587, smtpSecure: false,
+      provider: 'icloud',
+    };
+  }
+  if (domain.includes('gmx.')) {
+    return {
+      imapHost: 'imap.gmx.com', imapPort: 993,
+      smtpHost: 'mail.gmx.com', smtpPort: 587, smtpSecure: false,
+      provider: 'gmx',
+    };
+  }
+  if (domain.includes('ionos.') || domain.includes('1and1.')) {
+    return {
+      imapHost: 'imap.ionos.es', imapPort: 993,
+      smtpHost: 'smtp.ionos.es', smtpPort: 587, smtpSecure: false,
+      provider: 'ionos',
+    };
+  }
+
+  // 🌐 Dominio propio (hosting propio, cPanel, Plesk, etc.)
+  // Se prueba primero con "mail.dominio.com" y como fallback el propio dominio
+  return {
+    imapHost: 'mail.' + domain, imapPort: 993,
+    smtpHost: 'mail.' + domain, smtpPort: 465, smtpSecure: true,
+    provider: 'custom',
+    domain: domain,
+  };
+}
+
+// 🔥 Devuelve varios candidatos SMTP para probar en orden
+function getSmtpCandidates(email) {
+  const auto = getAutoConfig(email);
+  if (!auto) return [];
+
+  const candidates = [];
+  const seen = new Set();
+  const add = (host, port, secure) => {
+    const key = `${host}:${port}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push({ host, port, secure });
+  };
+
+  // 1) Config oficial del proveedor
+  add(auto.smtpHost, auto.smtpPort, auto.smtpSecure);
+
+  // 2) Alternativas del mismo host
+  add(auto.smtpHost, 465, true);
+  add(auto.smtpHost, 587, false);
+  add(auto.smtpHost, 25, false);
+
+  // 3) Para dominios propios, probar variantes
+  if (auto.provider === 'custom' && auto.domain) {
+    const d = auto.domain;
+    // Variantes típicas de hosting español / cPanel
+    add('smtp.' + d, 465, true);
+    add('smtp.' + d, 587, false);
+    add('mail.' + d, 465, true);
+    add('mail.' + d, 587, false);
+    add('mail.' + d, 25, false);
+    add(d, 465, true);
+    add(d, 587, false);
+  }
+
+  return candidates;
+}
+
+// 🔥 Devuelve varios candidatos IMAP para probar en orden
+function getImapCandidates(email) {
+  const auto = getAutoConfig(email);
+  if (!auto) return [];
+
+  const candidates = [];
+  const seen = new Set();
+  const add = (host, port, secure) => {
+    const key = `${host}:${port}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push({ host, port, secure });
+  };
+
+  add(auto.imapHost, auto.imapPort, true);
+  add(auto.imapHost, 143, false);
+
+  if (auto.provider === 'custom' && auto.domain) {
+    const d = auto.domain;
+    add('imap.' + d, 993, true);
+    add('imap.' + d, 143, false);
+    add('mail.' + d, 993, true);
+    add('mail.' + d, 143, false);
+  }
+
+  return candidates;
+}
+
+// ------------------------------------------------------------
 //  PERSISTENCIA DE CUENTAS (auto-arranque de workers)
 // ------------------------------------------------------------
 async function saveAccount(email, password, imapHost) {
@@ -141,6 +283,31 @@ async function connectImap(email, password, host, port, secure) {
   return client;
 }
 
+// 🔥 Conexión IMAP con fallback automático de candidatos
+async function connectImapAuto(email, password, preferredHost = null) {
+  const candidates = getImapCandidates(email);
+
+  // Si el usuario pasó un host específico, lo probamos primero
+  if (preferredHost) {
+    candidates.unshift({ host: preferredHost, port: 993, secure: true });
+    candidates.unshift({ host: preferredHost, port: 143, secure: false });
+  }
+
+  let lastError = null;
+  for (const c of candidates) {
+    try {
+      console.log(`🔌 Probando IMAP ${email} → ${c.host}:${c.port}...`);
+      const client = await connectImap(email, password, c.host, c.port, c.secure);
+      console.log(`✅ IMAP conectado: ${email} vía ${c.host}:${c.port}`);
+      return { client, host: c.host, port: c.port };
+    } catch (e) {
+      console.log(`⚠️ IMAP ${c.host}:${c.port} falló: ${e.message}`);
+      lastError = e;
+    }
+  }
+  throw lastError || new Error('Todos los intentos IMAP fallaron');
+}
+
 // ------------------------------------------------------------
 //  WEBSOCKETS
 // ------------------------------------------------------------
@@ -159,7 +326,7 @@ wss.on('connection', (ws) => {
           activeWorkers.get(userEmail).ws = ws;
           console.log(`ℹ️ Worker ya existente para ${userEmail}, ws actualizado`);
         } else {
-          console.log(`🔧 WS login: creando worker para ${userEmail} (host=${data.imapHost || 'auto'})`);
+          console.log(`🔧 WS login: creando worker para ${userEmail}`);
           startImapWorker(data.email, data.password, data.imapHost, ws);
         }
       }
@@ -268,15 +435,13 @@ async function processEmailsInRange(state, startUid, endUidNext) {
 
 async function runImapLoop(state) {
   while (state.active) {
-    let idleStarted = false;
     try {
-      console.log(`🔄 [BG] Conectando IMAP para ${state.email} (${state.host})...`);
-      try {
-        state.client = await connectImap(state.email, state.password, state.host, 993, true);
-      } catch (err) {
-        console.log(`⚠️ Puerto 993 falló, probando 143... (${err.message})`);
-        state.client = await connectImap(state.email, state.password, state.host, 143, false);
-      }
+      console.log(`🔄 [BG] Conectando IMAP para ${state.email}...`);
+
+      // 🔥 Conexión con fallback automático
+      const conn = await connectImapAuto(state.email, state.password, state.host);
+      state.client = conn.client;
+      state.host = conn.host;
 
       await state.client.mailboxOpen('INBOX');
 
@@ -463,7 +628,6 @@ cron.schedule('* * * * *', async () => {
   try {
     const now = new Date();
 
-    // 🔥 SIN where compuesto: leemos todos los "pending" y filtramos en JS
     const snapshot = await db
       .collection('scheduled_emails')
       .where('status', '==', 'pending')
@@ -498,13 +662,27 @@ cron.schedule('* * * * *', async () => {
 async function processScheduledEmail(doc) {
   const data = doc.data();
   const docRef = doc.ref;
+  const docId = doc.id;
 
+  // 🔥 Bloqueo atómico: verificar que sigue en "pending"
   try {
+    const fresh = await docRef.get();
+    if (!fresh.exists) return;
+    const freshStatus = fresh.data()?.status;
+    if (freshStatus !== 'pending') {
+      console.log(`⏭️ Doc ${docId} ya está en "${freshStatus}", saltando`);
+      return;
+    }
     await docRef.update({
       status: 'processing',
       processingStartedAt: new Date(),
     });
+  } catch (e) {
+    console.error(`❌ No se pudo bloquear ${docId}:`, e.message);
+    return;
+  }
 
+  try {
     const accountEmail = data.accountEmail;
     if (!accountEmail) throw new Error('Sin cuenta emisora');
 
@@ -515,15 +693,8 @@ async function processScheduledEmail(doc) {
     if (!accountSnap.exists) throw new Error(`No hay cuenta para ${accountEmail}`);
 
     const account = accountSnap.data();
-    const auto = getAutoConfig(accountEmail);
 
-    // 🔥 Usar el auto-config por dominio
-    const smtpHost = auto.smtpHost;
-    const smtpPort = auto.smtpPort;
-
-    console.log(`📮 SMTP para ${accountEmail}: ${smtpHost}:${smtpPort}`);
-
-    // 🔥 Adjuntos vienen como base64 en data.attachments
+    // 🔥 Preparar adjuntos base64
     const attachments = [];
     const rawAttachments = data.attachments || [];
 
@@ -542,36 +713,59 @@ async function processScheduledEmail(doc) {
       }
     }
 
-    const transporter = nodemailer.createTransport({
-      host: smtpHost,
-      port: smtpPort,
-      secure: smtpPort === 465,
-      auth: { user: accountEmail, pass: account.password },
-      tls: { rejectUnauthorized: false },
-    });
+    // 🔥 Probar varios puertos/hosts SMTP automáticamente
+    const smtpCandidates = getSmtpCandidates(accountEmail);
+    console.log(`📮 SMTP: probando ${smtpCandidates.length} combinaciones para ${accountEmail}...`);
 
-    await transporter.sendMail({
-      from: accountEmail,
-      to: data.to,
-      cc: data.cc || undefined,
-      bcc: data.bcc || undefined,
-      subject: data.subject || '(Sin asunto)',
-      html: data.body || '',
-      attachments: attachments,
-    });
+    let sent = false;
+    let lastError = null;
+    let workingConfig = null;
 
-    console.log(`✅ Programado enviado: "${data.subject}" → ${data.to}`);
+    for (const c of smtpCandidates) {
+      try {
+        console.log(`   → Probando ${c.host}:${c.port} (secure=${c.secure})...`);
+
+        const transporter = nodemailer.createTransport({
+          host: c.host,
+          port: c.port,
+          secure: c.secure,
+          auth: { user: accountEmail, pass: account.password },
+          tls: { rejectUnauthorized: false },
+          connectionTimeout: 15000,
+          greetingTimeout: 15000,
+          socketTimeout: 20000,
+        });
+
+        await transporter.verify();
+
+        await transporter.sendMail({
+          from: accountEmail,
+          to: data.to,
+          cc: data.cc || undefined,
+          bcc: data.bcc || undefined,
+          subject: data.subject || '(Sin asunto)',
+          html: data.body || '',
+          attachments,
+        });
+
+        console.log(`✅ Programado enviado vía ${c.host}:${c.port} → "${data.subject}" a ${data.to}`);
+        sent = true;
+        workingConfig = c;
+        break;
+      } catch (e) {
+        console.log(`   ⚠️ ${c.host}:${c.port} → ${e.message}`);
+        lastError = e;
+      }
+    }
+
+    if (!sent) {
+      throw lastError || new Error('Todos los intentos SMTP fallaron');
+    }
 
     // Guardar en Enviados
     try {
-      const imapAuto = getAutoConfig(accountEmail);
-      const client = await connectImap(
-        accountEmail,
-        account.password,
-        imapAuto.imapHost,
-        993,
-        true
-      );
+      const imapConn = await connectImapAuto(accountEmail, account.password);
+      const client = imapConn.client;
 
       const list = await client.list();
       const sentFolder =
@@ -602,15 +796,16 @@ async function processScheduledEmail(doc) {
     await docRef.update({
       status: 'sent',
       sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      sentVia: workingConfig ? `${workingConfig.host}:${workingConfig.port}` : null,
     });
 
     await sendPushNotification(accountEmail, {
       title: '✅ Correo programado enviado',
       body: `"${data.subject}" se ha enviado a ${data.to}`,
-      data: { type: 'scheduled_sent', docId: doc.id },
+      data: { type: 'scheduled_sent', docId },
     });
   } catch (e) {
-    console.error(`❌ Error enviando programado ${doc.id}:`, e.message);
+    console.error(`❌ Error enviando programado ${docId}:`, e.message);
     await docRef.update({
       status: 'failed',
       error: e.message,
@@ -696,80 +891,46 @@ async function sendPushNotification(email, payload) {
 }
 
 // ------------------------------------------------------------
-//  AUTO-CONFIG
+//  AUTH (con autodetección IMAP)
 // ------------------------------------------------------------
-function getAutoConfig(email) {
-  const domain = email.split('@')[1]?.toLowerCase();
-  if (!domain) return null;
-  if (domain.includes('gmail.com')) return { imapHost: 'imap.gmail.com', imapPort: 993, smtpHost: 'smtp.gmail.com', smtpPort: 587, secure: true };
-  if (domain.includes('outlook.com') || domain.includes('hotmail.com') || domain.includes('live.com')) return { imapHost: 'outlook.office365.com', imapPort: 993, smtpHost: 'smtp.office365.com', smtpPort: 587, secure: true };
-  if (domain.includes('yahoo.')) return { imapHost: 'imap.mail.yahoo.com', imapPort: 993, smtpHost: 'smtp.mail.yahoo.com', smtpPort: 465, secure: true };
-  if (domain.includes('zoho.')) return { imapHost: 'imap.zoho.com', imapPort: 993, smtpHost: 'smtp.zoho.com', smtpPort: 465, secure: true };
-  return { imapHost: 'mail.' + domain, imapPort: 993, smtpHost: 'mail.' + domain, smtpPort: 587, secure: true };
-}
-
-// ------------------------------------------------------------
-//  AUTH
-// ------------------------------------------------------------
-const handleAuth = (req, res) => {
+const handleAuth = async (req, res) => {
   const { email, password, host, port } = req.body;
-  if (!email || !password) return res.status(400).json({ success: false, error: 'Email y contraseña requeridos' });
+  if (!email || !password) {
+    return res.status(400).json({ success: false, error: 'Email y contraseña requeridos' });
+  }
 
-  const auto = getAutoConfig(email);
-  const targetHost = host || auto.imapHost;
-  const targetPort = Number(port) || auto.imapPort;
+  try {
+    console.log(`🔐 Verificando cuenta ${email}...`);
+    const conn = await connectImapAuto(email, password, host);
+    const client = conn.client;
 
-  const imap = new Imap({
-    user: email,
-    password,
-    host: targetHost,
-    port: targetPort,
-    tls: true,
-    tlsOptions: { rejectUnauthorized: false }
-  });
+    await client.logout().catch(() => {});
 
-  let responded = false;
+    const auto = getAutoConfig(email);
+    saveAccount(email, password, conn.host);
+    startImapWorker(email, password, conn.host);
 
-  imap.once('ready', () => {
-    if (!responded) {
-      responded = true;
-      imap.end();
-      saveAccount(email, password, targetHost);
-      startImapWorker(email, password, targetHost);
-      return res.json({
-        success: true,
-        message: 'Autenticación exitosa',
-        account: {
-          email,
-          password,
-          imapHost: targetHost,
-          imapPort: targetPort,
-          imapSecurity: 'ssl',
-          smtpHost: auto.smtpHost,
-          smtpPort: auto.smtpPort,
-          smtpSecurity: 'starttls'
-        }
-      });
-    }
-  });
-
-  imap.once('error', (err) => {
-    if (!responded) {
-      responded = true;
-      imap.end();
-      return res.status(401).json({ success: false, error: 'Credenciales inválidas: ' + err.message });
-    }
-  });
-
-  setTimeout(() => {
-    if (!responded) {
-      responded = true;
-      imap.end();
-      return res.status(408).json({ success: false, error: 'Timeout IMAP' });
-    }
-  }, 15000);
-
-  imap.connect();
+    return res.json({
+      success: true,
+      message: 'Autenticación exitosa',
+      account: {
+        email,
+        password,
+        imapHost: conn.host,
+        imapPort: conn.port,
+        imapSecurity: conn.port === 993 ? 'ssl' : 'starttls',
+        smtpHost: auto.smtpHost,
+        smtpPort: auto.smtpPort,
+        smtpSecurity: auto.smtpSecure ? 'ssl' : 'starttls',
+      }
+    });
+  } catch (e) {
+    console.error(`❌ Auth falló para ${email}:`, e.message);
+    return res.status(401).json({
+      success: false,
+      error: 'Credenciales inválidas: ' + e.message
+    });
+  }
 };
 
 // ------------------------------------------------------------
@@ -778,7 +939,7 @@ const handleAuth = (req, res) => {
 app.post('/api/login', handleAuth);
 app.post('/api/verify', handleAuth);
 
-// /ping reanima workers caídos (aprovecha el ping de UptimeRobot)
+// /ping reanima workers caídos
 app.get('/ping', async (req, res) => {
   if (db) {
     try {
@@ -787,9 +948,7 @@ app.get('/ping', async (req, res) => {
         const isAlive = state.active &&
                         state.client &&
                         state.client.usable;
-        if (!isAlive) {
-          deadEmails.push(email);
-        }
+        if (!isAlive) deadEmails.push(email);
       }
 
       for (const email of deadEmails) {
@@ -810,7 +969,7 @@ app.get('/ping', async (req, res) => {
       if (activeWorkers.size === 0) {
         const snapshot = await db.collection('user_accounts').get();
         if (snapshot.size > 0) {
-          console.log(`♻️ /ping: sin workers, arrancando ${snapshot.size} desde Firestore`);
+          console.log(`♻️ /ping: sin workers, arrancando ${snapshot.size}`);
           for (const d of snapshot.docs) {
             const data = d.data();
             if (data.email && data.password) {
@@ -853,7 +1012,7 @@ app.get('/api/debug/workers', (req, res) => {
   });
 });
 
-// 🔥 DEBUG: ver correos programados
+// DEBUG: ver correos programados
 app.get('/api/debug/scheduled', async (req, res) => {
   if (!db) return res.status(500).json({ error: 'Firestore no configurado' });
   try {
@@ -874,6 +1033,7 @@ app.get('/api/debug/scheduled', async (req, res) => {
         now: new Date().toISOString(),
         overdue: sfDate ? (sfDate.getTime() <= Date.now()) : false,
         attachmentsCount: (d.attachments || []).length,
+        sentVia: d.sentVia || null,
         error: d.error || null,
       });
     });
@@ -883,7 +1043,7 @@ app.get('/api/debug/scheduled', async (req, res) => {
   }
 });
 
-// 🔥 DEBUG: resetear los "processing" colgados a "pending"
+// DEBUG: resetear processing colgados
 app.get('/api/debug/reset-scheduled', async (req, res) => {
   if (!db) return res.status(500).json({ error: 'Firestore no configurado' });
   try {
@@ -899,6 +1059,22 @@ app.get('/api/debug/reset-scheduled', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// DEBUG: ver configuración auto para un email
+app.get('/api/debug/auto-config/:email', (req, res) => {
+  const email = req.params.email;
+  const auto = getAutoConfig(email);
+  const imapCandidates = getImapCandidates(email);
+  const smtpCandidates = getSmtpCandidates(email);
+  res.json({
+    email,
+    provider: auto?.provider || 'unknown',
+    imap: { host: auto?.imapHost, port: auto?.imapPort },
+    smtp: { host: auto?.smtpHost, port: auto?.smtpPort, secure: auto?.smtpSecure },
+    imapCandidates,
+    smtpCandidates,
+  });
 });
 
 app.post('/api/fcm-token', async (req, res) => {
@@ -918,11 +1094,11 @@ app.post('/api/fcm-token', async (req, res) => {
     console.log(`📱 Token FCM actualizado en Firestore para ${email}`);
 
     if (password) {
-      console.log(`🔧 fcm-token: iniciando worker para ${email} (host=${imapHost || 'auto'})`);
+      console.log(`🔧 fcm-token: iniciando worker para ${email}`);
       saveAccount(email, password, imapHost);
       startImapWorker(email, password, imapHost);
     } else {
-      console.log(`⚠️ fcm-token: sin password para ${email}, NO se inicia worker`);
+      console.log(`⚠️ fcm-token: sin password para ${email}`);
     }
 
     res.json({ success: true });
@@ -985,17 +1161,10 @@ app.post('/api/save-to-sent', async (req, res) => {
   const { email, password, host, port, to, subject, body } = req.body;
   if (!email || !password) return res.status(400).json({ success: false, error: 'Parámetros insuficientes' });
 
-  const auto = getAutoConfig(email);
-  const targetHost = host || auto.imapHost;
-  const targetPort = Number(port) || auto.imapPort;
-
   let client;
   try {
-    try {
-      client = await connectImap(email, password, targetHost, targetPort, true);
-    } catch (err) {
-      client = await connectImap(email, password, targetHost, 143, false);
-    }
+    const conn = await connectImapAuto(email, password, host);
+    client = conn.client;
 
     const list = await client.list();
     let sentFolder = list.find(f =>
@@ -1033,15 +1202,10 @@ app.post('/api/save-to-sent', async (req, res) => {
 
 app.post('/api/folders', async (req, res) => {
   const { email, password, host, port } = req.body;
-  const auto = getAutoConfig(email);
-  const targetHost = host || auto.imapHost;
   let client;
   try {
-    try {
-      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
-    } catch (err) {
-      client = await connectImap(email, password, targetHost, 143, false);
-    }
+    const conn = await connectImapAuto(email, password, host);
+    client = conn.client;
 
     const list = await client.list();
     await client.logout();
@@ -1081,16 +1245,11 @@ function detectAttachmentsFromStructure(structure) {
 
 app.post('/api/messages', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
-  const auto = getAutoConfig(email);
-  const targetHost = host || auto.imapHost;
 
   let client;
   try {
-    try {
-      client = await connectImap(email, password, targetHost, Number(port) || 993, true);
-    } catch (err) {
-      client = await connectImap(email, password, targetHost, 143, false);
-    }
+    const conn = await connectImapAuto(email, password, host);
+    client = conn.client;
 
     const lock = await client.getMailboxLock(folder);
     const messages = [];
@@ -1141,16 +1300,11 @@ app.post('/api/messages', async (req, res) => {
 app.post('/api/message-detail', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', uid } = req.body;
   if (!uid) return res.status(400).json({ success: false, error: 'UID requerido' });
-  const auto = getAutoConfig(email);
-  const targetHost = host || auto.imapHost;
 
   let client;
   try {
-    try {
-      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
-    } catch (err) {
-      client = await connectImap(email, password, targetHost, 143, false);
-    }
+    const conn = await connectImapAuto(email, password, host);
+    client = conn.client;
 
     const lock = await client.getMailboxLock(folder);
     let parsed;
@@ -1193,16 +1347,10 @@ app.post('/api/delete-message', async (req, res) => {
   const { email, password, host, port, uid, folder = 'INBOX' } = req.body;
   if (!uid) return res.status(400).json({ success: false, error: 'Falta UID' });
 
-  const auto = getAutoConfig(email);
-  const targetHost = host || auto.imapHost;
-
   let client;
   try {
-    try {
-      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
-    } catch (err) {
-      client = await connectImap(email, password, targetHost, 143, false);
-    }
+    const conn = await connectImapAuto(email, password, host);
+    client = conn.client;
 
     const lock = await client.getMailboxLock(folder);
     try {
@@ -1235,16 +1383,11 @@ app.post('/api/delete-message', async (req, res) => {
 app.post('/api/toggle-read', async (req, res) => {
   const { email, password, host, port, uid, folder = 'INBOX', read } = req.body;
   if (uid == null) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
-  const auto = getAutoConfig(email);
-  const targetHost = host || auto.imapHost;
 
   let client;
   try {
-    try {
-      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
-    } catch (err) {
-      client = await connectImap(email, password, targetHost, 143, false);
-    }
+    const conn = await connectImapAuto(email, password, host);
+    client = conn.client;
 
     const lock = await client.getMailboxLock(folder);
     try {
@@ -1263,19 +1406,12 @@ app.post('/api/toggle-read', async (req, res) => {
 
 app.post('/api/mark-all-read', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX' } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ success: false, error: 'Faltan parámetros' });
-  }
-  const auto = getAutoConfig(email);
-  const targetHost = host || auto.imapHost;
+  if (!email || !password) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
 
   let client;
   try {
-    try {
-      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
-    } catch (err) {
-      client = await connectImap(email, password, targetHost, 143, false);
-    }
+    const conn = await connectImapAuto(email, password, host);
+    client = conn.client;
 
     const lock = await client.getMailboxLock(folder);
     let total = 0;
@@ -1306,16 +1442,11 @@ app.post('/api/mark-all-read', async (req, res) => {
 app.post('/api/toggle-flagged', async (req, res) => {
   const { email, password, host, port, uid, folder = 'INBOX', flagged } = req.body;
   if (uid == null) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
-  const auto = getAutoConfig(email);
-  const targetHost = host || auto.imapHost;
 
   let client;
   try {
-    try {
-      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
-    } catch (err) {
-      client = await connectImap(email, password, targetHost, 143, false);
-    }
+    const conn = await connectImapAuto(email, password, host);
+    client = conn.client;
 
     const lock = await client.getMailboxLock(folder);
     try {
@@ -1335,16 +1466,11 @@ app.post('/api/toggle-flagged', async (req, res) => {
 app.post('/api/download-attachment', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', uid, partId } = req.body;
   if (!uid || !partId) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
-  const auto = getAutoConfig(email);
-  const targetHost = host || auto.imapHost;
 
   let client;
   try {
-    try {
-      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
-    } catch (err) {
-      client = await connectImap(email, password, targetHost, 143, false);
-    }
+    const conn = await connectImapAuto(email, password, host);
+    client = conn.client;
 
     const lock = await client.getMailboxLock(folder);
     let msg;
@@ -1396,16 +1522,10 @@ app.post('/api/scan-subscriptions', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Email y contraseña requeridos' });
   }
 
-  const auto = getAutoConfig(email);
-  const targetHost = host || auto.imapHost;
-
   let client;
   try {
-    try {
-      client = await connectImap(email, password, targetHost, Number(port) || 993, true);
-    } catch (err) {
-      client = await connectImap(email, password, targetHost, 143, false);
-    }
+    const conn = await connectImapAuto(email, password, host);
+    client = conn.client;
 
     const lock = await client.getMailboxLock('INBOX');
     const subscriptions = new Map();
@@ -1554,7 +1674,7 @@ app.post('/api/unsubscribe', async (req, res) => {
       const transporter = nodemailer.createTransport({
         host: auto.smtpHost,
         port: auto.smtpPort,
-        secure: auto.smtpPort === 465,
+        secure: auto.smtpSecure,
         auth: { user: email, pass: password },
         tls: { rejectUnauthorized: false },
       });

@@ -272,7 +272,7 @@ async function runImapLoop(state) {
 }
 
 // ------------------------------------------------------------
-//  CRON: RECORDATORIOS DE CALENDARIO (SIN ÍNDICE)
+//  CRON: RECORDATORIOS DE CALENDARIO
 // ------------------------------------------------------------
 cron.schedule('* * * * *', async () => {
   if (!db) return;
@@ -294,7 +294,6 @@ cron.schedule('* * * * *', async () => {
 
       if (!event.email) continue;
 
-      // 1 DÍA ANTES
       if (!event.notified1Day && diffHours <= 24 && diffHours > 0.5) {
         console.log(`📅 Recordatorio 1 DÍA ANTES para: ${event.title}`);
         await sendPushNotification(event.email, {
@@ -311,7 +310,6 @@ cron.schedule('* * * * *', async () => {
         await doc.ref.update({ notified1Day: true });
       }
 
-      // 15 MINUTOS ANTES
       if (!event.notifiedEvent && diffMs <= 15 * 60 * 1000 && diffMs > 0) {
         console.log(`⏰ Recordatorio 15 MIN ANTES para: ${event.title}`);
         await sendPushNotification(event.email, {
@@ -850,6 +848,232 @@ app.post('/api/download-attachment', async (req, res) => {
     res.json({ success: true, data: msg.bodyParts[partId].toString('base64') });
   } catch (e) {
     if (client) await client.logout().catch(() => {});
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ============================================================
+//  GESTIÓN DE SUSCRIPCIONES
+// ============================================================
+
+function analyzeIsSubscription({ from, subject, listUnsubscribe }) {
+  if (listUnsubscribe && listUnsubscribe.trim().length > 0) return true;
+
+  const text = `${from || ''} ${subject || ''}`.toLowerCase();
+  const keywords = [
+    'newsletter', 'boletin', 'boletín', 'suscripción', 'suscripcion',
+    'newsletter@', 'marketing@', 'info@', 'noreply@', 'no-reply@',
+    'no responder', 'no-responder', 'promociones', 'publicidad',
+  ];
+  return keywords.some(k => text.includes(k));
+}
+
+function parseListUnsubscribe(raw) {
+  if (!raw) return { mailto: [], http: [] };
+  const result = { mailto: [], http: [] };
+  const regex = /<([^>]+)>/g;
+  let match;
+  while ((match = regex.exec(raw)) !== null) {
+    const url = match[1].trim();
+    if (url.toLowerCase().startsWith('mailto:')) {
+      result.mailto.push(url);
+    } else if (url.toLowerCase().startsWith('http')) {
+      result.http.push(url);
+    }
+  }
+  return result;
+}
+
+app.post('/api/scan-subscriptions', async (req, res) => {
+  const { email, password, host, port, maxMessages = 500 } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ success: false, error: 'Email y contraseña requeridos' });
+  }
+
+  const auto = getAutoConfig(email);
+  const targetHost = host || auto.imapHost;
+
+  let client;
+  try {
+    try {
+      client = await connectImap(email, password, targetHost, Number(port) || 993, true);
+    } catch (err) {
+      client = await connectImap(email, password, targetHost, 143, false);
+    }
+
+    const lock = await client.getMailboxLock('INBOX');
+    const subscriptions = new Map();
+
+    try {
+      const status = await client.status('INBOX', { messages: true });
+      const total = status.messages || 0;
+      const startSeq = Math.max(1, total - maxMessages + 1);
+
+      console.log(`📬 Escaneando suscripciones en ${email}: ${total} mensajes, desde ${startSeq}`);
+
+      const iter = client.fetch(`${startSeq}:*`, {
+        uid: true,
+        envelope: true,
+        headers: ['list-unsubscribe', 'list-unsubscribe-post'],
+      });
+
+      for await (const msg of iter) {
+        const fromAddr = msg.envelope?.from?.[0]?.address || '';
+        const fromName = msg.envelope?.from?.[0]?.name || '';
+        const subject = msg.envelope?.subject || '';
+        const date = msg.envelope?.date ? new Date(msg.envelope.date) : null;
+
+        let headerListUnsub = '';
+        let headerListUnsubPost = '';
+        if (msg.headers) {
+          const raw = msg.headers.toString();
+          const mUnsub = raw.match(/^List-Unsubscribe:\s*(.+)$/im);
+          if (mUnsub) headerListUnsub = mUnsub[1].trim();
+          const mPost = raw.match(/^List-Unsubscribe-Post:\s*(.+)$/im);
+          if (mPost) headerListUnsubPost = mPost[1].trim();
+        }
+
+        if (!fromAddr) continue;
+
+        const isSub = analyzeIsSubscription({
+          from: fromAddr + ' ' + fromName,
+          subject,
+          listUnsubscribe: headerListUnsub,
+        });
+        if (!isSub) continue;
+
+        const key = fromAddr.toLowerCase();
+        const parsed = parseListUnsubscribe(headerListUnsub);
+
+        if (!subscriptions.has(key)) {
+          subscriptions.set(key, {
+            email: fromAddr,
+            name: fromName || fromAddr,
+            subject,
+            latestDate: date ? date.toISOString() : null,
+            count: 1,
+            listUnsubscribe: headerListUnsub,
+            listUnsubscribePost: headerListUnsubPost,
+            hasUnsubscribe: parsed.mailto.length > 0 || parsed.http.length > 0,
+          });
+        } else {
+          const s = subscriptions.get(key);
+          s.count++;
+          if (date && (!s.latestDate || new Date(s.latestDate) < date)) {
+            s.latestDate = date.toISOString();
+            s.subject = subject;
+            if (headerListUnsub) {
+              s.listUnsubscribe = headerListUnsub;
+              s.listUnsubscribePost = headerListUnsubPost;
+              s.hasUnsubscribe = parsed.mailto.length > 0 || parsed.http.length > 0;
+            }
+          }
+        }
+      }
+    } finally {
+      lock.release();
+    }
+
+    await client.logout();
+
+    const list = Array.from(subscriptions.values())
+      .sort((a, b) => (b.latestDate || '').localeCompare(a.latestDate || ''));
+
+    console.log(`✅ Detectadas ${list.length} suscripciones para ${email}`);
+    res.json({ success: true, subscriptions: list, total: list.length });
+  } catch (err) {
+    console.error('❌ Error en /api/scan-subscriptions:', err.message);
+    if (client) await client.logout().catch(() => {});
+    res.status(500).json({ success: false, error: err.message, subscriptions: [] });
+  }
+});
+
+app.post('/api/unsubscribe', async (req, res) => {
+  const {
+    email, password,
+    listUnsubscribe, listUnsubscribePost,
+  } = req.body;
+
+  if (!listUnsubscribe) {
+    return res.status(400).json({ success: false, error: 'Falta la cabecera List-Unsubscribe' });
+  }
+
+  const parsed = parseListUnsubscribe(listUnsubscribe);
+  const isOneClick = (listUnsubscribePost || '').toLowerCase().includes('one-click');
+
+  try {
+    let method = null;
+    let result = null;
+
+    // 1) POST one-click (RFC 8058)
+    if (parsed.http.length > 0 && isOneClick) {
+      try {
+        const r = await fetch(parsed.http[0], {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'User-Agent': 'RSMail/3.0',
+          },
+          body: 'List-Unsubscribe=One-Click',
+        });
+        method = 'https-post';
+        result = { status: r.status, ok: r.ok };
+        console.log(`✅ Unsubscribe one-click: ${r.status} para ${parsed.http[0]}`);
+      } catch (e) {
+        console.log('⚠️ POST one-click falló:', e.message);
+      }
+    }
+
+    // 2) GET HTTPS
+    if (!result && parsed.http.length > 0) {
+      try {
+        const r = await fetch(parsed.http[0], {
+          method: 'GET',
+          headers: { 'User-Agent': 'RSMail/3.0' },
+          redirect: 'follow',
+        });
+        method = 'https-get';
+        result = { status: r.status, ok: r.ok };
+        console.log(`✅ Unsubscribe GET: ${r.status} para ${parsed.http[0]}`);
+      } catch (e) {
+        console.log('⚠️ GET falló:', e.message);
+      }
+    }
+
+    // 3) mailto:
+    if (!result && parsed.mailto.length > 0) {
+      const mailtoUrl = parsed.mailto[0].replace(/^mailto:/i, '');
+      const [address, query] = mailtoUrl.split('?');
+      const subjectMatch = (query || '').match(/subject=([^&]+)/i);
+      const subject = subjectMatch ? decodeURIComponent(subjectMatch[1]) : 'unsubscribe';
+
+      const auto = getAutoConfig(email);
+      const transporter = nodemailer.createTransport({
+        host: auto.smtpHost,
+        port: auto.smtpPort,
+        secure: auto.smtpPort === 465,
+        auth: { user: email, pass: password },
+        tls: { rejectUnauthorized: false },
+      });
+
+      await transporter.sendMail({
+        from: email,
+        to: address,
+        subject: subject,
+        text: 'unsubscribe',
+      });
+      method = 'mailto';
+      result = { ok: true };
+      console.log(`✅ Unsubscribe por email a ${address}`);
+    }
+
+    if (!result) {
+      return res.status(400).json({ success: false, error: 'No se encontró un método de baja válido' });
+    }
+
+    res.json({ success: true, method, result });
+  } catch (e) {
+    console.error('❌ Error en /api/unsubscribe:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });

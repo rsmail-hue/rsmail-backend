@@ -1,4 +1,4 @@
-﻿const express = require('express');
+﻿﻿const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -203,7 +203,7 @@ function startImapWorker(email, password, customHost, ws = null) {
     lastUidNext: 0,
     client: null,
     active: true,
-    lastAlive: Date.now(),   // para saber si está vivo
+    lastAlive: Date.now(),
   };
 
   activeWorkers.set(email, workerState);
@@ -278,10 +278,8 @@ async function runImapLoop(state) {
         state.client = await connectImap(state.email, state.password, state.host, 143, false);
       }
 
-      // 🔥 Abrir INBOX explícitamente para permitir IDLE
       await state.client.mailboxOpen('INBOX');
 
-      // 🔥 Handler para el evento IDLE (nuevos correos)
       const handleExists = async () => {
         try {
           state.lastAlive = Date.now();
@@ -299,7 +297,6 @@ async function runImapLoop(state) {
 
       state.client.on('exists', handleExists);
 
-      // 🔥 Sync inicial por si hay correos perdidos entre reinicios
       const statusInit = await state.client.status('INBOX', { uidNext: true });
       const currentUidNext = statusInit.uidNext || 1;
 
@@ -315,21 +312,16 @@ async function runImapLoop(state) {
 
       console.log(`💤 Monitor IDLE activo para ${state.email}. Próximo UID: ${state.lastUidNext}`);
 
-      // Keep-alive: esperamos. El evento 'exists' hace el trabajo.
-      // Cada 30s logueamos el estado para saber que sigue vivo.
       let aliveLogCounter = 0;
       while (state.active && state.client.usable) {
         await new Promise(resolve => setTimeout(resolve, 5000));
         aliveLogCounter++;
 
         if (aliveLogCounter % 6 === 0) {
-          // Cada 30s
           state.lastAlive = Date.now();
           console.log(`💓 [${state.email}] IDLE activo (${Math.floor(aliveLogCounter * 5)}s)`);
         }
 
-        // 🔥 Fallback: cada 60s (12 ciclos de 5s) comprobamos manualmente
-        //    por si IDLE no funcionó en algún servidor IMAP exótico.
         if (aliveLogCounter % 12 === 0) {
           try {
             const s = await state.client.status('INBOX', { uidNext: true });
@@ -338,16 +330,12 @@ async function runImapLoop(state) {
               await processEmailsInRange(state, state.lastUidNext, s.uidNext);
             }
           } catch (e) {
-            // Si status falla, la conexión está muerta
             console.log(`⚠️ Fallback poll falló, cerrando conexión: ${e.message}`);
             break;
           }
         }
       }
 
-      // Si llegamos aquí y el cliente sigue activo, salimos del bucle
-      // solo si state.active es false. Si no, probablemente la conexión
-      // se cayó y toca reconectar.
       if (state.active && state.client.usable) {
         console.log(`⚠️ Bucle IDLE salió pero el cliente sigue usable. Reiniciando...`);
       }
@@ -398,7 +386,6 @@ cron.schedule('* * * * *', async () => {
           : null);
       if (!recipientEmail) continue;
 
-      // 🔥 RECORDATORIO 1 DÍA ANTES (ventana 23-25h)
       if (!event.notified1Day && diffHours <= 25 && diffHours > 23) {
         console.log(`📅 Recordatorio 1 DÍA ANTES para: ${event.title} → ${recipientEmail} (faltan ${diffHours.toFixed(1)}h)`);
         await sendPushNotification(recipientEmail, {
@@ -416,7 +403,6 @@ cron.schedule('* * * * *', async () => {
         await doc.ref.update({ notified1Day: true });
       }
 
-      // 🔥 RECORDATORIO 15 MIN ANTES
       if (!event.notifiedEvent && diffMs <= 15 * 60 * 1000 && diffMs > 0) {
         console.log(`⏰ Recordatorio 15 MIN ANTES para: ${event.title} → ${recipientEmail}`);
         await sendPushNotification(recipientEmail, {
@@ -469,6 +455,155 @@ cron.schedule('*/3 * * * *', async () => {
 });
 
 // ------------------------------------------------------------
+//  CRON: ENVÍO PROGRAMADO (cada minuto)
+// ------------------------------------------------------------
+cron.schedule('* * * * *', async () => {
+  if (!db) return;
+
+  try {
+    const now = new Date();
+
+    const snapshot = await db
+      .collection('scheduled_emails')
+      .where('status', '==', 'pending')
+      .where('scheduledFor', '<=', admin.firestore.Timestamp.fromDate(now))
+      .limit(10)
+      .get();
+
+    if (snapshot.empty) return;
+
+    console.log(`⏰ Procesando ${snapshot.size} correo(s) programado(s)...`);
+
+    for (const doc of snapshot.docs) {
+      await processScheduledEmail(doc);
+    }
+  } catch (e) {
+    console.error('❌ Error en cron de programados:', e.message);
+  }
+});
+
+async function processScheduledEmail(doc) {
+  const data = doc.data();
+  const docRef = doc.ref;
+
+  try {
+    await docRef.update({
+      status: 'processing',
+      processingStartedAt: new Date(),
+    });
+
+    const accountEmail = data.accountEmail;
+    if (!accountEmail) throw new Error('Sin cuenta emisora');
+
+    const accountSnap = await db
+      .collection('user_accounts')
+      .doc(accountEmail)
+      .get();
+    if (!accountSnap.exists) throw new Error(`No hay cuenta para ${accountEmail}`);
+
+    const account = accountSnap.data();
+    const auto = getAutoConfig(accountEmail);
+    const smtpHost = account.imapHost
+      ? 'smtp.' + account.imapHost.replace(/^mail\./i, '')
+      : auto.smtpHost;
+
+    // 🔥 Adjuntos vienen como base64 en data.attachments
+    const attachments = [];
+    const rawAttachments = data.attachments || [];
+
+    for (const att of rawAttachments) {
+      try {
+        if (att.content && att.filename) {
+          attachments.push({
+            filename: att.filename,
+            content: Buffer.from(att.content, 'base64'),
+            contentType: att.contentType || 'application/octet-stream',
+          });
+          console.log(`📎 Adjunto preparado: ${att.filename}`);
+        }
+      } catch (e) {
+        console.error(`⚠️ Error procesando adjunto:`, e.message);
+      }
+    }
+
+    const transporter = nodemailer.createTransport({
+      host: smtpHost,
+      port: 587,
+      secure: false,
+      auth: { user: accountEmail, pass: account.password },
+      tls: { rejectUnauthorized: false },
+    });
+
+    await transporter.sendMail({
+      from: accountEmail,
+      to: data.to,
+      cc: data.cc || undefined,
+      bcc: data.bcc || undefined,
+      subject: data.subject || '(Sin asunto)',
+      html: data.body || '',
+      attachments: attachments,
+    });
+
+    console.log(`✅ Programado enviado: "${data.subject}" → ${data.to}`);
+
+    // Guardar en Enviados
+    try {
+      const imapAuto = getAutoConfig(accountEmail);
+      const client = await connectImap(
+        accountEmail,
+        account.password,
+        imapAuto.imapHost,
+        993,
+        true
+      );
+
+      const list = await client.list();
+      const sentFolder =
+        list.find(
+          (f) =>
+            f.specialUse === '\\Sent' ||
+            /^sent$/i.test(f.name) ||
+            /enviad/i.test(f.name)
+        )?.path || 'INBOX.Sent';
+
+      const rawEmail = [
+        `From: ${accountEmail}`,
+        `To: ${data.to || ''}`,
+        `Subject: ${data.subject || '(Sin asunto)'}`,
+        `Date: ${new Date().toUTCString()}`,
+        `MIME-Version: 1.0`,
+        `Content-Type: text/html; charset=utf-8`,
+        '',
+        data.body || '',
+      ].join('\r\n');
+
+      await client.append(sentFolder, Buffer.from(rawEmail), ['\\Seen']);
+      await client.logout();
+    } catch (e) {
+      console.error('⚠️ No se pudo guardar en Enviados:', e.message);
+    }
+
+    await docRef.update({
+      status: 'sent',
+      sentAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await sendPushNotification(accountEmail, {
+      title: '✅ Correo programado enviado',
+      body: `"${data.subject}" se ha enviado a ${data.to}`,
+      data: { type: 'scheduled_sent', docId: doc.id },
+    });
+  } catch (e) {
+    console.error(`❌ Error enviando programado ${doc.id}:`, e.message);
+    await docRef.update({
+      status: 'failed',
+      error: e.message,
+      failedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  }
+}
+
+// ------------------------------------------------------------
 //  FCM PUSH
 // ------------------------------------------------------------
 async function sendPushNotification(email, payload) {
@@ -497,7 +632,7 @@ async function sendPushNotification(email, payload) {
       data: payload.data || { type: 'general' },
       android: {
         priority: 'high',
-        ttl: 60 * 60 * 1000,   // 🔥 TTL 1h para que no se quede atascado
+        ttl: 60 * 60 * 1000,
         notification: {
           channelId: 'rsmail_high_importance_channel',
           sound: 'default',
@@ -509,7 +644,7 @@ async function sendPushNotification(email, payload) {
       },
       apns: {
         headers: {
-          'apns-priority': '10',           // 🔥 máximo para iOS
+          'apns-priority': '10',
           'apns-push-type': 'alert',
         },
         payload: {
@@ -627,11 +762,10 @@ const handleAuth = (req, res) => {
 app.post('/api/login', handleAuth);
 app.post('/api/verify', handleAuth);
 
-// 🔥 /ping reanima workers caídos (aprovecha el ping de UptimeRobot)
+// /ping reanima workers caídos (aprovecha el ping de UptimeRobot)
 app.get('/ping', async (req, res) => {
   if (db) {
     try {
-      // 1) Revisar workers caídos en memoria
       const deadEmails = [];
       for (const [email, state] of activeWorkers.entries()) {
         const isAlive = state.active &&
@@ -642,7 +776,6 @@ app.get('/ping', async (req, res) => {
         }
       }
 
-      // 2) Reanimar los caídos
       for (const email of deadEmails) {
         console.log(`♻️ /ping: reanimando worker caído para ${email}`);
         const state = activeWorkers.get(email);
@@ -658,7 +791,6 @@ app.get('/ping', async (req, res) => {
         }
       }
 
-      // 3) Si no hay ningún worker pero sí cuentas, arrancarlos
       if (activeWorkers.size === 0) {
         const snapshot = await db.collection('user_accounts').get();
         if (snapshot.size > 0) {
@@ -683,7 +815,7 @@ app.get('/ping', async (req, res) => {
   });
 });
 
-// 🔥 DEBUG: ver workers activos
+// DEBUG: ver workers activos
 app.get('/api/debug/workers', (req, res) => {
   const workers = [];
   for (const [email, state] of activeWorkers.entries()) {

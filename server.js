@@ -1,4 +1,4 @@
-﻿﻿const express = require('express');
+﻿const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -455,7 +455,7 @@ cron.schedule('*/3 * * * *', async () => {
 });
 
 // ------------------------------------------------------------
-//  CRON: ENVÍO PROGRAMADO (cada minuto)
+//  CRON: ENVÍO PROGRAMADO (cada minuto) — SIN índice compuesto
 // ------------------------------------------------------------
 cron.schedule('* * * * *', async () => {
   if (!db) return;
@@ -463,18 +463,31 @@ cron.schedule('* * * * *', async () => {
   try {
     const now = new Date();
 
+    // 🔥 SIN where compuesto: leemos todos los "pending" y filtramos en JS
     const snapshot = await db
       .collection('scheduled_emails')
       .where('status', '==', 'pending')
-      .where('scheduledFor', '<=', admin.firestore.Timestamp.fromDate(now))
-      .limit(10)
+      .limit(50)
       .get();
 
     if (snapshot.empty) return;
 
-    console.log(`⏰ Procesando ${snapshot.size} correo(s) programado(s)...`);
+    const pendingToSend = [];
+    snapshot.forEach((doc) => {
+      const data = doc.data();
+      const sf = data.scheduledFor;
+      if (!sf) return;
+      const scheduledDate = sf.toDate ? sf.toDate() : new Date(sf);
+      if (scheduledDate.getTime() <= now.getTime()) {
+        pendingToSend.push(doc);
+      }
+    });
 
-    for (const doc of snapshot.docs) {
+    if (pendingToSend.length === 0) return;
+
+    console.log(`⏰ Procesando ${pendingToSend.length} correo(s) programado(s)...`);
+
+    for (const doc of pendingToSend) {
       await processScheduledEmail(doc);
     }
   } catch (e) {
@@ -503,9 +516,12 @@ async function processScheduledEmail(doc) {
 
     const account = accountSnap.data();
     const auto = getAutoConfig(accountEmail);
-    const smtpHost = account.imapHost
-      ? 'smtp.' + account.imapHost.replace(/^mail\./i, '')
-      : auto.smtpHost;
+
+    // 🔥 Usar el auto-config por dominio
+    const smtpHost = auto.smtpHost;
+    const smtpPort = auto.smtpPort;
+
+    console.log(`📮 SMTP para ${accountEmail}: ${smtpHost}:${smtpPort}`);
 
     // 🔥 Adjuntos vienen como base64 en data.attachments
     const attachments = [];
@@ -528,8 +544,8 @@ async function processScheduledEmail(doc) {
 
     const transporter = nodemailer.createTransport({
       host: smtpHost,
-      port: 587,
-      secure: false,
+      port: smtpPort,
+      secure: smtpPort === 465,
       auth: { user: accountEmail, pass: account.password },
       tls: { rejectUnauthorized: false },
     });
@@ -835,6 +851,54 @@ app.get('/api/debug/workers', (req, res) => {
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
   });
+});
+
+// 🔥 DEBUG: ver correos programados
+app.get('/api/debug/scheduled', async (req, res) => {
+  if (!db) return res.status(500).json({ error: 'Firestore no configurado' });
+  try {
+    const snap = await db.collection('scheduled_emails').get();
+    const items = [];
+    snap.forEach((doc) => {
+      const d = doc.data();
+      const sf = d.scheduledFor;
+      const sfDate = sf?.toDate ? sf.toDate() : (sf ? new Date(sf) : null);
+      items.push({
+        id: doc.id,
+        accountEmail: d.accountEmail,
+        to: d.to,
+        subject: d.subject,
+        status: d.status,
+        scheduledFor: sfDate ? sfDate.toISOString() : null,
+        scheduledForReadable: sfDate ? sfDate.toLocaleString() : null,
+        now: new Date().toISOString(),
+        overdue: sfDate ? (sfDate.getTime() <= Date.now()) : false,
+        attachmentsCount: (d.attachments || []).length,
+        error: d.error || null,
+      });
+    });
+    res.json({ count: items.length, now: new Date().toISOString(), items });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 🔥 DEBUG: resetear los "processing" colgados a "pending"
+app.get('/api/debug/reset-scheduled', async (req, res) => {
+  if (!db) return res.status(500).json({ error: 'Firestore no configurado' });
+  try {
+    const snap = await db.collection('scheduled_emails')
+      .where('status', '==', 'processing')
+      .get();
+    let reset = 0;
+    for (const doc of snap.docs) {
+      await doc.ref.update({ status: 'pending', resetAt: new Date() });
+      reset++;
+    }
+    res.json({ reset, message: `${reset} correos reseteados a pending` });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post('/api/fcm-token', async (req, res) => {

@@ -1,4 +1,4 @@
-﻿﻿﻿﻿const express = require('express');
+﻿const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -52,7 +52,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
-//  WORKERS IMAP PERSISTENTES
+//  WORKERS IMAP PERSISTENTES (con IDLE)
 // ------------------------------------------------------------
 const activeWorkers = new Map();
 
@@ -177,7 +177,7 @@ wss.on('connection', (ws) => {
 });
 
 // ------------------------------------------------------------
-//  MOTOR IMAP PERSISTENTE
+//  MOTOR IMAP PERSISTENTE CON IDLE
 // ------------------------------------------------------------
 function startImapWorker(email, password, customHost, ws = null) {
   if (activeWorkers.has(email)) {
@@ -202,7 +202,8 @@ function startImapWorker(email, password, customHost, ws = null) {
     host,
     lastUidNext: 0,
     client: null,
-    active: true
+    active: true,
+    lastAlive: Date.now(),   // para saber si está vivo
   };
 
   activeWorkers.set(email, workerState);
@@ -267,7 +268,7 @@ async function processEmailsInRange(state, startUid, endUidNext) {
 
 async function runImapLoop(state) {
   while (state.active) {
-    let lock = null;
+    let idleStarted = false;
     try {
       console.log(`🔄 [BG] Conectando IMAP para ${state.email} (${state.host})...`);
       try {
@@ -277,8 +278,28 @@ async function runImapLoop(state) {
         state.client = await connectImap(state.email, state.password, state.host, 143, false);
       }
 
-      lock = await state.client.getMailboxLock('INBOX');
+      // 🔥 Abrir INBOX explícitamente para permitir IDLE
+      await state.client.mailboxOpen('INBOX');
 
+      // 🔥 Handler para el evento IDLE (nuevos correos)
+      const handleExists = async () => {
+        try {
+          state.lastAlive = Date.now();
+          const status = await state.client.status('INBOX', { uidNext: true });
+          const currentUidNext = status.uidNext || 1;
+
+          if (currentUidNext > state.lastUidNext) {
+            console.log(`⚡ IDLE: nuevo correo detectado al instante. Rango ${state.lastUidNext} a ${currentUidNext - 1}`);
+            await processEmailsInRange(state, state.lastUidNext, currentUidNext);
+          }
+        } catch (e) {
+          console.error(`❌ Error en handleExists (${state.email}):`, e.message);
+        }
+      };
+
+      state.client.on('exists', handleExists);
+
+      // 🔥 Sync inicial por si hay correos perdidos entre reinicios
       const statusInit = await state.client.status('INBOX', { uidNext: true });
       const currentUidNext = statusInit.uidNext || 1;
 
@@ -292,19 +313,43 @@ async function runImapLoop(state) {
         await saveLastUid(state.email, currentUidNext);
       }
 
-      console.log(`📊 Monitor activo para ${state.email}. Próximo UID: ${state.lastUidNext}`);
+      console.log(`💤 Monitor IDLE activo para ${state.email}. Próximo UID: ${state.lastUidNext}`);
 
+      // Keep-alive: esperamos. El evento 'exists' hace el trabajo.
+      // Cada 30s logueamos el estado para saber que sigue vivo.
+      let aliveLogCounter = 0;
       while (state.active && state.client.usable) {
-        await new Promise(resolve => setTimeout(resolve, 8000));
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        aliveLogCounter++;
 
-        if (!state.active || !state.client.usable) break;
-
-        const currentStatus = await state.client.status('INBOX', { uidNext: true });
-
-        if (currentStatus.uidNext && currentStatus.uidNext > state.lastUidNext) {
-          console.log(`📨 Cambio en bandeja. Rango ${state.lastUidNext} a ${currentStatus.uidNext - 1}`);
-          await processEmailsInRange(state, state.lastUidNext, currentStatus.uidNext);
+        if (aliveLogCounter % 6 === 0) {
+          // Cada 30s
+          state.lastAlive = Date.now();
+          console.log(`💓 [${state.email}] IDLE activo (${Math.floor(aliveLogCounter * 5)}s)`);
         }
+
+        // 🔥 Fallback: cada 60s (12 ciclos de 5s) comprobamos manualmente
+        //    por si IDLE no funcionó en algún servidor IMAP exótico.
+        if (aliveLogCounter % 12 === 0) {
+          try {
+            const s = await state.client.status('INBOX', { uidNext: true });
+            if (s.uidNext && s.uidNext > state.lastUidNext) {
+              console.log(`🔄 Fallback poll: nuevo correo detectado (IDLE no disparó)`);
+              await processEmailsInRange(state, state.lastUidNext, s.uidNext);
+            }
+          } catch (e) {
+            // Si status falla, la conexión está muerta
+            console.log(`⚠️ Fallback poll falló, cerrando conexión: ${e.message}`);
+            break;
+          }
+        }
+      }
+
+      // Si llegamos aquí y el cliente sigue activo, salimos del bucle
+      // solo si state.active es false. Si no, probablemente la conexión
+      // se cayó y toca reconectar.
+      if (state.active && state.client.usable) {
+        console.log(`⚠️ Bucle IDLE salió pero el cliente sigue usable. Reiniciando...`);
       }
 
     } catch (e) {
@@ -312,16 +357,16 @@ async function runImapLoop(state) {
         console.log(`⚠️ IMAP caído para ${state.email}: ${e.message}`);
       }
     } finally {
-      if (lock) try { lock.release(); } catch (e) {}
       if (state.client) {
+        try { state.client.removeAllListeners('exists'); } catch (_) {}
         await state.client.logout().catch(() => {});
         state.client = null;
       }
     }
 
     if (state.active) {
-      console.log(`⏳ Reconectando IMAP ${state.email} en 15s...`);
-      await new Promise(r => setTimeout(r, 15000));
+      console.log(`⏳ Reconectando IMAP ${state.email} en 10s...`);
+      await new Promise(r => setTimeout(r, 10000));
     }
   }
 }
@@ -395,6 +440,35 @@ cron.schedule('* * * * *', async () => {
 });
 
 // ------------------------------------------------------------
+//  CRON: REANIMACIÓN DE WORKERS CAÍDOS (cada 3 min)
+// ------------------------------------------------------------
+cron.schedule('*/3 * * * *', async () => {
+  if (!db) return;
+  try {
+    const snapshot = await db.collection('user_accounts').get();
+    for (const doc of snapshot.docs) {
+      const data = doc.data();
+      if (!data.email || !data.password) continue;
+
+      const state = activeWorkers.get(data.email);
+      const isAlive = state &&
+                      state.active &&
+                      state.client &&
+                      state.client.usable;
+
+      if (!isAlive) {
+        console.log(`♻️ Cron: reanimando worker caído para ${data.email}`);
+        if (state) state.active = false;
+        activeWorkers.delete(data.email);
+        startImapWorker(data.email, data.password, data.imapHost);
+      }
+    }
+  } catch (e) {
+    console.error('⚠️ Error en cron de reanimación:', e.message);
+  }
+});
+
+// ------------------------------------------------------------
 //  FCM PUSH
 // ------------------------------------------------------------
 async function sendPushNotification(email, payload) {
@@ -423,18 +497,26 @@ async function sendPushNotification(email, payload) {
       data: payload.data || { type: 'general' },
       android: {
         priority: 'high',
+        ttl: 60 * 60 * 1000,   // 🔥 TTL 1h para que no se quede atascado
         notification: {
           channelId: 'rsmail_high_importance_channel',
           sound: 'default',
           priority: 'max',
-          visibility: 'public'
+          visibility: 'public',
+          defaultVibrateTimings: true,
+          defaultSound: true,
         }
       },
       apns: {
+        headers: {
+          'apns-priority': '10',           // 🔥 máximo para iOS
+          'apns-push-type': 'alert',
+        },
         payload: {
           aps: {
             sound: 'default',
-            badge: 1
+            badge: 1,
+            'content-available': 1,
           }
         }
       },
@@ -501,7 +583,6 @@ const handleAuth = (req, res) => {
     if (!responded) {
       responded = true;
       imap.end();
-      // 🔥 Persistir cuenta + arrancar worker
       saveAccount(email, password, targetHost);
       startImapWorker(email, password, targetHost);
       return res.json({
@@ -545,7 +626,62 @@ const handleAuth = (req, res) => {
 // ------------------------------------------------------------
 app.post('/api/login', handleAuth);
 app.post('/api/verify', handleAuth);
-app.get('/ping', (req, res) => res.json({ alive: true, ts: new Date().toISOString() }));
+
+// 🔥 /ping reanima workers caídos (aprovecha el ping de UptimeRobot)
+app.get('/ping', async (req, res) => {
+  if (db) {
+    try {
+      // 1) Revisar workers caídos en memoria
+      const deadEmails = [];
+      for (const [email, state] of activeWorkers.entries()) {
+        const isAlive = state.active &&
+                        state.client &&
+                        state.client.usable;
+        if (!isAlive) {
+          deadEmails.push(email);
+        }
+      }
+
+      // 2) Reanimar los caídos
+      for (const email of deadEmails) {
+        console.log(`♻️ /ping: reanimando worker caído para ${email}`);
+        const state = activeWorkers.get(email);
+        if (state) state.active = false;
+        activeWorkers.delete(email);
+
+        const doc = await db.collection('user_accounts').doc(email).get();
+        if (doc.exists) {
+          const data = doc.data();
+          if (data.email && data.password) {
+            startImapWorker(data.email, data.password, data.imapHost);
+          }
+        }
+      }
+
+      // 3) Si no hay ningún worker pero sí cuentas, arrancarlos
+      if (activeWorkers.size === 0) {
+        const snapshot = await db.collection('user_accounts').get();
+        if (snapshot.size > 0) {
+          console.log(`♻️ /ping: sin workers, arrancando ${snapshot.size} desde Firestore`);
+          for (const d of snapshot.docs) {
+            const data = d.data();
+            if (data.email && data.password) {
+              startImapWorker(data.email, data.password, data.imapHost);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error('⚠️ Error en /ping reanimación:', e.message);
+    }
+  }
+
+  res.json({
+    alive: true,
+    ts: new Date().toISOString(),
+    workers: activeWorkers.size,
+  });
+});
 
 // 🔥 DEBUG: ver workers activos
 app.get('/api/debug/workers', (req, res) => {
@@ -558,6 +694,7 @@ app.get('/api/debug/workers', (req, res) => {
       lastUidNext: state.lastUidNext,
       clientUsable: state.client?.usable ?? false,
       wsConnected: state.ws?.readyState === 1,
+      lastAliveAgo: Math.floor((Date.now() - (state.lastAlive || 0)) / 1000) + 's',
     });
   }
   res.json({

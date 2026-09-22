@@ -1,4 +1,4 @@
-﻿﻿const express = require('express');
+﻿﻿﻿const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -119,7 +119,9 @@ wss.on('connection', (ws) => {
 
         if (activeWorkers.has(userEmail)) {
           activeWorkers.get(userEmail).ws = ws;
+          console.log(`ℹ️ Worker ya existente para ${userEmail}, ws actualizado`);
         } else {
+          console.log(`🔧 WS login: creando worker para ${userEmail} (host=${data.imapHost || 'auto'})`);
           startImapWorker(data.email, data.password, data.imapHost, ws);
         }
       }
@@ -143,6 +145,12 @@ function startImapWorker(email, password, customHost, ws = null) {
   if (activeWorkers.has(email)) {
     const existing = activeWorkers.get(email);
     if (ws) existing.ws = ws;
+    console.log(`ℹ️ Worker ya existente para ${email}, no se reinicia`);
+    return;
+  }
+
+  if (!password) {
+    console.error(`❌ startImapWorker: SIN PASSWORD para ${email}, no se puede iniciar`);
     return;
   }
 
@@ -160,8 +168,8 @@ function startImapWorker(email, password, customHost, ws = null) {
   };
 
   activeWorkers.set(email, workerState);
-  runImapLoop(workerState);
   console.log(`✅ Worker IMAP iniciado para ${email} en ${host}`);
+  runImapLoop(workerState);
 }
 
 async function processEmailsInRange(state, startUid, endUidNext) {
@@ -176,6 +184,7 @@ async function processEmailsInRange(state, startUid, endUidNext) {
 
   try {
     const fetchRange = `${safeStartUid}:${safeEndUid}`;
+    console.log(`📥 Procesando correos en rango ${fetchRange} para ${state.email}`);
     const newIter = state.client.fetch(fetchRange, { uid: true, envelope: true }, { uid: true });
 
     for await (const msg of newIter) {
@@ -196,7 +205,7 @@ async function processEmailsInRange(state, startUid, endUidNext) {
           }));
         }
 
-        // 🔥 NOTIFICACIÓN DE NUEVO CORREO (con folder para deep link)
+        console.log(`📤 Enviando push para nuevo correo UID:${msg.uid}...`);
         await sendPushNotification(state.email, {
           title: `📧 Nuevo correo de ${from}`,
           body: subject,
@@ -226,6 +235,7 @@ async function runImapLoop(state) {
       try {
         state.client = await connectImap(state.email, state.password, state.host, 993, true);
       } catch (err) {
+        console.log(`⚠️ Puerto 993 falló, probando 143... (${err.message})`);
         state.client = await connectImap(state.email, state.password, state.host, 143, false);
       }
 
@@ -299,12 +309,17 @@ cron.schedule('* * * * *', async () => {
       const diffHours = diffMs / (1000 * 60 * 60);
       const formattedTime = eventDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
-      if (!event.email) continue;
+      // 🔥 Fallback: si no hay email propio, usar sharedEmails[0]
+      const recipientEmail = event.email ||
+        (Array.isArray(event.sharedEmails) && event.sharedEmails.length > 0
+          ? event.sharedEmails[0]
+          : null);
+      if (!recipientEmail) continue;
 
       // 🔥 RECORDATORIO 1 DÍA ANTES
       if (!event.notified1Day && diffHours <= 24 && diffHours > 0.5) {
-        console.log(`📅 Recordatorio 1 DÍA ANTES para: ${event.title}`);
-        await sendPushNotification(event.email, {
+        console.log(`📅 Recordatorio 1 DÍA ANTES para: ${event.title} → ${recipientEmail}`);
+        await sendPushNotification(recipientEmail, {
           title: `📅 Mañana: ${event.title}`,
           body: `Tienes este evento programado para mañana a las ${formattedTime}`,
           data: {
@@ -321,8 +336,8 @@ cron.schedule('* * * * *', async () => {
 
       // 🔥 RECORDATORIO 15 MIN ANTES
       if (!event.notifiedEvent && diffMs <= 15 * 60 * 1000 && diffMs > 0) {
-        console.log(`⏰ Recordatorio 15 MIN ANTES para: ${event.title}`);
-        await sendPushNotification(event.email, {
+        console.log(`⏰ Recordatorio 15 MIN ANTES para: ${event.title} → ${recipientEmail}`);
+        await sendPushNotification(recipientEmail, {
           title: `⏰ Comienza pronto: ${event.title}`,
           body: event.description || `El evento comienza a las ${formattedTime}`,
           data: {
@@ -346,7 +361,10 @@ cron.schedule('* * * * *', async () => {
 //  FCM PUSH
 // ------------------------------------------------------------
 async function sendPushNotification(email, payload) {
-  if (!db) return;
+  if (!db) {
+    console.log('⚠️ sendPushNotification: sin db');
+    return;
+  }
 
   try {
     const tokensSnapshot = await db.collection('fcm_tokens').where('email', '==', email).get();
@@ -357,6 +375,8 @@ async function sendPushNotification(email, payload) {
 
     const tokens = [];
     tokensSnapshot.forEach(doc => tokens.push(doc.data().token));
+
+    console.log(`🚀 Enviando push a ${tokens.length} token(s) para ${email}`);
 
     const message = {
       notification: {
@@ -385,7 +405,7 @@ async function sendPushNotification(email, payload) {
     };
 
     const response = await admin.messaging().sendEachForMulticast(message);
-    console.log(`🚀 Push enviado a ${tokens.length} dispositivo(s) para ${email}`);
+    console.log(`✅ Push enviado a ${tokens.length} dispositivo(s) para ${email} | éxito: ${response.successCount}, fallos: ${response.failureCount}`);
 
     if (response.failureCount > 0) {
       const failedTokens = [];
@@ -488,6 +508,27 @@ app.post('/api/login', handleAuth);
 app.post('/api/verify', handleAuth);
 app.get('/ping', (req, res) => res.json({ alive: true }));
 
+// 🔥 DEBUG: ver workers activos
+app.get('/api/debug/workers', (req, res) => {
+  const workers = [];
+  for (const [email, state] of activeWorkers.entries()) {
+    workers.push({
+      email,
+      host: state.host,
+      active: state.active,
+      lastUidNext: state.lastUidNext,
+      clientUsable: state.client?.usable ?? false,
+      wsConnected: state.ws?.readyState === 1,
+    });
+  }
+  res.json({
+    count: workers.length,
+    workers,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
 app.post('/api/fcm-token', async (req, res) => {
   const { email, token, password, imapHost } = req.body;
   if (!email || !token) return res.status(400).json({ success: false, error: 'Email y token requeridos' });
@@ -505,7 +546,10 @@ app.post('/api/fcm-token', async (req, res) => {
     console.log(`📱 Token FCM actualizado en Firestore para ${email}`);
 
     if (password) {
+      console.log(`🔧 fcm-token: iniciando worker para ${email} (host=${imapHost || 'auto'})`);
       startImapWorker(email, password, imapHost);
+    } else {
+      console.log(`⚠️ fcm-token: sin password para ${email}, NO se inicia worker`);
     }
 
     res.json({ success: true });
@@ -636,9 +680,6 @@ app.post('/api/folders', async (req, res) => {
   }
 });
 
-// ------------------------------------------------------------
-//  DETECCIÓN DE ADJUNTOS EN bodyStructure
-// ------------------------------------------------------------
 function detectAttachmentsFromStructure(structure) {
   if (!structure) return false;
   const stack = [structure];
@@ -665,9 +706,6 @@ function detectAttachmentsFromStructure(structure) {
   return false;
 }
 
-// ------------------------------------------------------------
-//  ENDPOINT /api/messages (con detección de adjuntos + fix flags)
-// ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
   const auto = getAutoConfig(email);
@@ -850,9 +888,6 @@ app.post('/api/toggle-read', async (req, res) => {
   }
 });
 
-// ------------------------------------------------------------
-//  MARCAR TODOS COMO LEÍDOS
-// ------------------------------------------------------------
 app.post('/api/mark-all-read', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX' } = req.body;
   if (!email || !password) {
@@ -953,10 +988,6 @@ app.post('/api/download-attachment', async (req, res) => {
     res.status(500).json({ success: false, error: e.message });
   }
 });
-
-// ============================================================
-//  GESTIÓN DE SUSCRIPCIONES
-// ============================================================
 
 function analyzeIsSubscription({ from, subject, listUnsubscribe }) {
   if (listUnsubscribe && listUnsubscribe.trim().length > 0) return true;
@@ -1177,8 +1208,5 @@ app.post('/api/unsubscribe', async (req, res) => {
   }
 });
 
-// ------------------------------------------------------------
-//  INICIAR SERVIDOR
-// ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`✅ Backend RSMAIL activo en puerto ${PORT}`));

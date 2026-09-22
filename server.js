@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -625,10 +625,47 @@ app.post('/api/folders', async (req, res) => {
   }
 });
 
+// ------------------------------------------------------------
+//  DETECCIÓN DE ADJUNTOS EN bodyStructure
+// ------------------------------------------------------------
+function detectAttachmentsFromStructure(structure) {
+  if (!structure) return false;
+  const stack = [structure];
+
+  while (stack.length) {
+    const part = stack.pop();
+    if (!part) continue;
+
+    // Disposition: "attachment" → adjunto clásico
+    const disp = (part.disposition || '').toString().toLowerCase();
+    if (disp === 'attachment') return true;
+
+    // Nombre de archivo en parámetros de disposición
+    if (part.dispositionParameters && part.dispositionParameters.filename) {
+      return true;
+    }
+
+    // Nombre en parámetros (típico en adjuntos inline con name="...")
+    if (part.parameters && part.parameters.name) {
+      return true;
+    }
+
+    // Recursión en hijos
+    if (Array.isArray(part.childNodes)) {
+      for (const child of part.childNodes) stack.push(child);
+    }
+  }
+  return false;
+}
+
+// ------------------------------------------------------------
+//  ENDPOINT /api/messages (con detección de adjuntos + fix flags)
+// ------------------------------------------------------------
 app.post('/api/messages', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
   const auto = getAutoConfig(email);
   const targetHost = host || auto.imapHost;
+
   let client;
   try {
     try {
@@ -636,22 +673,37 @@ app.post('/api/messages', async (req, res) => {
     } catch (err) {
       client = await connectImap(email, password, targetHost, 143, false);
     }
+
     const lock = await client.getMailboxLock(folder);
     const messages = [];
 
     try {
-      const iter = client.fetch('1:*', { envelope: true, flags: true }, { max: limit, reverse: true });
+      const iter = client.fetch(
+        '1:*',
+        { envelope: true, flags: true, bodyStructure: true },
+        { max: limit, reverse: true }
+      );
+
       for await (const msg of iter) {
-        let flags = msg.flags || [];
-        if (!Array.isArray(flags)) flags = Object.values(flags);
+        // 🔥 FIX: imapflow devuelve flags como Set, no como Array
+        let flags = msg.flags;
+        if (flags instanceof Set) {
+          flags = Array.from(flags);
+        } else if (!Array.isArray(flags)) {
+          flags = [];
+        }
+
+        // 🔥 NUEVO: detección real de adjuntos desde bodyStructure
+        const hasAttachments = detectAttachmentsFromStructure(msg.bodyStructure);
+
         messages.push({
           uid: msg.uid,
           id: msg.uid.toString(),
-          subject: msg.envelope.subject || '(Sin asunto)',
-          from: msg.envelope.from?.[0]?.address || msg.envelope.from?.[0]?.name || '',
-          to: msg.envelope.to?.[0]?.address || '',
-          date: msg.envelope.date ? new Date(msg.envelope.date).toISOString() : new Date().toISOString(),
-          hasAttachments: false,
+          subject: msg.envelope?.subject || '(Sin asunto)',
+          from: msg.envelope?.from?.[0]?.address || msg.envelope?.from?.[0]?.name || '',
+          to: msg.envelope?.to?.[0]?.address || '',
+          date: msg.envelope?.date ? new Date(msg.envelope.date).toISOString() : new Date().toISOString(),
+          hasAttachments,
           flags,
           isRead: flags.includes('\\Seen'),
           isFlagged: flags.includes('\\Flagged'),
@@ -787,6 +839,51 @@ app.post('/api/toggle-read', async (req, res) => {
     }
     await client.logout();
     res.json({ success: true });
+  } catch (e) {
+    if (client) await client.logout().catch(() => {});
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ------------------------------------------------------------
+//  MARCAR TODOS COMO LEÍDOS
+// ------------------------------------------------------------
+app.post('/api/mark-all-read', async (req, res) => {
+  const { email, password, host, port, folder = 'INBOX' } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ success: false, error: 'Faltan parámetros' });
+  }
+  const auto = getAutoConfig(email);
+  const targetHost = host || auto.imapHost;
+
+  let client;
+  try {
+    try {
+      client = await connectImap(email, password, targetHost, Number(port) || auto.imapPort, true);
+    } catch (err) {
+      client = await connectImap(email, password, targetHost, 143, false);
+    }
+
+    const lock = await client.getMailboxLock(folder);
+    let total = 0;
+    try {
+      const uids = [];
+      const iter = client.fetch('1:*', { uid: true }, { uid: true });
+      for await (const msg of iter) {
+        if (msg.uid) uids.push(msg.uid);
+      }
+      total = uids.length;
+
+      if (total > 0) {
+        await client.messageFlagsAdd(uids, ['\\Seen'], { uid: true });
+      }
+    } finally {
+      lock.release();
+    }
+
+    await client.logout();
+    console.log(`✅ Marcados ${total} correos como leídos en ${folder} para ${email}`);
+    res.json({ success: true, marked: total });
   } catch (e) {
     if (client) await client.logout().catch(() => {});
     res.status(500).json({ success: false, error: e.message });
@@ -1005,7 +1102,6 @@ app.post('/api/unsubscribe', async (req, res) => {
     let method = null;
     let result = null;
 
-    // 1) POST one-click (RFC 8058)
     if (parsed.http.length > 0 && isOneClick) {
       try {
         const r = await fetch(parsed.http[0], {
@@ -1024,7 +1120,6 @@ app.post('/api/unsubscribe', async (req, res) => {
       }
     }
 
-    // 2) GET HTTPS
     if (!result && parsed.http.length > 0) {
       try {
         const r = await fetch(parsed.http[0], {
@@ -1040,7 +1135,6 @@ app.post('/api/unsubscribe', async (req, res) => {
       }
     }
 
-    // 3) mailto:
     if (!result && parsed.mailto.length > 0) {
       const mailtoUrl = parsed.mailto[0].replace(/^mailto:/i, '');
       const [address, query] = mailtoUrl.split('?');

@@ -1,4 +1,4 @@
-﻿﻿﻿const express = require('express');
+﻿﻿﻿﻿const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -55,6 +55,44 @@ const wss = new WebSocket.Server({ server });
 //  WORKERS IMAP PERSISTENTES
 // ------------------------------------------------------------
 const activeWorkers = new Map();
+
+// ------------------------------------------------------------
+//  PERSISTENCIA DE CUENTAS (auto-arranque de workers)
+// ------------------------------------------------------------
+async function saveAccount(email, password, imapHost) {
+  if (!db) return;
+  try {
+    await db.collection('user_accounts').doc(email).set({
+      email,
+      password,
+      imapHost,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+  } catch (e) {
+    console.error(`⚠️ Error guardando cuenta ${email}:`, e.message);
+  }
+}
+
+async function restoreWorkers() {
+  if (!db) {
+    console.log('⚠️ Sin Firestore, no se restauran workers');
+    return;
+  }
+  try {
+    const snapshot = await db.collection('user_accounts').get();
+    console.log(`🔄 Restaurando ${snapshot.size} worker(s) desde Firestore...`);
+    for (const doc of snapshot.docs) {
+      const data = doc.data();
+      if (data.email && data.password) {
+        console.log(`  → Arrancando worker para ${data.email}`);
+        startImapWorker(data.email, data.password, data.imapHost);
+      }
+    }
+    console.log(`✅ Restauración de workers completada`);
+  } catch (e) {
+    console.error('⚠️ Error restaurando workers:', e.message);
+  }
+}
 
 async function getSavedLastUid(email) {
   if (!db) return null;
@@ -309,16 +347,15 @@ cron.schedule('* * * * *', async () => {
       const diffHours = diffMs / (1000 * 60 * 60);
       const formattedTime = eventDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
-      // 🔥 Fallback: si no hay email propio, usar sharedEmails[0]
       const recipientEmail = event.email ||
         (Array.isArray(event.sharedEmails) && event.sharedEmails.length > 0
           ? event.sharedEmails[0]
           : null);
       if (!recipientEmail) continue;
 
-      // 🔥 RECORDATORIO 1 DÍA ANTES
-      if (!event.notified1Day && diffHours <= 24 && diffHours > 0.5) {
-        console.log(`📅 Recordatorio 1 DÍA ANTES para: ${event.title} → ${recipientEmail}`);
+      // 🔥 RECORDATORIO 1 DÍA ANTES (ventana 23-25h)
+      if (!event.notified1Day && diffHours <= 25 && diffHours > 23) {
+        console.log(`📅 Recordatorio 1 DÍA ANTES para: ${event.title} → ${recipientEmail} (faltan ${diffHours.toFixed(1)}h)`);
         await sendPushNotification(recipientEmail, {
           title: `📅 Mañana: ${event.title}`,
           body: `Tienes este evento programado para mañana a las ${formattedTime}`,
@@ -464,6 +501,8 @@ const handleAuth = (req, res) => {
     if (!responded) {
       responded = true;
       imap.end();
+      // 🔥 Persistir cuenta + arrancar worker
+      saveAccount(email, password, targetHost);
       startImapWorker(email, password, targetHost);
       return res.json({
         success: true,
@@ -506,7 +545,7 @@ const handleAuth = (req, res) => {
 // ------------------------------------------------------------
 app.post('/api/login', handleAuth);
 app.post('/api/verify', handleAuth);
-app.get('/ping', (req, res) => res.json({ alive: true }));
+app.get('/ping', (req, res) => res.json({ alive: true, ts: new Date().toISOString() }));
 
 // 🔥 DEBUG: ver workers activos
 app.get('/api/debug/workers', (req, res) => {
@@ -547,6 +586,7 @@ app.post('/api/fcm-token', async (req, res) => {
 
     if (password) {
       console.log(`🔧 fcm-token: iniciando worker para ${email} (host=${imapHost || 'auto'})`);
+      saveAccount(email, password, imapHost);
       startImapWorker(email, password, imapHost);
     } else {
       console.log(`⚠️ fcm-token: sin password para ${email}, NO se inicia worker`);
@@ -1209,4 +1249,7 @@ app.post('/api/unsubscribe', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`✅ Backend RSMAIL activo en puerto ${PORT}`));
+server.listen(PORT, async () => {
+  console.log(`✅ Backend RSMAIL activo en puerto ${PORT}`);
+  await restoreWorkers();
+});

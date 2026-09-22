@@ -1,4 +1,4 @@
-﻿const express = require('express');
+﻿﻿const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -64,7 +64,6 @@ function getAutoConfig(email) {
   const domain = email.split('@')[1]?.toLowerCase();
   if (!domain) return null;
 
-  // 📧 Proveedores conocidos
   if (domain === 'gmail.com' || domain === 'googlemail.com') {
     return {
       imapHost: 'imap.gmail.com', imapPort: 993,
@@ -122,8 +121,6 @@ function getAutoConfig(email) {
     };
   }
 
-  // 🌐 Dominio propio (hosting propio, cPanel, Plesk, etc.)
-  // Se prueba primero con "mail.dominio.com" y como fallback el propio dominio
   return {
     imapHost: 'mail.' + domain, imapPort: 993,
     smtpHost: 'mail.' + domain, smtpPort: 465, smtpSecure: true,
@@ -132,7 +129,7 @@ function getAutoConfig(email) {
   };
 }
 
-// 🔥 Devuelve varios candidatos SMTP para probar en orden
+// 🔥 Candidatos SMTP
 function getSmtpCandidates(email) {
   const auto = getAutoConfig(email);
   if (!auto) return [];
@@ -146,18 +143,13 @@ function getSmtpCandidates(email) {
     candidates.push({ host, port, secure });
   };
 
-  // 1) Config oficial del proveedor
   add(auto.smtpHost, auto.smtpPort, auto.smtpSecure);
-
-  // 2) Alternativas del mismo host
   add(auto.smtpHost, 465, true);
   add(auto.smtpHost, 587, false);
   add(auto.smtpHost, 25, false);
 
-  // 3) Para dominios propios, probar variantes
   if (auto.provider === 'custom' && auto.domain) {
     const d = auto.domain;
-    // Variantes típicas de hosting español / cPanel
     add('smtp.' + d, 465, true);
     add('smtp.' + d, 587, false);
     add('mail.' + d, 465, true);
@@ -170,7 +162,7 @@ function getSmtpCandidates(email) {
   return candidates;
 }
 
-// 🔥 Devuelve varios candidatos IMAP para probar en orden
+// 🔥 Candidatos IMAP
 function getImapCandidates(email) {
   const auto = getAutoConfig(email);
   if (!auto) return [];
@@ -199,7 +191,7 @@ function getImapCandidates(email) {
 }
 
 // ------------------------------------------------------------
-//  PERSISTENCIA DE CUENTAS (auto-arranque de workers)
+//  PERSISTENCIA DE CUENTAS
 // ------------------------------------------------------------
 async function saveAccount(email, password, imapHost) {
   if (!db) return;
@@ -283,11 +275,9 @@ async function connectImap(email, password, host, port, secure) {
   return client;
 }
 
-// 🔥 Conexión IMAP con fallback automático de candidatos
 async function connectImapAuto(email, password, preferredHost = null) {
   const candidates = getImapCandidates(email);
 
-  // Si el usuario pasó un host específico, lo probamos primero
   if (preferredHost) {
     candidates.unshift({ host: preferredHost, port: 993, secure: true });
     candidates.unshift({ host: preferredHost, port: 143, secure: false });
@@ -438,7 +428,6 @@ async function runImapLoop(state) {
     try {
       console.log(`🔄 [BG] Conectando IMAP para ${state.email}...`);
 
-      // 🔥 Conexión con fallback automático
       const conn = await connectImapAuto(state.email, state.password, state.host);
       state.client = conn.client;
       state.host = conn.host;
@@ -620,7 +609,7 @@ cron.schedule('*/3 * * * *', async () => {
 });
 
 // ------------------------------------------------------------
-//  CRON: ENVÍO PROGRAMADO (cada minuto) — SIN índice compuesto
+//  CRON: RECORDATORIOS DE CORREO (cada minuto)
 // ------------------------------------------------------------
 cron.schedule('* * * * *', async () => {
   if (!db) return;
@@ -628,191 +617,89 @@ cron.schedule('* * * * *', async () => {
   try {
     const now = new Date();
 
+    // 🔥 Sin índice compuesto: filtramos en JS
     const snapshot = await db
-      .collection('scheduled_emails')
+      .collection('email_reminders')
       .where('status', '==', 'pending')
-      .limit(50)
+      .limit(100)
       .get();
 
     if (snapshot.empty) return;
 
-    const pendingToSend = [];
+    const toSend = [];
     snapshot.forEach((doc) => {
       const data = doc.data();
-      const sf = data.scheduledFor;
-      if (!sf) return;
-      const scheduledDate = sf.toDate ? sf.toDate() : new Date(sf);
-      if (scheduledDate.getTime() <= now.getTime()) {
-        pendingToSend.push(doc);
+      const ra = data.remindAt;
+      if (!ra) return;
+      const remindDate = ra.toDate ? ra.toDate() : new Date(ra);
+      if (remindDate.getTime() <= now.getTime()) {
+        toSend.push(doc);
       }
     });
 
-    if (pendingToSend.length === 0) return;
+    if (toSend.length === 0) return;
 
-    console.log(`⏰ Procesando ${pendingToSend.length} correo(s) programado(s)...`);
+    console.log(`🔔 Procesando ${toSend.length} recordatorio(s) de correo...`);
 
-    for (const doc of pendingToSend) {
-      await processScheduledEmail(doc);
+    for (const doc of toSend) {
+      const data = doc.data();
+      const docRef = doc.ref;
+
+      try {
+        const accountEmail = data.accountEmail;
+        if (!accountEmail) {
+          await docRef.update({
+            status: 'failed',
+            error: 'Sin cuenta asociada',
+          });
+          continue;
+        }
+
+        await docRef.update({ status: 'processing' });
+
+        const from = data.emailFrom || 'remitente';
+        const subject = data.emailSubject || '(Sin asunto)';
+        const note = data.note || '';
+
+        const title = note.isNotEmpty
+          ? `🔔 ${note}`
+          : `🔔 Recordatorio: ${subject}`;
+        const body = note.isNotEmpty
+          ? `Correo de ${from}: ${subject}`
+          : `Correo de ${from}`;
+
+        console.log(`📤 Enviando recordatorio: ${subject} → ${accountEmail}`);
+
+        await sendPushNotification(accountEmail, {
+          title: title,
+          body: body,
+          data: {
+            type: 'email_reminder',
+            uid: String(data.emailUid || ''),
+            folder: data.emailFolder || 'INBOX',
+            subject: subject,
+            sender: from,
+          }
+        });
+
+        await docRef.update({
+          status: 'sent',
+          sentAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+        console.log(`✅ Recordatorio enviado: "${subject}"`);
+      } catch (e) {
+        console.error(`❌ Error recordatorio ${doc.id}:`, e.message);
+        await docRef.update({
+          status: 'failed',
+          error: e.message,
+        });
+      }
     }
   } catch (e) {
-    console.error('❌ Error en cron de programados:', e.message);
+    console.error('❌ Error en cron de recordatorios:', e.message);
   }
 });
-
-async function processScheduledEmail(doc) {
-  const data = doc.data();
-  const docRef = doc.ref;
-  const docId = doc.id;
-
-  // 🔥 Bloqueo atómico: verificar que sigue en "pending"
-  try {
-    const fresh = await docRef.get();
-    if (!fresh.exists) return;
-    const freshStatus = fresh.data()?.status;
-    if (freshStatus !== 'pending') {
-      console.log(`⏭️ Doc ${docId} ya está en "${freshStatus}", saltando`);
-      return;
-    }
-    await docRef.update({
-      status: 'processing',
-      processingStartedAt: new Date(),
-    });
-  } catch (e) {
-    console.error(`❌ No se pudo bloquear ${docId}:`, e.message);
-    return;
-  }
-
-  try {
-    const accountEmail = data.accountEmail;
-    if (!accountEmail) throw new Error('Sin cuenta emisora');
-
-    const accountSnap = await db
-      .collection('user_accounts')
-      .doc(accountEmail)
-      .get();
-    if (!accountSnap.exists) throw new Error(`No hay cuenta para ${accountEmail}`);
-
-    const account = accountSnap.data();
-
-    // 🔥 Preparar adjuntos base64
-    const attachments = [];
-    const rawAttachments = data.attachments || [];
-
-    for (const att of rawAttachments) {
-      try {
-        if (att.content && att.filename) {
-          attachments.push({
-            filename: att.filename,
-            content: Buffer.from(att.content, 'base64'),
-            contentType: att.contentType || 'application/octet-stream',
-          });
-          console.log(`📎 Adjunto preparado: ${att.filename}`);
-        }
-      } catch (e) {
-        console.error(`⚠️ Error procesando adjunto:`, e.message);
-      }
-    }
-
-    // 🔥 Probar varios puertos/hosts SMTP automáticamente
-    const smtpCandidates = getSmtpCandidates(accountEmail);
-    console.log(`📮 SMTP: probando ${smtpCandidates.length} combinaciones para ${accountEmail}...`);
-
-    let sent = false;
-    let lastError = null;
-    let workingConfig = null;
-
-    for (const c of smtpCandidates) {
-      try {
-        console.log(`   → Probando ${c.host}:${c.port} (secure=${c.secure})...`);
-
-        const transporter = nodemailer.createTransport({
-          host: c.host,
-          port: c.port,
-          secure: c.secure,
-          auth: { user: accountEmail, pass: account.password },
-          tls: { rejectUnauthorized: false },
-          connectionTimeout: 15000,
-          greetingTimeout: 15000,
-          socketTimeout: 20000,
-        });
-
-        await transporter.verify();
-
-        await transporter.sendMail({
-          from: accountEmail,
-          to: data.to,
-          cc: data.cc || undefined,
-          bcc: data.bcc || undefined,
-          subject: data.subject || '(Sin asunto)',
-          html: data.body || '',
-          attachments,
-        });
-
-        console.log(`✅ Programado enviado vía ${c.host}:${c.port} → "${data.subject}" a ${data.to}`);
-        sent = true;
-        workingConfig = c;
-        break;
-      } catch (e) {
-        console.log(`   ⚠️ ${c.host}:${c.port} → ${e.message}`);
-        lastError = e;
-      }
-    }
-
-    if (!sent) {
-      throw lastError || new Error('Todos los intentos SMTP fallaron');
-    }
-
-    // Guardar en Enviados
-    try {
-      const imapConn = await connectImapAuto(accountEmail, account.password);
-      const client = imapConn.client;
-
-      const list = await client.list();
-      const sentFolder =
-        list.find(
-          (f) =>
-            f.specialUse === '\\Sent' ||
-            /^sent$/i.test(f.name) ||
-            /enviad/i.test(f.name)
-        )?.path || 'INBOX.Sent';
-
-      const rawEmail = [
-        `From: ${accountEmail}`,
-        `To: ${data.to || ''}`,
-        `Subject: ${data.subject || '(Sin asunto)'}`,
-        `Date: ${new Date().toUTCString()}`,
-        `MIME-Version: 1.0`,
-        `Content-Type: text/html; charset=utf-8`,
-        '',
-        data.body || '',
-      ].join('\r\n');
-
-      await client.append(sentFolder, Buffer.from(rawEmail), ['\\Seen']);
-      await client.logout();
-    } catch (e) {
-      console.error('⚠️ No se pudo guardar en Enviados:', e.message);
-    }
-
-    await docRef.update({
-      status: 'sent',
-      sentAt: admin.firestore.FieldValue.serverTimestamp(),
-      sentVia: workingConfig ? `${workingConfig.host}:${workingConfig.port}` : null,
-    });
-
-    await sendPushNotification(accountEmail, {
-      title: '✅ Correo programado enviado',
-      body: `"${data.subject}" se ha enviado a ${data.to}`,
-      data: { type: 'scheduled_sent', docId },
-    });
-  } catch (e) {
-    console.error(`❌ Error enviando programado ${docId}:`, e.message);
-    await docRef.update({
-      status: 'failed',
-      error: e.message,
-      failedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-  }
-}
 
 // ------------------------------------------------------------
 //  FCM PUSH
@@ -1012,55 +899,6 @@ app.get('/api/debug/workers', (req, res) => {
   });
 });
 
-// DEBUG: ver correos programados
-app.get('/api/debug/scheduled', async (req, res) => {
-  if (!db) return res.status(500).json({ error: 'Firestore no configurado' });
-  try {
-    const snap = await db.collection('scheduled_emails').get();
-    const items = [];
-    snap.forEach((doc) => {
-      const d = doc.data();
-      const sf = d.scheduledFor;
-      const sfDate = sf?.toDate ? sf.toDate() : (sf ? new Date(sf) : null);
-      items.push({
-        id: doc.id,
-        accountEmail: d.accountEmail,
-        to: d.to,
-        subject: d.subject,
-        status: d.status,
-        scheduledFor: sfDate ? sfDate.toISOString() : null,
-        scheduledForReadable: sfDate ? sfDate.toLocaleString() : null,
-        now: new Date().toISOString(),
-        overdue: sfDate ? (sfDate.getTime() <= Date.now()) : false,
-        attachmentsCount: (d.attachments || []).length,
-        sentVia: d.sentVia || null,
-        error: d.error || null,
-      });
-    });
-    res.json({ count: items.length, now: new Date().toISOString(), items });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// DEBUG: resetear processing colgados
-app.get('/api/debug/reset-scheduled', async (req, res) => {
-  if (!db) return res.status(500).json({ error: 'Firestore no configurado' });
-  try {
-    const snap = await db.collection('scheduled_emails')
-      .where('status', '==', 'processing')
-      .get();
-    let reset = 0;
-    for (const doc of snap.docs) {
-      await doc.ref.update({ status: 'pending', resetAt: new Date() });
-      reset++;
-    }
-    res.json({ reset, message: `${reset} correos reseteados a pending` });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 // DEBUG: ver configuración auto para un email
 app.get('/api/debug/auto-config/:email', (req, res) => {
   const email = req.params.email;
@@ -1075,6 +913,34 @@ app.get('/api/debug/auto-config/:email', (req, res) => {
     imapCandidates,
     smtpCandidates,
   });
+});
+
+// DEBUG: ver recordatorios de correo
+app.get('/api/debug/reminders', async (req, res) => {
+  if (!db) return res.status(500).json({ error: 'Firestore no configurado' });
+  try {
+    const snap = await db.collection('email_reminders').get();
+    const items = [];
+    snap.forEach((doc) => {
+      const d = doc.data();
+      const ra = d.remindAt;
+      const raDate = ra?.toDate ? ra.toDate() : (ra ? new Date(ra) : null);
+      items.push({
+        id: doc.id,
+        accountEmail: d.accountEmail,
+        subject: d.emailSubject,
+        from: d.emailFrom,
+        note: d.note,
+        status: d.status,
+        remindAt: raDate ? raDate.toISOString() : null,
+        overdue: raDate ? (raDate.getTime() <= Date.now()) : false,
+        error: d.error || null,
+      });
+    });
+    res.json({ count: items.length, now: new Date().toISOString(), items });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post('/api/fcm-token', async (req, res) => {
@@ -1701,6 +1567,9 @@ app.post('/api/unsubscribe', async (req, res) => {
   }
 });
 
+// ------------------------------------------------------------
+//  INICIAR SERVIDOR
+// ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, async () => {
   console.log(`✅ Backend RSMAIL activo en puerto ${PORT}`);

@@ -1,4 +1,4 @@
-﻿﻿const express = require('express');
+﻿﻿﻿﻿const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -522,7 +522,7 @@ async function checkAndSendAutoReply({
 // ------------------------------------------------------------
 //  MOTOR DE REGLAS / FILTROS
 // ------------------------------------------------------------
-const _rulesCache = new Map(); // email -> { rules, expiresAt }
+const _rulesCache = new Map();
 const RULES_CACHE_TTL_MS = 5 * 60 * 1000;
 
 async function getRulesForAccount(email) {
@@ -609,7 +609,6 @@ async function executeRuleActions({
 
     const lock = await client.getMailboxLock(folder);
     try {
-      // FASE 1: flags antes de mover
       for (const a of actions) {
         const t = a.type;
         if (t === 'markRead') {
@@ -623,7 +622,6 @@ async function executeRuleActions({
         }
       }
 
-      // FASE 2: mover / borrar / spam
       for (const a of actions) {
         const t = a.type;
         const v = a.value || '';
@@ -769,9 +767,9 @@ async function applyRulesToMessage({
 // ------------------------------------------------------------
 //  TRADUCCIÓN AUTOMÁTICA
 // ------------------------------------------------------------
-const _translateCache = new Map(); // hash -> { translated, ts }
-const TRANSLATE_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6h
-const GOOGLE_HARD_LIMIT = 4500; // Google público ~5000, dejamos margen
+const _translateCache = new Map();
+const TRANSLATE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const GOOGLE_HARD_LIMIT = 4500;
 
 function _simpleHash(s) {
   let h = 0;
@@ -825,8 +823,6 @@ async function libreTranslate(text, target, source = 'auto', format = 'text') {
   };
 }
 
-/// Trocea un texto largo en chunks seguros para Google,
-/// intentando no cortar tags HTML ni palabras a medias.
 function _chunkText(text, maxLen = GOOGLE_HARD_LIMIT) {
   if (text.length <= maxLen) return [text];
 
@@ -840,7 +836,6 @@ function _chunkText(text, maxLen = GOOGLE_HARD_LIMIT) {
     }
 
     let cutAt = i + maxLen;
-    // Buscar un punto "seguro" hacia atrás
     const lowerBound = i + Math.floor(maxLen * 0.6);
     for (let k = cutAt; k > lowerBound; k--) {
       const c = text[k];
@@ -858,8 +853,6 @@ function _chunkText(text, maxLen = GOOGLE_HARD_LIMIT) {
   return chunks;
 }
 
-/// Traduce un texto en trozos si es necesario. Devuelve
-/// { translated, detectedSource, chunked }
 async function translateInChunks(text, target, source, format) {
   if (text.length <= GOOGLE_HARD_LIMIT) {
     let r;
@@ -892,7 +885,6 @@ async function translateInChunks(text, target, source, format) {
       try {
         r = await libreTranslate(chunk, target, source, format);
       } catch (e2) {
-        // último recurso: devolver el original de este trozo
         parts.push(chunk);
         continue;
       }
@@ -923,7 +915,6 @@ app.post('/api/translate', async (req, res) => {
       return res.status(400).json({ error: 'text_required' });
     }
 
-    // 🔥 Subimos el límite a 200 KB (el cliente ya trocea, esto es red de seguridad)
     if (text.length > 200000) {
       return res.status(413).json({
         error: 'text_too_long',
@@ -935,7 +926,6 @@ app.post('/api/translate', async (req, res) => {
     const cacheKey = `${target}_${source}_${format}_${_simpleHash(text)}`;
     const now = Date.now();
 
-    // 1. Cache memoria
     const cached = _translateCache.get(cacheKey);
     if (cached && now - cached.ts < TRANSLATE_CACHE_TTL_MS) {
       return res.json({
@@ -945,7 +935,6 @@ app.post('/api/translate', async (req, res) => {
       });
     }
 
-    // 2. Firestore
     if (db) {
       try {
         const doc = await db.collection('translation_cache').doc(cacheKey).get();
@@ -965,7 +954,6 @@ app.post('/api/translate', async (req, res) => {
       } catch (_) {}
     }
 
-    // 3. Traducir (con troceo automático si hace falta)
     let result;
     try {
       result = await translateInChunks(text, target, source, format);
@@ -974,7 +962,6 @@ app.post('/api/translate', async (req, res) => {
       return res.status(502).json({ error: 'translate_failed', message: e.message });
     }
 
-    // 4. Caches
     _translateCache.set(cacheKey, {
       translated: result.translated,
       detectedSource: result.detectedSource,
@@ -1004,7 +991,6 @@ app.post('/api/translate', async (req, res) => {
   }
 });
 
-// Limpieza de cache de traducción antigua (cada 12h)
 cron.schedule('0 */12 * * *', async () => {
   if (!db) return;
   try {
@@ -1120,7 +1106,6 @@ async function processEmailsInRange(state, startUid, endUidNext) {
 
         console.log(`🔔 Correo entrante UID:${msg.uid} | De: ${from} | Asunto: ${subject}`);
 
-        // 🔥 REGLAS: aplicar antes de notificar
         try {
           const rules = await getRulesForAccount(state.email);
           if (rules.length > 0) {
@@ -1175,7 +1160,6 @@ async function processEmailsInRange(state, startUid, endUidNext) {
           }
         });
 
-        // 🔥 AUTO-RESPUESTA (AUSENCIAS/VACACIONES)
         await checkAndSendAutoReply({
           accountEmail: state.email,
           accountPassword: state.password,
@@ -1945,7 +1929,6 @@ const handleAuth = async (req, res) => {
 app.post('/api/login', handleAuth);
 app.post('/api/verify', handleAuth);
 
-// 🔥 Reglas: invalidar caché
 app.post('/api/rules/invalidate', (req, res) => {
   const { email } = req.body || {};
   if (email) _rulesCache.delete(email);
@@ -2036,7 +2019,6 @@ app.get('/api/debug/auto-config/:email', (req, res) => {
   });
 });
 
-// 🔥 Reglas: debug
 app.get('/api/debug/rules/:email', async (req, res) => {
   if (!db) return res.status(500).json({ error: 'Firestore no configurado' });
   try {
@@ -2049,7 +2031,6 @@ app.get('/api/debug/rules/:email', async (req, res) => {
   }
 });
 
-// 🔥 Traducción: debug
 app.get('/api/debug/translate/:email', async (req, res) => {
   if (!db) return res.status(500).json({ error: 'Firestore no configurado' });
   try {
@@ -2466,6 +2447,139 @@ app.post('/api/toggle-flagged', async (req, res) => {
   }
 });
 
+// ------------------------------------------------------------
+//  CLOUD — Escaneo de adjuntos
+// ------------------------------------------------------------
+function collectAttachmentParts(structure, prefix = '') {
+  const out = [];
+
+  const walk = (node, currentPart) => {
+    if (!node) return;
+
+    const part = currentPart || node.part || '';
+    const disposition = (node.disposition || '').toString().toLowerCase();
+    const filename =
+      node.dispositionParameters?.filename ||
+      node.parameters?.name ||
+      '';
+
+    // Es adjunto si disposition=attachment, o si tiene filename
+    const isAttachment = disposition === 'attachment' || filename.length > 0;
+
+    if (isAttachment && part) {
+      out.push({
+        partId: String(part),
+        filename: filename || `adjunto_${part}`,
+        contentType: node.type || 'application/octet-stream',
+        size: node.size || 0,
+      });
+    }
+
+    // Recorrer hijos
+    if (Array.isArray(node.childNodes)) {
+      node.childNodes.forEach((child) => walk(child, child.part || part));
+    }
+  };
+
+  walk(structure, prefix);
+  return out;
+}
+
+app.post('/api/scan-attachments', async (req, res) => {
+  const {
+    email,
+    password,
+    host,
+    port,
+    folder = 'INBOX',
+    limit = 200,
+  } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({
+      success: false,
+      error: 'Email y contraseña requeridos',
+      attachments: [],
+    });
+  }
+
+  let client;
+  try {
+    const conn = await connectImapAuto(email, password, host);
+    client = conn.client;
+
+    const lock = await client.getMailboxLock(folder, { readOnly: true });
+    const attachments = [];
+
+    try {
+      const status = await client.status(folder, { messages: true });
+      const total = status.messages || 0;
+      const startSeq = Math.max(1, total - limit + 1);
+
+      console.log(
+        `☁️ Escaneando adjuntos en ${email} (${folder}): ${total} msgs, desde ${startSeq}`
+      );
+
+      const iter = client.fetch(
+        `${startSeq}:*`,
+        { uid: true, envelope: true, bodyStructure: true },
+        { uid: true }
+      );
+
+      for await (const msg of iter) {
+        const parts = collectAttachmentParts(msg.bodyStructure);
+        if (parts.length === 0) continue;
+
+        const from = msg.envelope?.from?.[0]?.address || '';
+        const fromName = msg.envelope?.from?.[0]?.name || from;
+        const subject = msg.envelope?.subject || '(Sin asunto)';
+        const date = msg.envelope?.date
+          ? new Date(msg.envelope.date).toISOString()
+          : new Date().toISOString();
+
+        for (const p of parts) {
+          attachments.push({
+            uid: msg.uid,
+            folder,
+            partId: p.partId,
+            filename: p.filename,
+            contentType: p.contentType,
+            size: p.size,
+            fromEmail: from,
+            fromName,
+            subject,
+            date,
+          });
+        }
+      }
+    } finally {
+      lock.release();
+    }
+
+    await client.logout();
+
+    // Ordenar por fecha descendente
+    attachments.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+
+    res.json({
+      success: true,
+      attachments,
+      total: attachments.length,
+    });
+  } catch (err) {
+    if (client) await client.logout().catch(() => {});
+    console.error('❌ Error en /api/scan-attachments:', err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message,
+      attachments: [],
+    });
+  }
+});
+
+// ------------------------------------------------------------
+//  DESCARGAR ADJUNTO
+// ------------------------------------------------------------
 app.post('/api/download-attachment', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', uid, partId } = req.body;
   if (!uid || !partId) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
@@ -2491,6 +2605,9 @@ app.post('/api/download-attachment', async (req, res) => {
   }
 });
 
+// ------------------------------------------------------------
+//  SUSCRIPCIONES
+// ------------------------------------------------------------
 function analyzeIsSubscription({ from, subject, listUnsubscribe }) {
   if (listUnsubscribe && listUnsubscribe.trim().length > 0) return true;
 

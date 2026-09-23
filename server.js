@@ -8,6 +8,28 @@ const WebSocket = require('ws');
 const http = require('http');
 const admin = require('firebase-admin');
 const cron = require('node-cron');
+const multer = require('multer');
+const cloudinary = require('cloudinary').v2;
+
+// ------------------------------------------------------------
+//  CLOUDINARY (opcional)
+// ------------------------------------------------------------
+const CLOUDINARY_ENABLED =
+  !!process.env.CLOUDINARY_CLOUD_NAME &&
+  !!process.env.CLOUDINARY_API_KEY &&
+  !!process.env.CLOUDINARY_API_SECRET;
+
+if (CLOUDINARY_ENABLED) {
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+    secure: true,
+  });
+  console.log('✅ Cloudinary configurado');
+} else {
+  console.log('⚠️ Cloudinary sin configurar → fallback a almacenamiento local');
+}
 
 // ------------------------------------------------------------
 //  FIREBASE ADMIN (FCM)
@@ -1011,6 +1033,116 @@ cron.schedule('0 */12 * * *', async () => {
     }
   } catch (e) {
     console.error('⚠️ Error limpiando traducciones:', e.message);
+  }
+});
+
+// ------------------------------------------------------------
+//  CHAT — SUBIDA DE ARCHIVOS (Cloudinary + fallback local)
+// ------------------------------------------------------------
+const multerMemory = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25 MB
+});
+
+app.post(
+  '/api/chat/upload',
+  multerMemory.single('file'),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ success: false, error: 'No file' });
+      }
+
+      const originalName = req.file.originalname || `file_${Date.now()}`;
+      const size = req.file.size || 0;
+      const mimetype = req.file.mimetype || 'application/octet-stream';
+
+      // 1. Cloudinary (recomendado)
+      if (CLOUDINARY_ENABLED) {
+        try {
+          const isImage = mimetype.startsWith('image/');
+          const isVideo = mimetype.startsWith('video/');
+
+          const uploadResult = await new Promise((resolve, reject) => {
+            const stream = cloudinary.uploader.upload_stream(
+              {
+                folder: 'rsmail_chat',
+                resource_type: isImage
+                    ? 'image'
+                    : isVideo
+                        ? 'video'
+                        : 'raw',
+                public_id: `${Date.now()}_${originalName
+                    .replace(/\.[^/.]+$/, '')
+                    .replace(/[^\w\-]/g, '_')}`,
+                use_filename: false,
+                unique_filename: true,
+                overwrite: false,
+                access_mode: 'public',
+              },
+              (error, result) => {
+                if (error) reject(error);
+                else resolve(result);
+              }
+            );
+            stream.end(req.file.buffer);
+          });
+
+          return res.json({
+            success: true,
+            url: uploadResult.secure_url,
+            filename: originalName,
+            size,
+            provider: 'cloudinary',
+            publicId: uploadResult.public_id,
+          });
+        } catch (cloudErr) {
+          console.error('❌ Cloudinary falló:', cloudErr.message);
+          // Fallback a disco local si Cloudinary falla
+        }
+      }
+
+      // 2. Fallback local (efímero en Render free)
+      const fs = require('fs');
+      const path = require('path');
+      const dir = path.join(__dirname, 'uploads', 'chat');
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+      const uniqueName = `${Date.now()}_${originalName.replace(
+          /[^\w\.\-]/g,
+          '_'
+      )}`;
+      const filePath = path.join(dir, uniqueName);
+      fs.writeFileSync(filePath, req.file.buffer);
+
+      const baseUrl = `${req.protocol}://${req.get('host')}`;
+      res.json({
+        success: true,
+        url: `${baseUrl}/api/chat/file/${encodeURIComponent(uniqueName)}`,
+        filename: originalName,
+        size,
+        provider: 'local',
+      });
+    } catch (e) {
+      console.error('❌ Error en /api/chat/upload:', e.message);
+      res.status(500).json({ success: false, error: e.message });
+    }
+  }
+);
+
+// Servir archivos del fallback local
+app.get('/api/chat/file/:filename', (req, res) => {
+  try {
+    const fs = require('fs');
+    const path = require('path');
+    const safeName = path.basename(req.params.filename);
+    const filePath = path.join(__dirname, 'uploads', 'chat', safeName);
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).send('Not found');
+    }
+    res.sendFile(filePath);
+  } catch (e) {
+    res.status(500).send(e.message);
   }
 });
 

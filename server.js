@@ -1,4 +1,4 @@
-﻿﻿const express = require('express');
+﻿﻿﻿const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -129,7 +129,6 @@ function getAutoConfig(email) {
   };
 }
 
-// 🔥 Candidatos SMTP
 function getSmtpCandidates(email) {
   const auto = getAutoConfig(email);
   if (!auto) return [];
@@ -162,7 +161,6 @@ function getSmtpCandidates(email) {
   return candidates;
 }
 
-// 🔥 Candidatos IMAP
 function getImapCandidates(email) {
   const auto = getAutoConfig(email);
   if (!auto) return [];
@@ -345,7 +343,7 @@ function startImapWorker(email, password, customHost, ws = null) {
   }
 
   if (!password) {
-    console.error(`❌ startImapWorker: SIN PASSWORD para ${email}, no se puede iniciar`);
+    console.error(`❌ startImapWorker: SIN PASSWORD para ${email}`);
     return;
   }
 
@@ -490,10 +488,6 @@ async function runImapLoop(state) {
         }
       }
 
-      if (state.active && state.client.usable) {
-        console.log(`⚠️ Bucle IDLE salió pero el cliente sigue usable. Reiniciando...`);
-      }
-
     } catch (e) {
       if (state.active) {
         console.log(`⚠️ IMAP caído para ${state.email}: ${e.message}`);
@@ -541,7 +535,7 @@ cron.schedule('* * * * *', async () => {
       if (!recipientEmail) continue;
 
       if (!event.notified1Day && diffHours <= 25 && diffHours > 23) {
-        console.log(`📅 Recordatorio 1 DÍA ANTES para: ${event.title} → ${recipientEmail} (faltan ${diffHours.toFixed(1)}h)`);
+        console.log(`📅 Recordatorio 1 DÍA ANTES para: ${event.title} → ${recipientEmail}`);
         await sendPushNotification(recipientEmail, {
           title: `📅 Mañana: ${event.title}`,
           body: `Tienes este evento programado para mañana a las ${formattedTime}`,
@@ -616,8 +610,6 @@ cron.schedule('* * * * *', async () => {
 
   try {
     const now = new Date();
-
-    // 🔥 Sin índice compuesto: filtramos en JS
     const snapshot = await db
       .collection('email_reminders')
       .where('status', '==', 'pending')
@@ -632,9 +624,7 @@ cron.schedule('* * * * *', async () => {
       const ra = data.remindAt;
       if (!ra) return;
       const remindDate = ra.toDate ? ra.toDate() : new Date(ra);
-      if (remindDate.getTime() <= now.getTime()) {
-        toSend.push(doc);
-      }
+      if (remindDate.getTime() <= now.getTime()) toSend.push(doc);
     });
 
     if (toSend.length === 0) return;
@@ -648,10 +638,7 @@ cron.schedule('* * * * *', async () => {
       try {
         const accountEmail = data.accountEmail;
         if (!accountEmail) {
-          await docRef.update({
-            status: 'failed',
-            error: 'Sin cuenta asociada',
-          });
+          await docRef.update({ status: 'failed', error: 'Sin cuenta asociada' });
           continue;
         }
 
@@ -667,8 +654,6 @@ cron.schedule('* * * * *', async () => {
         const body = note.isNotEmpty
           ? `Correo de ${from}: ${subject}`
           : `Correo de ${from}`;
-
-        console.log(`📤 Enviando recordatorio: ${subject} → ${accountEmail}`);
 
         await sendPushNotification(accountEmail, {
           title: title,
@@ -690,10 +675,7 @@ cron.schedule('* * * * *', async () => {
         console.log(`✅ Recordatorio enviado: "${subject}"`);
       } catch (e) {
         console.error(`❌ Error recordatorio ${doc.id}:`, e.message);
-        await docRef.update({
-          status: 'failed',
-          error: e.message,
-        });
+        await docRef.update({ status: 'failed', error: e.message });
       }
     }
   } catch (e) {
@@ -705,10 +687,7 @@ cron.schedule('* * * * *', async () => {
 //  FCM PUSH
 // ------------------------------------------------------------
 async function sendPushNotification(email, payload) {
-  if (!db) {
-    console.log('⚠️ sendPushNotification: sin db');
-    return;
-  }
+  if (!db) return;
 
   try {
     const tokensSnapshot = await db.collection('fcm_tokens').where('email', '==', email).get();
@@ -757,15 +736,12 @@ async function sendPushNotification(email, payload) {
     };
 
     const response = await admin.messaging().sendEachForMulticast(message);
-    console.log(`✅ Push enviado a ${tokens.length} dispositivo(s) para ${email} | éxito: ${response.successCount}, fallos: ${response.failureCount}`);
+    console.log(`✅ Push enviado | éxito: ${response.successCount}, fallos: ${response.failureCount}`);
 
     if (response.failureCount > 0) {
       const failedTokens = [];
       response.responses.forEach((resp, idx) => {
-        if (!resp.success) {
-          console.log(`❌ Token fallido: ${resp.error?.message}`);
-          failedTokens.push(tokens[idx]);
-        }
+        if (!resp.success) failedTokens.push(tokens[idx]);
       });
       for (const token of failedTokens) {
         const snapshots = await db.collection('fcm_tokens').where('token', '==', token).get();
@@ -778,7 +754,380 @@ async function sendPushNotification(email, payload) {
 }
 
 // ------------------------------------------------------------
-//  AUTH (con autodetección IMAP)
+//  MODO CONFIDENCIAL
+// ------------------------------------------------------------
+
+// Crear un correo confidencial
+app.post('/api/confidential/create', async (req, res) => {
+  if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
+
+  try {
+    const {
+      ownerId,
+      accountEmail,
+      to,
+      subject,
+      body,
+      password,
+      expiresInDays,
+      note,
+    } = req.body;
+
+    if (!ownerId || !body || !expiresInDays) {
+      return res.status(400).json({ success: false, error: 'Faltan parámetros' });
+    }
+
+    let days = Number(expiresInDays);
+    if (isNaN(days) || days < 1) days = 1;
+    if (days > 15) days = 15; // máximo 15 días
+
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + days);
+
+    const ref = await db.collection('confidential_emails').add({
+      ownerId,
+      accountEmail,
+      to,
+      subject,
+      body,
+      password: password || null,
+      expiresAt: admin.firestore.Timestamp.fromDate(expiresAt),
+      note: note || '',
+      views: [],
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      status: 'active',
+    });
+
+    res.json({
+      success: true,
+      id: ref.id,
+      url: `https://rsmail-backend.onrender.com/confidential/${ref.id}`,
+      expiresAt: expiresAt.toISOString(),
+    });
+  } catch (e) {
+    console.error('❌ Error creando confidencial:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Abrir un confidencial
+app.post('/api/confidential/open/:id', async (req, res) => {
+  if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
+
+  try {
+    const { id } = req.params;
+    const { password } = req.body;
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+
+    const doc = await db.collection('confidential_emails').doc(id).get();
+    if (!doc.exists) {
+      return res.status(404).json({ success: false, error: 'Enlace no encontrado' });
+    }
+
+    const data = doc.data();
+
+    const expiresAt = data.expiresAt?.toDate ? data.expiresAt.toDate() : new Date(data.expiresAt);
+    if (expiresAt < new Date()) {
+      return res.status(410).json({ success: false, error: 'Este enlace ha caducado' });
+    }
+
+    if (data.password) {
+      if (!password) {
+        return res.status(401).json({ success: false, error: 'Contraseña requerida' });
+      }
+      if (password !== data.password) {
+        return res.status(401).json({ success: false, error: 'Contraseña incorrecta' });
+      }
+    }
+
+    const views = data.views || [];
+    views.push({
+      at: new Date().toISOString(),
+      ip: ip,
+    });
+    await doc.ref.update({ views });
+
+    if (data.accountEmail) {
+      sendPushNotification(data.accountEmail, {
+        title: '🔓 Tu correo confidencial ha sido abierto',
+        body: `"${data.subject || '(Sin asunto)'}" se ha abierto`,
+        data: { type: 'confidential_opened', id },
+      }).catch(() => {});
+    }
+
+    res.json({
+      success: true,
+      subject: data.subject || '(Sin asunto)',
+      body: data.body || '',
+      from: data.accountEmail,
+      to: data.to,
+      expiresAt: expiresAt.toISOString(),
+      views: views.length,
+    });
+  } catch (e) {
+    console.error('❌ Error abriendo confidencial:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Ver estado de un confidencial
+app.get('/api/confidential/status/:id', async (req, res) => {
+  if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
+
+  try {
+    const doc = await db.collection('confidential_emails').doc(req.params.id).get();
+    if (!doc.exists) return res.status(404).json({ success: false, error: 'No encontrado' });
+    const data = doc.data();
+    const expiresAt = data.expiresAt?.toDate ? data.expiresAt.toDate() : new Date(data.expiresAt);
+
+    res.json({
+      success: true,
+      id: doc.id,
+      subject: data.subject,
+      to: data.to,
+      note: data.note,
+      status: expiresAt < new Date() ? 'expired' : 'active',
+      expiresAt: expiresAt.toISOString(),
+      views: (data.views || []).length,
+      viewsList: data.views || [],
+      hasPassword: !!data.password,
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Revocar manualmente
+app.delete('/api/confidential/:id', async (req, res) => {
+  if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
+  try {
+    await db.collection('confidential_emails').doc(req.params.id).delete();
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Página pública HTML del confidencial
+app.get('/confidential/:id', (req, res) => {
+  const id = req.params.id;
+  res.send(`<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RSMail · Mensaje confidencial</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-user-select: none; user-select: none; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: linear-gradient(135deg, #0D47A1 0%, #1A73E8 100%);
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    padding: 16px; color: #333;
+  }
+  .container {
+    background: #fff; border-radius: 16px; max-width: 720px; width: 100%;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.25); overflow: hidden;
+  }
+  .header {
+    background: #1A73E8; color: #fff; padding: 20px;
+    display: flex; align-items: center; gap: 12px;
+  }
+  .header h1 { font-size: 18px; font-weight: 600; }
+  .header .lock { font-size: 24px; }
+  .banner {
+    background: #FFF3CD; border-left: 4px solid #FFC107;
+    padding: 12px 20px; font-size: 13px; color: #856404;
+  }
+  .content { padding: 24px; }
+  .subject { font-size: 20px; font-weight: 700; margin-bottom: 8px; color: #111; }
+  .meta { font-size: 12px; color: #888; margin-bottom: 20px; }
+  .body {
+    font-size: 15px; line-height: 1.6; color: #222; white-space: pre-wrap;
+    word-wrap: break-word;
+  }
+  .footer {
+    padding: 16px 24px; background: #f5f5f5; font-size: 11px; color: #999;
+    text-align: center; border-top: 1px solid #e0e0e0;
+  }
+  .password-box { padding: 40px 24px; text-align: center; }
+  .password-box h2 { font-size: 18px; margin-bottom: 16px; }
+  .password-box input {
+    width: 100%; max-width: 300px; padding: 12px 16px; border-radius: 8px;
+    border: 2px solid #1A73E8; font-size: 15px; outline: none;
+    margin-bottom: 12px; -webkit-user-select: text; user-select: text;
+  }
+  .password-box button {
+    background: #1A73E8; color: #fff; border: none; padding: 12px 32px;
+    border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer;
+    transition: background 0.2s;
+  }
+  .password-box button:hover { background: #0D47A1; }
+  .error { padding: 40px 24px; text-align: center; color: #c62828; }
+  .error h2 { font-size: 20px; margin-bottom: 8px; }
+  .error p { font-size: 14px; color: #666; }
+  .loading { padding: 40px; text-align: center; color: #1A73E8; font-size: 14px; }
+  .spinner {
+    width: 40px; height: 40px; border: 4px solid #e0e0e0; border-top-color: #1A73E8;
+    border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 16px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="container" id="app">
+  <div class="loading">
+    <div class="spinner"></div>
+    Cargando mensaje confidencial...
+  </div>
+</div>
+
+<script>
+const CONF_ID = '${id}';
+
+document.addEventListener('contextmenu', e => e.preventDefault());
+document.addEventListener('copy', e => e.preventDefault());
+document.addEventListener('cut', e => e.preventDefault());
+document.addEventListener('selectstart', e => e.preventDefault());
+document.addEventListener('dragstart', e => e.preventDefault());
+document.addEventListener('keydown', e => {
+  if (e.ctrlKey && ['c','x','s','p','u','a'].includes(e.key.toLowerCase())) {
+    e.preventDefault();
+  }
+  if (e.ctrlKey && e.shiftKey && ['i','j','c'].includes(e.key.toLowerCase())) {
+    e.preventDefault();
+  }
+  if (e.key === 'F12') e.preventDefault();
+  if (e.key === 'PrintScreen') {
+    navigator.clipboard.writeText('RSMail · Contenido protegido');
+    e.preventDefault();
+  }
+});
+
+async function loadContent(password) {
+  const body = { password: password || null };
+  const res = await fetch('/api/confidential/open/' + CONF_ID, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const data = await res.json();
+  return { status: res.status, data };
+}
+
+async function init(password) {
+  const app = document.getElementById('app');
+  try {
+    const { status, data } = await loadContent(password);
+
+    if (status === 401) {
+      app.innerHTML = \`
+        <div class="header">
+          <span class="lock">🔒</span>
+          <h1>Mensaje confidencial</h1>
+        </div>
+        <div class="banner">
+          Este mensaje está protegido. Introduce la contraseña para abrirlo.
+        </div>
+        <div class="password-box">
+          <h2>Introduce la contraseña</h2>
+          <input type="password" id="pwd" placeholder="Contraseña" autofocus>
+          <div>
+            <button onclick="submitPwd()">Abrir</button>
+          </div>
+          <p id="err" style="color:#c62828;margin-top:12px;font-size:13px;"></p>
+        </div>
+        <div class="footer">🔒 Enviado de forma segura con RSMail</div>
+      \`;
+      document.getElementById('pwd').addEventListener('keydown', e => {
+        if (e.key === 'Enter') submitPwd();
+      });
+      window.submitPwd = () => {
+        const p = document.getElementById('pwd').value;
+        if (!p) return;
+        init(p);
+      };
+      return;
+    }
+
+    if (!data.success) {
+      app.innerHTML = \`
+        <div class="header">
+          <span class="lock">🔒</span>
+          <h1>Mensaje confidencial</h1>
+        </div>
+        <div class="error">
+          <h2>\${status === 410 ? 'Enlace caducado' : 'No disponible'}</h2>
+          <p>\${data.error || 'Este enlace ya no es válido'}</p>
+        </div>
+        <div class="footer">RSMail</div>
+      \`;
+      return;
+    }
+
+    const exp = new Date(data.expiresAt).toLocaleDateString('es-ES');
+    const safeBody = (data.body || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    app.innerHTML = \`
+      <div class="header">
+        <span class="lock">🔒</span>
+        <h1>Mensaje confidencial</h1>
+      </div>
+      <div class="banner">
+        Este mensaje es confidencial. No lo reenvíes, copies ni imprimas. Caduca el \${exp}.
+      </div>
+      <div class="content">
+        <div class="subject">\${(data.subject || '(Sin asunto)').replace(/</g,'&lt;')}</div>
+        <div class="meta">
+          De: \${(data.from || '').replace(/</g,'&lt;')} · Para: \${(data.to || '').replace(/</g,'&lt;')}
+        </div>
+        <div class="body">\${safeBody}</div>
+      </div>
+      <div class="footer">
+        🔒 Enviado de forma segura con RSMail · Caduca el \${exp}
+      </div>
+    \`;
+  } catch (e) {
+    app.innerHTML = \`
+      <div class="error">
+        <h2>Error de conexión</h2>
+        <p>\${e.message}</p>
+      </div>
+    \`;
+  }
+}
+
+init();
+</script>
+</body>
+</html>`);
+});
+
+// Cron: limpiar caducados antiguos cada 30 min
+cron.schedule('*/30 * * * *', async () => {
+  if (!db) return;
+  try {
+    const snap = await db.collection('confidential_emails').get();
+    let deleted = 0;
+    const now = Date.now();
+    for (const doc of snap.docs) {
+      const data = doc.data();
+      const exp = data.expiresAt?.toDate ? data.expiresAt.toDate() : new Date(data.expiresAt);
+      if (now - exp.getTime() > 30 * 24 * 60 * 60 * 1000) {
+        await doc.ref.delete();
+        deleted++;
+      }
+    }
+    if (deleted > 0) {
+      console.log(`🗑️ Eliminados ${deleted} confidenciales antiguos`);
+    }
+  } catch (e) {
+    console.error('❌ Error limpiando confidenciales:', e.message);
+  }
+});
+
+// ------------------------------------------------------------
+//  AUTH
 // ------------------------------------------------------------
 const handleAuth = async (req, res) => {
   const { email, password, host, port } = req.body;
@@ -790,7 +1139,6 @@ const handleAuth = async (req, res) => {
     console.log(`🔐 Verificando cuenta ${email}...`);
     const conn = await connectImapAuto(email, password, host);
     const client = conn.client;
-
     await client.logout().catch(() => {});
 
     const auto = getAutoConfig(email);
@@ -826,15 +1174,12 @@ const handleAuth = async (req, res) => {
 app.post('/api/login', handleAuth);
 app.post('/api/verify', handleAuth);
 
-// /ping reanima workers caídos
 app.get('/ping', async (req, res) => {
   if (db) {
     try {
       const deadEmails = [];
       for (const [email, state] of activeWorkers.entries()) {
-        const isAlive = state.active &&
-                        state.client &&
-                        state.client.usable;
+        const isAlive = state.active && state.client && state.client.usable;
         if (!isAlive) deadEmails.push(email);
       }
 
@@ -877,7 +1222,6 @@ app.get('/ping', async (req, res) => {
   });
 });
 
-// DEBUG: ver workers activos
 app.get('/api/debug/workers', (req, res) => {
   const workers = [];
   for (const [email, state] of activeWorkers.entries()) {
@@ -899,7 +1243,6 @@ app.get('/api/debug/workers', (req, res) => {
   });
 });
 
-// DEBUG: ver configuración auto para un email
 app.get('/api/debug/auto-config/:email', (req, res) => {
   const email = req.params.email;
   const auto = getAutoConfig(email);
@@ -915,7 +1258,6 @@ app.get('/api/debug/auto-config/:email', (req, res) => {
   });
 });
 
-// DEBUG: ver recordatorios de correo
 app.get('/api/debug/reminders', async (req, res) => {
   if (!db) return res.status(500).json({ error: 'Firestore no configurado' });
   try {
@@ -1094,13 +1436,8 @@ function detectAttachmentsFromStructure(structure) {
     const disp = (part.disposition || '').toString().toLowerCase();
     if (disp === 'attachment') return true;
 
-    if (part.dispositionParameters && part.dispositionParameters.filename) {
-      return true;
-    }
-
-    if (part.parameters && part.parameters.name) {
-      return true;
-    }
+    if (part.dispositionParameters && part.dispositionParameters.filename) return true;
+    if (part.parameters && part.parameters.name) return true;
 
     if (Array.isArray(part.childNodes)) {
       for (const child of part.childNodes) stack.push(child);
@@ -1288,7 +1625,6 @@ app.post('/api/mark-all-read', async (req, res) => {
         if (msg.uid) uids.push(msg.uid);
       }
       total = uids.length;
-
       if (total > 0) {
         await client.messageFlagsAdd(uids, ['\\Seen'], { uid: true });
       }
@@ -1297,7 +1633,6 @@ app.post('/api/mark-all-read', async (req, res) => {
     }
 
     await client.logout();
-    console.log(`✅ Marcados ${total} correos como leídos en ${folder} para ${email}`);
     res.json({ success: true, marked: total });
   } catch (e) {
     if (client) await client.logout().catch(() => {});
@@ -1384,9 +1719,7 @@ function parseListUnsubscribe(raw) {
 
 app.post('/api/scan-subscriptions', async (req, res) => {
   const { email, password, host, port, maxMessages = 500 } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ success: false, error: 'Email y contraseña requeridos' });
-  }
+  if (!email || !password) return res.status(400).json({ success: false, error: 'Email y contraseña requeridos' });
 
   let client;
   try {
@@ -1471,24 +1804,17 @@ app.post('/api/scan-subscriptions', async (req, res) => {
     const list = Array.from(subscriptions.values())
       .sort((a, b) => (b.latestDate || '').localeCompare(a.latestDate || ''));
 
-    console.log(`✅ Detectadas ${list.length} suscripciones para ${email}`);
     res.json({ success: true, subscriptions: list, total: list.length });
   } catch (err) {
-    console.error('❌ Error en /api/scan-subscriptions:', err.message);
     if (client) await client.logout().catch(() => {});
     res.status(500).json({ success: false, error: err.message, subscriptions: [] });
   }
 });
 
 app.post('/api/unsubscribe', async (req, res) => {
-  const {
-    email, password,
-    listUnsubscribe, listUnsubscribePost,
-  } = req.body;
+  const { email, password, listUnsubscribe, listUnsubscribePost } = req.body;
 
-  if (!listUnsubscribe) {
-    return res.status(400).json({ success: false, error: 'Falta la cabecera List-Unsubscribe' });
-  }
+  if (!listUnsubscribe) return res.status(400).json({ success: false, error: 'Falta la cabecera List-Unsubscribe' });
 
   const parsed = parseListUnsubscribe(listUnsubscribe);
   const isOneClick = (listUnsubscribePost || '').toLowerCase().includes('one-click');
@@ -1509,7 +1835,6 @@ app.post('/api/unsubscribe', async (req, res) => {
         });
         method = 'https-post';
         result = { status: r.status, ok: r.ok };
-        console.log(`✅ Unsubscribe one-click: ${r.status} para ${parsed.http[0]}`);
       } catch (e) {
         console.log('⚠️ POST one-click falló:', e.message);
       }
@@ -1524,7 +1849,6 @@ app.post('/api/unsubscribe', async (req, res) => {
         });
         method = 'https-get';
         result = { status: r.status, ok: r.ok };
-        console.log(`✅ Unsubscribe GET: ${r.status} para ${parsed.http[0]}`);
       } catch (e) {
         console.log('⚠️ GET falló:', e.message);
       }
@@ -1553,12 +1877,9 @@ app.post('/api/unsubscribe', async (req, res) => {
       });
       method = 'mailto';
       result = { ok: true };
-      console.log(`✅ Unsubscribe por email a ${address}`);
     }
 
-    if (!result) {
-      return res.status(400).json({ success: false, error: 'No se encontró un método de baja válido' });
-    }
+    if (!result) return res.status(400).json({ success: false, error: 'No se encontró un método de baja válido' });
 
     res.json({ success: true, method, result });
   } catch (e) {

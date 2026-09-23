@@ -1,4 +1,4 @@
-﻿﻿﻿﻿const express = require('express');
+﻿﻿﻿﻿﻿﻿const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -2463,7 +2463,6 @@ function collectAttachmentParts(structure, prefix = '') {
       node.parameters?.name ||
       '';
 
-    // Es adjunto si disposition=attachment, o si tiene filename
     const isAttachment = disposition === 'attachment' || filename.length > 0;
 
     if (isAttachment && part) {
@@ -2475,7 +2474,6 @@ function collectAttachmentParts(structure, prefix = '') {
       });
     }
 
-    // Recorrer hijos
     if (Array.isArray(node.childNodes)) {
       node.childNodes.forEach((child) => walk(child, child.part || part));
     }
@@ -2558,7 +2556,6 @@ app.post('/api/scan-attachments', async (req, res) => {
 
     await client.logout();
 
-    // Ordenar por fecha descendente
     attachments.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
 
     res.json({
@@ -2578,11 +2575,17 @@ app.post('/api/scan-attachments', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  DESCARGAR ADJUNTO
+//  DESCARGAR ADJUNTO (versión robusta con simpleParser)
 // ------------------------------------------------------------
 app.post('/api/download-attachment', async (req, res) => {
-  const { email, password, host, port, folder = 'INBOX', uid, partId } = req.body;
-  if (!uid || !partId) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
+  const {
+    email, password, host, port,
+    folder = 'INBOX', uid, partId, filename,
+  } = req.body;
+
+  if (!uid) {
+    return res.status(400).json({ success: false, error: 'Falta UID' });
+  }
 
   let client;
   try {
@@ -2590,17 +2593,70 @@ app.post('/api/download-attachment', async (req, res) => {
     client = conn.client;
 
     const lock = await client.getMailboxLock(folder, { readOnly: true });
-    let msg;
+    let parsed;
     try {
-      msg = await client.fetchOne(String(uid), { bodyParts: [partId] }, { uid: true });
+      const msg = await client.fetchOne(
+        String(uid),
+        { source: true },
+        { uid: true }
+      );
+      if (msg?.source) parsed = await simpleParser(msg.source);
     } finally {
       lock.release();
     }
     await client.logout();
-    if (!msg?.bodyParts?.[partId]) return res.status(404).json({ success: false, error: 'Adjunto no encontrado' });
-    res.json({ success: true, data: msg.bodyParts[partId].toString('base64') });
+    client = null;
+
+    if (!parsed) {
+      return res.status(404).json({ success: false, error: 'Correo no encontrado' });
+    }
+
+    const attachments = parsed.attachments || [];
+    if (attachments.length === 0) {
+      return res.status(404).json({ success: false, error: 'Sin adjuntos' });
+    }
+
+    let target = null;
+
+    // 1. Por filename
+    if (filename) {
+      target = attachments.find((a) => a.filename === filename);
+    }
+
+    // 2. Por partId numérico → índice
+    if (!target && partId) {
+      const cleaned = String(partId).trim();
+      const parts = cleaned.split('.').map((p) => parseInt(p, 10) || 0);
+      const lastIdx = parts[parts.length - 1];
+      if (lastIdx > 0 && lastIdx <= attachments.length) {
+        target = attachments[lastIdx - 1];
+      }
+    }
+
+    // 3. Si solo hay uno, ese
+    if (!target && attachments.length === 1) {
+      target = attachments[0];
+    }
+
+    if (!target) {
+      return res.status(404).json({
+        success: false,
+        error: 'Adjunto no encontrado',
+        availableFilenames: attachments.map((a) => a.filename).filter(Boolean),
+      });
+    }
+
+    const content = target.content || Buffer.from('');
+    res.json({
+      success: true,
+      data: content.toString('base64'),
+      filename: target.filename || filename || 'adjunto',
+      contentType: target.contentType || 'application/octet-stream',
+      size: content.length,
+    });
   } catch (e) {
     if (client) await client.logout().catch(() => {});
+    console.error('❌ Error descargando adjunto:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });

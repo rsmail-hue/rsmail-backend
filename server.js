@@ -1,4 +1,4 @@
-﻿﻿﻿﻿const express = require('express');
+﻿﻿const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -771,6 +771,7 @@ async function applyRulesToMessage({
 // ------------------------------------------------------------
 const _translateCache = new Map(); // hash -> { translated, ts }
 const TRANSLATE_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6h
+const GOOGLE_HARD_LIMIT = 4500; // Google público ~5000, dejamos margen
 
 function _simpleHash(s) {
   let h = 0;
@@ -824,6 +825,91 @@ async function libreTranslate(text, target, source = 'auto', format = 'text') {
   };
 }
 
+/// Trocea un texto largo en chunks seguros para Google,
+/// intentando no cortar tags HTML ni palabras a medias.
+function _chunkText(text, maxLen = GOOGLE_HARD_LIMIT) {
+  if (text.length <= maxLen) return [text];
+
+  const chunks = [];
+  let i = 0;
+
+  while (i < text.length) {
+    if (text.length - i <= maxLen) {
+      chunks.push(text.substring(i));
+      break;
+    }
+
+    let cutAt = i + maxLen;
+    // Buscar un punto "seguro" hacia atrás
+    const lowerBound = i + Math.floor(maxLen * 0.6);
+    for (let k = cutAt; k > lowerBound; k--) {
+      const c = text[k];
+      if (c === ' ' || c === '\n' || c === '>' || c === '.') {
+        cutAt = k;
+        break;
+      }
+    }
+    if (cutAt <= i) cutAt = i + maxLen;
+
+    chunks.push(text.substring(i, cutAt));
+    i = cutAt;
+  }
+
+  return chunks;
+}
+
+/// Traduce un texto en trozos si es necesario. Devuelve
+/// { translated, detectedSource, chunked }
+async function translateInChunks(text, target, source, format) {
+  if (text.length <= GOOGLE_HARD_LIMIT) {
+    let r;
+    try {
+      r = await googleTranslate(text, target, source, format);
+    } catch (e1) {
+      console.log(`⚠️ Google falló en chunk único (${e1.message}), LibreTranslate…`);
+      r = await libreTranslate(text, target, source, format);
+    }
+    return {
+      translated: r.translated,
+      detectedSource: r.detectedSource,
+      chunked: false,
+    };
+  }
+
+  const chunks = _chunkText(text);
+  console.log(`✂️ Traduciendo en ${chunks.length} trozos (total ${text.length} chars)`);
+
+  const parts = [];
+  let detected = source;
+
+  for (let idx = 0; idx < chunks.length; idx++) {
+    const chunk = chunks[idx];
+    let r;
+    try {
+      r = await googleTranslate(chunk, target, source, format);
+    } catch (e1) {
+      console.log(`   ⚠️ Google falló chunk ${idx + 1}: ${e1.message}`);
+      try {
+        r = await libreTranslate(chunk, target, source, format);
+      } catch (e2) {
+        // último recurso: devolver el original de este trozo
+        parts.push(chunk);
+        continue;
+      }
+    }
+    if (r.detectedSource && r.detectedSource !== 'auto') {
+      detected = r.detectedSource;
+    }
+    parts.push(r.translated);
+  }
+
+  return {
+    translated: parts.join(' '),
+    detectedSource: detected,
+    chunked: true,
+  };
+}
+
 app.post('/api/translate', async (req, res) => {
   try {
     const {
@@ -836,8 +922,14 @@ app.post('/api/translate', async (req, res) => {
     if (!text || typeof text !== 'string') {
       return res.status(400).json({ error: 'text_required' });
     }
-    if (text.length > 60000) {
-      return res.status(413).json({ error: 'text_too_long' });
+
+    // 🔥 Subimos el límite a 200 KB (el cliente ya trocea, esto es red de seguridad)
+    if (text.length > 200000) {
+      return res.status(413).json({
+        error: 'text_too_long',
+        length: text.length,
+        max: 200000,
+      });
     }
 
     const cacheKey = `${target}_${source}_${format}_${_simpleHash(text)}`;
@@ -853,7 +945,7 @@ app.post('/api/translate', async (req, res) => {
       });
     }
 
-    // 2. Firestore (persistente)
+    // 2. Firestore
     if (db) {
       try {
         const doc = await db.collection('translation_cache').doc(cacheKey).get();
@@ -873,21 +965,16 @@ app.post('/api/translate', async (req, res) => {
       } catch (_) {}
     }
 
-    // 3. Proveedor
+    // 3. Traducir (con troceo automático si hace falta)
     let result;
     try {
-      result = await googleTranslate(text, target, source, format);
-    } catch (e1) {
-      console.log(`⚠️ Google Translate falló: ${e1.message}, probando LibreTranslate`);
-      try {
-        result = await libreTranslate(text, target, source, format);
-      } catch (e2) {
-        console.error(`❌ Ambos traductores fallaron: ${e2.message}`);
-        return res.status(502).json({ error: 'translate_failed' });
-      }
+      result = await translateInChunks(text, target, source, format);
+    } catch (e) {
+      console.error(`❌ Traducción falló: ${e.message}`);
+      return res.status(502).json({ error: 'translate_failed', message: e.message });
     }
 
-    // 4. Guardar en caches
+    // 4. Caches
     _translateCache.set(cacheKey, {
       translated: result.translated,
       detectedSource: result.detectedSource,
@@ -909,6 +996,7 @@ app.post('/api/translate', async (req, res) => {
       translated: result.translated,
       detectedSource: result.detectedSource,
       cached: false,
+      chunked: !!result.chunked,
     });
   } catch (e) {
     console.error('❌ /api/translate error:', e.message);
@@ -1966,9 +2054,9 @@ app.get('/api/debug/translate/:email', async (req, res) => {
   if (!db) return res.status(500).json({ error: 'Firestore no configurado' });
   try {
     const doc = await db
-        .collection('translation_configs')
-        .doc(req.params.email)
-        .get();
+      .collection('translation_configs')
+      .doc(req.params.email)
+      .get();
     res.json(doc.exists ? doc.data() : { enabled: false });
   } catch (e) {
     res.status(500).json({ error: e.message });

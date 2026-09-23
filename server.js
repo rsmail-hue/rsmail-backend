@@ -1,4 +1,4 @@
-﻿﻿﻿﻿const express = require('express');
+﻿﻿const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -330,11 +330,6 @@ async function sendViaBrevo({ fromEmail, fromName, to, subject, html }) {
 // ------------------------------------------------------------
 //  AUSENCIAS / VACACIONES (multi-período)
 // ------------------------------------------------------------
-
-/**
- * Lee absences_configs/{email} y devuelve el período activo AHORA
- * (o null si no hay ninguno).
- */
 async function getActiveAbsencePeriod(accountEmail) {
   if (!db) return null;
   try {
@@ -371,7 +366,7 @@ async function checkAndSendAutoReply({
 
   try {
     const period = await getActiveAbsencePeriod(accountEmail);
-    if (!period) return; // Sin ausencia activa ahora mismo
+    if (!period) return;
 
     const fromLower = (incomingFrom || '').toLowerCase();
     if (!fromLower.includes('@')) return;
@@ -388,7 +383,6 @@ async function checkAndSendAutoReply({
       return;
     }
 
-    // ¿Solo contactos?
     if (period.onlyContacts) {
       try {
         const contactsSnap = await db
@@ -406,7 +400,6 @@ async function checkAndSendAutoReply({
       }
     }
 
-    // Anti-spam: intervalo mínimo por remitente por período
     const replyId =
       `${accountEmail}__${period.id}__${fromLower}`.replace(/\//g, '_');
     const sentRef = db.collection('vacation_sent_replies').doc(replyId);
@@ -420,7 +413,6 @@ async function checkAndSendAutoReply({
       }
     }
 
-    // HTML
     const escapedBody = (period.body || '')
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
@@ -454,7 +446,6 @@ async function checkAndSendAutoReply({
       ? `${period.subject} — ${replySubject}`
       : replySubject;
 
-    // SMTP intentos
     let sent = false;
     let lastError = null;
     const smtpCandidates = getSmtpCandidates(accountEmail);
@@ -491,7 +482,6 @@ async function checkAndSendAutoReply({
       }
     }
 
-    // Fallback Brevo
     if (!sent && process.env.BREVO_API_KEY) {
       try {
         console.log('📤 Auto-reply: SMTP bloqueado, probando Brevo...');
@@ -526,6 +516,254 @@ async function checkAndSendAutoReply({
     }
   } catch (e) {
     console.error('❌ Error en checkAndSendAutoReply:', e.message);
+  }
+}
+
+// ------------------------------------------------------------
+//  MOTOR DE REGLAS / FILTROS
+// ------------------------------------------------------------
+const _rulesCache = new Map(); // email -> { rules, expiresAt }
+const RULES_CACHE_TTL_MS = 5 * 60 * 1000;
+
+async function getRulesForAccount(email) {
+  if (!db) return [];
+  const now = Date.now();
+  const cached = _rulesCache.get(email);
+  if (cached && cached.expiresAt > now) return cached.rules;
+
+  try {
+    const doc = await db.collection('rules_configs').doc(email).get();
+    const rules = doc.exists
+      ? (doc.data()?.rules || []).filter((r) => r && r.enabled)
+      : [];
+    _rulesCache.set(email, { rules, expiresAt: now + RULES_CACHE_TTL_MS });
+    return rules;
+  } catch (e) {
+    console.error('⚠️ Error cargando reglas:', e.message);
+    return [];
+  }
+}
+
+function rulesNeedBody(rules) {
+  return rules.some((r) =>
+    (r.conditions || []).some((c) => c.field === 'body')
+  );
+}
+
+function evalCondition(c, ctx) {
+  const field = c.field;
+  const op = c.operator;
+  const raw = c.value ?? '';
+
+  let target = '';
+  if (field === 'from') target = ctx.from || '';
+  else if (field === 'to') target = ctx.to || '';
+  else if (field === 'cc') target = ctx.cc || '';
+  else if (field === 'subject') target = ctx.subject || '';
+  else if (field === 'body') target = ctx.body || '';
+  else if (field === 'hasAttachment') {
+    if (op === 'isTrue') return !!ctx.hasAttachment;
+    if (op === 'isFalse') return !ctx.hasAttachment;
+    return false;
+  } else if (field === 'sizeKb') {
+    const n = Number(raw) || 0;
+    const sz = Number(ctx.sizeKb) || 0;
+    if (op === 'greaterThan') return sz > n;
+    if (op === 'lessThan') return sz < n;
+    return false;
+  }
+
+  const t = target.toLowerCase();
+  const v = raw.toLowerCase();
+
+  switch (op) {
+    case 'contains':    return t.includes(v);
+    case 'notContains': return !t.includes(v);
+    case 'equals':      return t === v;
+    case 'notEquals':   return t !== v;
+    case 'startsWith':  return t.startsWith(v);
+    case 'endsWith':    return t.endsWith(v);
+    case 'regex':
+      try { return new RegExp(raw, 'i').test(target); }
+      catch (_) { return false; }
+    default: return false;
+  }
+}
+
+function ruleMatches(rule, ctx) {
+  const conds = rule.conditions || [];
+  if (conds.length === 0) return false;
+  const results = conds.map((c) => evalCondition(c, ctx));
+  return rule.matchAll ? results.every(Boolean) : results.some(Boolean);
+}
+
+async function executeRuleActions({
+  accountEmail, accountPassword, accountHost, folder, uid, actions,
+}) {
+  let client;
+  const forwards = [];
+
+  try {
+    const conn = await connectImapAuto(accountEmail, accountPassword, accountHost);
+    client = conn.client;
+
+    const lock = await client.getMailboxLock(folder);
+    try {
+      // ───── FASE 1: flags (antes de mover)
+      for (const a of actions) {
+        const t = a.type;
+        if (t === 'markRead') {
+          await client.messageFlagsAdd(String(uid), ['\\Seen'], { uid: true }).catch(() => {});
+        } else if (t === 'markUnread') {
+          await client.messageFlagsRemove(String(uid), ['\\Seen'], { uid: true }).catch(() => {});
+        } else if (t === 'star') {
+          await client.messageFlagsAdd(String(uid), ['\\Flagged'], { uid: true }).catch(() => {});
+        } else if (t === 'unstar') {
+          await client.messageFlagsRemove(String(uid), ['\\Flagged'], { uid: true }).catch(() => {});
+        }
+      }
+
+      // ───── FASE 2: mover / borrar / spam (corta tras el move)
+      for (const a of actions) {
+        const t = a.type;
+        const v = a.value || '';
+
+        if (t === 'moveTo') {
+          if (!v) continue;
+          const list = await client.list();
+          const found = list.find(
+            (f) =>
+              f.path.toLowerCase() === v.toLowerCase() ||
+              f.name.toLowerCase() === v.toLowerCase()
+          );
+          const target = found ? found.path : v;
+          try {
+            await client.messageMove(String(uid), target, { uid: true });
+          } catch (e) {
+            console.log(`⚠️ Regla moveTo "${v}" falló: ${e.message}`);
+          }
+          try { lock.release(); } catch (_) {}
+          await client.logout();
+          client = null;
+          return true;
+        }
+
+        if (t === 'deleteMessage') {
+          const list = await client.list();
+          const trash = list.find(
+            (f) =>
+              f.specialUse === '\\Trash' ||
+              /papelera/i.test(f.name) ||
+              /^trash$/i.test(f.name)
+          )?.path || 'Trash';
+          try {
+            await client.messageMove(String(uid), trash, { uid: true });
+          } catch (e) {
+            await client.messageDelete(String(uid), { uid: true }).catch(() => {});
+          }
+          try { lock.release(); } catch (_) {}
+          await client.logout();
+          client = null;
+          return true;
+        }
+
+        if (t === 'markSpam') {
+          const list = await client.list();
+          const junk = list.find(
+            (f) =>
+              f.specialUse === '\\Junk' ||
+              /junk/i.test(f.name) ||
+              /spam/i.test(f.name)
+          )?.path;
+          if (junk) {
+            try {
+              await client.messageMove(String(uid), junk, { uid: true });
+              try { lock.release(); } catch (_) {}
+              await client.logout();
+              client = null;
+              return true;
+            } catch (e) {
+              console.log(`⚠️ Regla markSpam falló: ${e.message}`);
+            }
+          }
+        }
+
+        if (t === 'forward' && v) {
+          forwards.push(v);
+        }
+      }
+    } finally {
+      try { lock.release(); } catch (_) {}
+    }
+
+    await client.logout();
+    client = null;
+  } catch (e) {
+    console.log(`⚠️ Error ejecutando acciones: ${e.message}`);
+    if (client) await client.logout().catch(() => {});
+    return false;
+  }
+
+  // Forward fuera del lock (usa SMTP/Brevo)
+  for (const to of forwards) {
+    try {
+      await sendViaBrevo({
+        fromEmail: accountEmail,
+        fromName: '',
+        to,
+        subject: '[Reenviado por regla]',
+        html: '<p>Este mensaje ha sido reenviado por una regla de RSMail.</p>',
+      });
+    } catch (e) {
+      console.log(`⚠️ Regla forward falló: ${e.message}`);
+    }
+  }
+  return true;
+}
+
+async function applyRulesToMessage({
+  accountEmail, accountPassword, accountHost, uid, folder, parsed, envelope, size,
+}) {
+  if (!db) return;
+
+  const rules = await getRulesForAccount(accountEmail);
+  if (rules.length === 0) return;
+
+  const fromAddr = envelope?.from?.[0]?.address || '';
+  const fromName = envelope?.from?.[0]?.name || '';
+  const toAddr = (envelope?.to || []).map((t) => t.address).join(', ');
+  const ccAddr = (envelope?.cc || []).map((t) => t.address).join(', ');
+  const subject = envelope?.subject || '';
+  const hasAttachment = (parsed?.attachments || []).length > 0;
+  const sizeKb = Math.round((size || 0) / 1024);
+
+  const ctx = {
+    from: `${fromName} <${fromAddr}>`,
+    to: toAddr,
+    cc: ccAddr,
+    subject,
+    body: parsed?.text || '',
+    hasAttachment,
+    sizeKb,
+  };
+
+  for (const rule of rules) {
+    if (!ruleMatches(rule, ctx)) continue;
+    console.log(`✅ Regla "${rule.name}" coincide (UID ${uid})`);
+
+    await executeRuleActions({
+      accountEmail,
+      accountPassword,
+      accountHost,
+      folder,
+      uid,
+      actions: rule.actions || [],
+    });
+
+    if (rule.stopProcessing) {
+      console.log(`⏹️ Regla "${rule.name}" marcada como stopProcessing, fin`);
+      break;
+    }
   }
 }
 
@@ -621,6 +859,37 @@ async function processEmailsInRange(state, startUid, endUidNext) {
 
         console.log(`🔔 Correo entrante UID:${msg.uid} | De: ${from} | Asunto: ${subject}`);
 
+        // 🔥 REGLAS: aplicar antes de notificar
+        try {
+          const rules = await getRulesForAccount(state.email);
+          if (rules.length > 0) {
+            const needBody = rulesNeedBody(rules);
+            let parsed = null;
+            let source = null;
+            try {
+              const fetchOpts = needBody ? { source: true } : { size: true };
+              const full = await state.client.fetchOne(String(msg.uid), fetchOpts, { uid: true });
+              if (full?.source) parsed = await simpleParser(full.source);
+              source = full;
+            } catch (e) {
+              console.log(`⚠️ No se pudo bajar source para reglas: ${e.message}`);
+            }
+
+            await applyRulesToMessage({
+              accountEmail: state.email,
+              accountPassword: state.password,
+              accountHost: state.host,
+              uid: msg.uid,
+              folder: 'INBOX',
+              parsed,
+              envelope: msg.envelope,
+              size: source?.size || 0,
+            });
+          }
+        } catch (e) {
+          console.log(`⚠️ Error aplicando reglas: ${e.message}`);
+        }
+
         if (state.ws && state.ws.readyState === WebSocket.OPEN) {
           state.ws.send(JSON.stringify({
             type: 'new_email',
@@ -672,7 +941,6 @@ async function runImapLoop(state) {
       state.client = conn.client;
       state.host = conn.host;
 
-      // 🔥 readOnly para NO marcar \Seen
       await state.client.mailboxOpen('INBOX', { readOnly: true });
 
       const handleExists = async () => {
@@ -1416,6 +1684,13 @@ const handleAuth = async (req, res) => {
 app.post('/api/login', handleAuth);
 app.post('/api/verify', handleAuth);
 
+// 🔥 Reglas: invalidar caché
+app.post('/api/rules/invalidate', (req, res) => {
+  const { email } = req.body || {};
+  if (email) _rulesCache.delete(email);
+  res.json({ ok: true });
+});
+
 app.get('/ping', async (req, res) => {
   if (db) {
     try {
@@ -1498,6 +1773,19 @@ app.get('/api/debug/auto-config/:email', (req, res) => {
     imapCandidates,
     smtpCandidates,
   });
+});
+
+// 🔥 Reglas: debug
+app.get('/api/debug/rules/:email', async (req, res) => {
+  if (!db) return res.status(500).json({ error: 'Firestore no configurado' });
+  try {
+    const doc = await db.collection('rules_configs').doc(req.params.email).get();
+    if (!doc.exists) return res.json({ count: 0, rules: [] });
+    const rules = doc.data()?.rules || [];
+    res.json({ count: rules.length, rules });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/api/debug/reminders', async (req, res) => {
@@ -1688,7 +1976,6 @@ function detectAttachmentsFromStructure(structure) {
   return false;
 }
 
-// 🔥 FIX: readOnly
 app.post('/api/messages', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
 
@@ -1740,7 +2027,6 @@ app.post('/api/messages', async (req, res) => {
   }
 });
 
-// 🔥 FIX: readOnly
 app.post('/api/message-detail', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', uid } = req.body;
   if (!uid) return res.status(400).json({ success: false, error: 'UID requerido' });
@@ -1905,7 +2191,6 @@ app.post('/api/toggle-flagged', async (req, res) => {
   }
 });
 
-// 🔥 FIX: readOnly
 app.post('/api/download-attachment', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', uid, partId } = req.body;
   if (!uid || !partId) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
@@ -1959,7 +2244,6 @@ function parseListUnsubscribe(raw) {
   return result;
 }
 
-// 🔥 FIX: readOnly
 app.post('/api/scan-subscriptions', async (req, res) => {
   const { email, password, host, port, maxMessages = 500 } = req.body;
   if (!email || !password) return res.status(400).json({ success: false, error: 'Email y contraseña requeridos' });

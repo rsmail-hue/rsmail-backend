@@ -1,4 +1,4 @@
-﻿﻿﻿const express = require('express');
+﻿const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -430,7 +430,8 @@ async function runImapLoop(state) {
       state.client = conn.client;
       state.host = conn.host;
 
-      await state.client.mailboxOpen('INBOX');
+      // 🔥 FIX: abrir INBOX en modo solo lectura (NO marca \Seen)
+      await state.client.mailboxOpen('INBOX', { readOnly: true });
 
       const handleExists = async () => {
         try {
@@ -757,7 +758,6 @@ async function sendPushNotification(email, payload) {
 //  MODO CONFIDENCIAL
 // ------------------------------------------------------------
 
-// Crear un correo confidencial
 app.post('/api/confidential/create', async (req, res) => {
   if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
 
@@ -779,7 +779,7 @@ app.post('/api/confidential/create', async (req, res) => {
 
     let days = Number(expiresInDays);
     if (isNaN(days) || days < 1) days = 1;
-    if (days > 15) days = 15; // máximo 15 días
+    if (days > 15) days = 15;
 
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + days);
@@ -810,7 +810,6 @@ app.post('/api/confidential/create', async (req, res) => {
   }
 });
 
-// Abrir un confidencial
 app.post('/api/confidential/open/:id', async (req, res) => {
   if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
 
@@ -870,7 +869,6 @@ app.post('/api/confidential/open/:id', async (req, res) => {
   }
 });
 
-// Ver estado de un confidencial
 app.get('/api/confidential/status/:id', async (req, res) => {
   if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
 
@@ -897,7 +895,6 @@ app.get('/api/confidential/status/:id', async (req, res) => {
   }
 });
 
-// Revocar manualmente
 app.delete('/api/confidential/:id', async (req, res) => {
   if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
   try {
@@ -908,7 +905,6 @@ app.delete('/api/confidential/:id', async (req, res) => {
   }
 });
 
-// Página pública HTML del confidencial
 app.get('/confidential/:id', (req, res) => {
   const id = req.params.id;
   res.send(`<!DOCTYPE html>
@@ -1103,7 +1099,6 @@ init();
 </html>`);
 });
 
-// Cron: limpiar caducados antiguos cada 30 min
 cron.schedule('*/30 * * * *', async () => {
   if (!db) return;
   try {
@@ -1446,6 +1441,7 @@ function detectAttachmentsFromStructure(structure) {
   return false;
 }
 
+// 🔥 FIX: /api/messages ahora abre en solo lectura (NO marca \Seen)
 app.post('/api/messages', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
 
@@ -1454,7 +1450,7 @@ app.post('/api/messages', async (req, res) => {
     const conn = await connectImapAuto(email, password, host);
     client = conn.client;
 
-    const lock = await client.getMailboxLock(folder);
+    const lock = await client.getMailboxLock(folder, { readOnly: true });
     const messages = [];
 
     try {
@@ -1500,6 +1496,7 @@ app.post('/api/messages', async (req, res) => {
   }
 });
 
+// 🔥 FIX: /api/message-detail ahora abre en solo lectura (NO marca \Seen)
 app.post('/api/message-detail', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', uid } = req.body;
   if (!uid) return res.status(400).json({ success: false, error: 'UID requerido' });
@@ -1509,7 +1506,7 @@ app.post('/api/message-detail', async (req, res) => {
     const conn = await connectImapAuto(email, password, host);
     client = conn.client;
 
-    const lock = await client.getMailboxLock(folder);
+    const lock = await client.getMailboxLock(folder, { readOnly: true });
     let parsed;
     try {
       const msg = await client.fetchOne(String(uid), { source: true }, { uid: true });
@@ -1555,6 +1552,7 @@ app.post('/api/delete-message', async (req, res) => {
     const conn = await connectImapAuto(email, password, host);
     client = conn.client;
 
+    // Escritura necesaria
     const lock = await client.getMailboxLock(folder);
     try {
       const isAlreadyTrash = folder.toLowerCase().includes('trash') || folder.toLowerCase().includes('papelera');
@@ -1592,6 +1590,7 @@ app.post('/api/toggle-read', async (req, res) => {
     const conn = await connectImapAuto(email, password, host);
     client = conn.client;
 
+    // Escritura necesaria
     const lock = await client.getMailboxLock(folder);
     try {
       if (read) await client.messageFlagsAdd(String(uid), ['\\Seen'], { uid: true });
@@ -1616,6 +1615,7 @@ app.post('/api/mark-all-read', async (req, res) => {
     const conn = await connectImapAuto(email, password, host);
     client = conn.client;
 
+    // Escritura necesaria
     const lock = await client.getMailboxLock(folder);
     let total = 0;
     try {
@@ -1649,6 +1649,7 @@ app.post('/api/toggle-flagged', async (req, res) => {
     const conn = await connectImapAuto(email, password, host);
     client = conn.client;
 
+    // Escritura necesaria
     const lock = await client.getMailboxLock(folder);
     try {
       if (flagged) await client.messageFlagsAdd(String(uid), ['\\Flagged'], { uid: true });
@@ -1664,6 +1665,7 @@ app.post('/api/toggle-flagged', async (req, res) => {
   }
 });
 
+// 🔥 FIX: /api/download-attachment ahora abre en solo lectura (NO marca \Seen)
 app.post('/api/download-attachment', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', uid, partId } = req.body;
   if (!uid || !partId) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
@@ -1673,7 +1675,7 @@ app.post('/api/download-attachment', async (req, res) => {
     const conn = await connectImapAuto(email, password, host);
     client = conn.client;
 
-    const lock = await client.getMailboxLock(folder);
+    const lock = await client.getMailboxLock(folder, { readOnly: true });
     let msg;
     try {
       msg = await client.fetchOne(String(uid), { bodyParts: [partId] }, { uid: true });
@@ -1717,6 +1719,7 @@ function parseListUnsubscribe(raw) {
   return result;
 }
 
+// 🔥 FIX: /api/scan-subscriptions ahora abre en solo lectura (NO marca \Seen)
 app.post('/api/scan-subscriptions', async (req, res) => {
   const { email, password, host, port, maxMessages = 500 } = req.body;
   if (!email || !password) return res.status(400).json({ success: false, error: 'Email y contraseña requeridos' });
@@ -1726,7 +1729,7 @@ app.post('/api/scan-subscriptions', async (req, res) => {
     const conn = await connectImapAuto(email, password, host);
     client = conn.client;
 
-    const lock = await client.getMailboxLock('INBOX');
+    const lock = await client.getMailboxLock('INBOX', { readOnly: true });
     const subscriptions = new Map();
 
     try {

@@ -1,4 +1,4 @@
-﻿const express = require('express');
+﻿﻿﻿﻿const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -297,6 +297,239 @@ async function connectImapAuto(email, password, preferredHost = null) {
 }
 
 // ------------------------------------------------------------
+//  ENVÍO VIA BREVO (fallback)
+// ------------------------------------------------------------
+async function sendViaBrevo({ fromEmail, fromName, to, subject, html }) {
+  const brevoKey = process.env.BREVO_API_KEY;
+  if (!brevoKey) throw new Error('BREVO_API_KEY no configurada');
+
+  const payload = {
+    sender: { name: fromName || fromEmail.split('@')[0], email: fromEmail },
+    to: [{ email: to }],
+    subject,
+    htmlContent: html,
+  };
+
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'accept': 'application/json',
+      'api-key': brevoKey,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Brevo ${res.status}: ${body}`);
+  }
+  return true;
+}
+
+// ------------------------------------------------------------
+//  AUSENCIAS / VACACIONES (multi-período)
+// ------------------------------------------------------------
+
+/**
+ * Lee absences_configs/{email} y devuelve el período activo AHORA
+ * (o null si no hay ninguno).
+ */
+async function getActiveAbsencePeriod(accountEmail) {
+  if (!db) return null;
+  try {
+    const doc = await db.collection('absences_configs').doc(accountEmail).get();
+    if (!doc.exists) return null;
+
+    const data = doc.data() || {};
+    const periods = Array.isArray(data.periods) ? data.periods : [];
+    const now = Date.now();
+
+    for (const p of periods) {
+      if (!p.enabled) continue;
+      const start = p.startDate ? Date.parse(p.startDate) : null;
+      const end = p.endDate ? Date.parse(p.endDate) : null;
+      if (start && now < start) continue;
+      if (end && now > end) continue;
+      return p;
+    }
+    return null;
+  } catch (e) {
+    console.error('⚠️ Error leyendo absences_configs:', e.message);
+    return null;
+  }
+}
+
+async function checkAndSendAutoReply({
+  accountEmail,
+  accountPassword,
+  incomingFrom,
+  incomingSubject,
+  incomingUid,
+}) {
+  if (!db) return;
+
+  try {
+    const period = await getActiveAbsencePeriod(accountEmail);
+    if (!period) return; // Sin ausencia activa ahora mismo
+
+    const fromLower = (incomingFrom || '').toLowerCase();
+    if (!fromLower.includes('@')) return;
+    if (fromLower === accountEmail.toLowerCase()) return;
+
+    const ignorePatterns = [
+      'noreply@', 'no-reply@', 'no_reply@',
+      'mailer-daemon@', 'postmaster@',
+      'notifications@', 'notification@',
+      'bounce@', 'bounces@',
+    ];
+    if (ignorePatterns.some((p) => fromLower.includes(p))) {
+      console.log(`⏭️ Auto-reply: ignorando ${fromLower}`);
+      return;
+    }
+
+    // ¿Solo contactos?
+    if (period.onlyContacts) {
+      try {
+        const contactsSnap = await db
+          .collection('users').doc(accountEmail)
+          .collection('contacts')
+          .where('email', '==', fromLower)
+          .limit(1)
+          .get();
+        if (contactsSnap.empty) {
+          console.log(`⏭️ Auto-reply: ${fromLower} no está en contactos`);
+          return;
+        }
+      } catch (e) {
+        console.log('⚠️ Error consultando contactos:', e.message);
+      }
+    }
+
+    // Anti-spam: intervalo mínimo por remitente por período
+    const replyId =
+      `${accountEmail}__${period.id}__${fromLower}`.replace(/\//g, '_');
+    const sentRef = db.collection('vacation_sent_replies').doc(replyId);
+    const sentDoc = await sentRef.get();
+    const intervalMs = (period.replyIntervalDays || 4) * 24 * 60 * 60 * 1000;
+    if (sentDoc.exists) {
+      const prevTs = sentDoc.data().sentAt?.toDate?.()?.getTime?.() || 0;
+      if (prevTs && Date.now() - prevTs < intervalMs) {
+        console.log(`⏭️ Auto-reply: ya respondimos a ${fromLower} recientemente`);
+        return;
+      }
+    }
+
+    // HTML
+    const escapedBody = (period.body || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/\n/g, '<br>');
+
+    const escapedTitle = (period.title || 'Ausencia')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;');
+
+    const html = `
+<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#333;line-height:1.6;">
+  <div style="background:#E3F2FD;border-left:4px solid #1A73E8;
+              padding:10px 14px;margin-bottom:16px;border-radius:6px;">
+    <strong style="color:#0D47A1;">📤 Respuesta automática — ${escapedTitle}</strong>
+  </div>
+  <div>${escapedBody}</div>
+  <hr style="border:none;border-top:1px solid #ddd;margin:20px 0;">
+  <div style="font-size:11px;color:#888;font-style:italic;">
+    Este es un mensaje automático. No he leído tu correo todavía, pero lo veré cuando vuelva.
+    Recibí: "${(incomingSubject || '').replace(/"/g, '&quot;')}" de ${incomingFrom}.
+  </div>
+  <div style="margin-top:16px;padding-top:12px;border-top:2px solid #1A73E8;text-align:center;">
+    <p style="margin:0;font-size:11px;color:#1A73E8;font-weight:bold;">RSMail</p>
+    <p style="margin:4px 0 0 0;font-size:10px;color:#888;">Enviado desde RSMail, tu visor de confianza</p>
+  </div>
+</div>`;
+
+    const replySubject = `Re: ${incomingSubject || '(Sin asunto)'}`;
+    const autoReplySubject = period.subject
+      ? `${period.subject} — ${replySubject}`
+      : replySubject;
+
+    // SMTP intentos
+    let sent = false;
+    let lastError = null;
+    const smtpCandidates = getSmtpCandidates(accountEmail);
+
+    for (const c of smtpCandidates) {
+      try {
+        console.log(`📤 Auto-reply: probando ${c.host}:${c.port}...`);
+        const transporter = nodemailer.createTransport({
+          host: c.host, port: c.port, secure: c.secure,
+          auth: { user: accountEmail, pass: accountPassword },
+          tls: { rejectUnauthorized: false },
+          connectionTimeout: 10000,
+          greetingTimeout: 10000,
+          socketTimeout: 15000,
+        });
+
+        await transporter.sendMail({
+          from: accountEmail,
+          to: incomingFrom,
+          subject: autoReplySubject,
+          html,
+          headers: {
+            'Auto-Submitted': 'auto-replied',
+            'X-Auto-Response-Suppress': 'All',
+          },
+        });
+
+        sent = true;
+        console.log(`✅ Auto-reply enviado vía ${c.host}:${c.port}`);
+        break;
+      } catch (e) {
+        console.log(`   ⚠️ Falló: ${e.message}`);
+        lastError = e;
+      }
+    }
+
+    // Fallback Brevo
+    if (!sent && process.env.BREVO_API_KEY) {
+      try {
+        console.log('📤 Auto-reply: SMTP bloqueado, probando Brevo...');
+        await sendViaBrevo({
+          fromEmail: accountEmail,
+          fromName: '',
+          to: incomingFrom,
+          subject: autoReplySubject,
+          html,
+        });
+        sent = true;
+        console.log('✅ Auto-reply enviado vía Brevo');
+      } catch (e) {
+        console.log(`   ⚠️ Brevo falló: ${e.message}`);
+        lastError = e;
+      }
+    }
+
+    if (sent) {
+      await sentRef.set({
+        accountEmail,
+        periodId: period.id,
+        periodTitle: period.title,
+        senderEmail: fromLower,
+        originalSubject: incomingSubject,
+        originalUid: incomingUid,
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      console.log(`✅ Auto-reply a ${fromLower} registrado (período "${period.title}")`);
+    } else {
+      console.log(`❌ No se pudo enviar auto-reply a ${fromLower}: ${lastError?.message}`);
+    }
+  } catch (e) {
+    console.error('❌ Error en checkAndSendAutoReply:', e.message);
+  }
+}
+
+// ------------------------------------------------------------
 //  WEBSOCKETS
 // ------------------------------------------------------------
 wss.on('connection', (ws) => {
@@ -411,6 +644,15 @@ async function processEmailsInRange(state, startUid, endUidNext) {
             folder: 'INBOX',
           }
         });
+
+        // 🔥 AUTO-RESPUESTA (AUSENCIAS/VACACIONES)
+        await checkAndSendAutoReply({
+          accountEmail: state.email,
+          accountPassword: state.password,
+          incomingFrom: from,
+          incomingSubject: subject,
+          incomingUid: msg.uid,
+        });
       }
     }
   } catch (err) {
@@ -430,7 +672,7 @@ async function runImapLoop(state) {
       state.client = conn.client;
       state.host = conn.host;
 
-      // 🔥 FIX: abrir INBOX en modo solo lectura (NO marca \Seen)
+      // 🔥 readOnly para NO marcar \Seen
       await state.client.mailboxOpen('INBOX', { readOnly: true });
 
       const handleExists = async () => {
@@ -685,6 +927,30 @@ cron.schedule('* * * * *', async () => {
 });
 
 // ------------------------------------------------------------
+//  CRON: LIMPIAR RESPUESTAS VACACIONES ANTIGUAS (cada 6h)
+// ------------------------------------------------------------
+cron.schedule('0 */6 * * *', async () => {
+  if (!db) return;
+  try {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - 30);
+    const snap = await db.collection('vacation_sent_replies')
+      .where('sentAt', '<', admin.firestore.Timestamp.fromDate(cutoff))
+      .get();
+    let deleted = 0;
+    for (const doc of snap.docs) {
+      await doc.ref.delete();
+      deleted++;
+    }
+    if (deleted > 0) {
+      console.log(`🗑️ Limpiados ${deleted} registros de auto-reply antiguos`);
+    }
+  } catch (e) {
+    console.error('⚠️ Error limpiando auto-replies:', e.message);
+  }
+});
+
+// ------------------------------------------------------------
 //  FCM PUSH
 // ------------------------------------------------------------
 async function sendPushNotification(email, payload) {
@@ -757,20 +1023,13 @@ async function sendPushNotification(email, payload) {
 // ------------------------------------------------------------
 //  MODO CONFIDENCIAL
 // ------------------------------------------------------------
-
 app.post('/api/confidential/create', async (req, res) => {
   if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
 
   try {
     const {
-      ownerId,
-      accountEmail,
-      to,
-      subject,
-      body,
-      password,
-      expiresInDays,
-      note,
+      ownerId, accountEmail, to, subject, body,
+      password, expiresInDays, note,
     } = req.body;
 
     if (!ownerId || !body || !expiresInDays) {
@@ -785,11 +1044,7 @@ app.post('/api/confidential/create', async (req, res) => {
     expiresAt.setDate(expiresAt.getDate() + days);
 
     const ref = await db.collection('confidential_emails').add({
-      ownerId,
-      accountEmail,
-      to,
-      subject,
-      body,
+      ownerId, accountEmail, to, subject, body,
       password: password || null,
       expiresAt: admin.firestore.Timestamp.fromDate(expiresAt),
       note: note || '',
@@ -824,26 +1079,18 @@ app.post('/api/confidential/open/:id', async (req, res) => {
     }
 
     const data = doc.data();
-
     const expiresAt = data.expiresAt?.toDate ? data.expiresAt.toDate() : new Date(data.expiresAt);
     if (expiresAt < new Date()) {
       return res.status(410).json({ success: false, error: 'Este enlace ha caducado' });
     }
 
     if (data.password) {
-      if (!password) {
-        return res.status(401).json({ success: false, error: 'Contraseña requerida' });
-      }
-      if (password !== data.password) {
-        return res.status(401).json({ success: false, error: 'Contraseña incorrecta' });
-      }
+      if (!password) return res.status(401).json({ success: false, error: 'Contraseña requerida' });
+      if (password !== data.password) return res.status(401).json({ success: false, error: 'Contraseña incorrecta' });
     }
 
     const views = data.views || [];
-    views.push({
-      at: new Date().toISOString(),
-      ip: ip,
-    });
+    views.push({ at: new Date().toISOString(), ip });
     await doc.ref.update({ views });
 
     if (data.accountEmail) {
@@ -1441,7 +1688,7 @@ function detectAttachmentsFromStructure(structure) {
   return false;
 }
 
-// 🔥 FIX: /api/messages ahora abre en solo lectura (NO marca \Seen)
+// 🔥 FIX: readOnly
 app.post('/api/messages', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
 
@@ -1462,11 +1709,8 @@ app.post('/api/messages', async (req, res) => {
 
       for await (const msg of iter) {
         let flags = msg.flags;
-        if (flags instanceof Set) {
-          flags = Array.from(flags);
-        } else if (!Array.isArray(flags)) {
-          flags = [];
-        }
+        if (flags instanceof Set) flags = Array.from(flags);
+        else if (!Array.isArray(flags)) flags = [];
 
         const hasAttachments = detectAttachmentsFromStructure(msg.bodyStructure);
 
@@ -1496,7 +1740,7 @@ app.post('/api/messages', async (req, res) => {
   }
 });
 
-// 🔥 FIX: /api/message-detail ahora abre en solo lectura (NO marca \Seen)
+// 🔥 FIX: readOnly
 app.post('/api/message-detail', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', uid } = req.body;
   if (!uid) return res.status(400).json({ success: false, error: 'UID requerido' });
@@ -1552,7 +1796,6 @@ app.post('/api/delete-message', async (req, res) => {
     const conn = await connectImapAuto(email, password, host);
     client = conn.client;
 
-    // Escritura necesaria
     const lock = await client.getMailboxLock(folder);
     try {
       const isAlreadyTrash = folder.toLowerCase().includes('trash') || folder.toLowerCase().includes('papelera');
@@ -1590,7 +1833,6 @@ app.post('/api/toggle-read', async (req, res) => {
     const conn = await connectImapAuto(email, password, host);
     client = conn.client;
 
-    // Escritura necesaria
     const lock = await client.getMailboxLock(folder);
     try {
       if (read) await client.messageFlagsAdd(String(uid), ['\\Seen'], { uid: true });
@@ -1615,7 +1857,6 @@ app.post('/api/mark-all-read', async (req, res) => {
     const conn = await connectImapAuto(email, password, host);
     client = conn.client;
 
-    // Escritura necesaria
     const lock = await client.getMailboxLock(folder);
     let total = 0;
     try {
@@ -1649,7 +1890,6 @@ app.post('/api/toggle-flagged', async (req, res) => {
     const conn = await connectImapAuto(email, password, host);
     client = conn.client;
 
-    // Escritura necesaria
     const lock = await client.getMailboxLock(folder);
     try {
       if (flagged) await client.messageFlagsAdd(String(uid), ['\\Flagged'], { uid: true });
@@ -1665,7 +1905,7 @@ app.post('/api/toggle-flagged', async (req, res) => {
   }
 });
 
-// 🔥 FIX: /api/download-attachment ahora abre en solo lectura (NO marca \Seen)
+// 🔥 FIX: readOnly
 app.post('/api/download-attachment', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', uid, partId } = req.body;
   if (!uid || !partId) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
@@ -1719,7 +1959,7 @@ function parseListUnsubscribe(raw) {
   return result;
 }
 
-// 🔥 FIX: /api/scan-subscriptions ahora abre en solo lectura (NO marca \Seen)
+// 🔥 FIX: readOnly
 app.post('/api/scan-subscriptions', async (req, res) => {
   const { email, password, host, port, maxMessages = 500 } = req.body;
   if (!email || !password) return res.status(400).json({ success: false, error: 'Email y contraseña requeridos' });

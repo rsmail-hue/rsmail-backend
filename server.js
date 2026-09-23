@@ -1,4 +1,4 @@
-﻿﻿const express = require('express');
+﻿﻿﻿﻿const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -609,7 +609,7 @@ async function executeRuleActions({
 
     const lock = await client.getMailboxLock(folder);
     try {
-      // ───── FASE 1: flags (antes de mover)
+      // FASE 1: flags antes de mover
       for (const a of actions) {
         const t = a.type;
         if (t === 'markRead') {
@@ -623,7 +623,7 @@ async function executeRuleActions({
         }
       }
 
-      // ───── FASE 2: mover / borrar / spam (corta tras el move)
+      // FASE 2: mover / borrar / spam
       for (const a of actions) {
         const t = a.type;
         const v = a.value || '';
@@ -704,7 +704,6 @@ async function executeRuleActions({
     return false;
   }
 
-  // Forward fuera del lock (usa SMTP/Brevo)
   for (const to of forwards) {
     try {
       await sendViaBrevo({
@@ -766,6 +765,180 @@ async function applyRulesToMessage({
     }
   }
 }
+
+// ------------------------------------------------------------
+//  TRADUCCIÓN AUTOMÁTICA
+// ------------------------------------------------------------
+const _translateCache = new Map(); // hash -> { translated, ts }
+const TRANSLATE_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6h
+
+function _simpleHash(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+  }
+  return (h >>> 0).toString(16);
+}
+
+async function googleTranslate(text, target, source = 'auto', format = 'text') {
+  const url = new URL('https://translate.googleapis.com/translate_a/single');
+  url.searchParams.set('client', 'gtx');
+  url.searchParams.set('sl', source);
+  url.searchParams.set('tl', target);
+  url.searchParams.set('dt', 't');
+  url.searchParams.set('q', text);
+  if (format === 'html') url.searchParams.set('format', 'html');
+
+  const res = await fetch(url.toString(), {
+    headers: { 'User-Agent': 'RSMail/3.0' },
+  });
+  if (!res.ok) throw new Error(`google ${res.status}`);
+  const data = await res.json();
+
+  const translated = Array.isArray(data?.[0])
+    ? data[0].map((chunk) => chunk?.[0] || '').join('')
+    : '';
+  const detected = data?.[2] || source;
+  return { translated, detectedSource: detected };
+}
+
+async function libreTranslate(text, target, source = 'auto', format = 'text') {
+  const res = await fetch('https://libretranslate.com/translate', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': 'RSMail/3.0',
+    },
+    body: JSON.stringify({
+      q: text,
+      source: source === 'auto' ? 'auto' : source,
+      target,
+      format,
+    }),
+  });
+  if (!res.ok) throw new Error(`libre ${res.status}`);
+  const data = await res.json();
+  return {
+    translated: data?.translatedText || text,
+    detectedSource: data?.detectedLanguage?.language || source,
+  };
+}
+
+app.post('/api/translate', async (req, res) => {
+  try {
+    const {
+      text,
+      target = 'es',
+      source = 'auto',
+      format = 'text',
+    } = req.body || {};
+
+    if (!text || typeof text !== 'string') {
+      return res.status(400).json({ error: 'text_required' });
+    }
+    if (text.length > 60000) {
+      return res.status(413).json({ error: 'text_too_long' });
+    }
+
+    const cacheKey = `${target}_${source}_${format}_${_simpleHash(text)}`;
+    const now = Date.now();
+
+    // 1. Cache memoria
+    const cached = _translateCache.get(cacheKey);
+    if (cached && now - cached.ts < TRANSLATE_CACHE_TTL_MS) {
+      return res.json({
+        translated: cached.translated,
+        detectedSource: cached.detectedSource,
+        cached: true,
+      });
+    }
+
+    // 2. Firestore (persistente)
+    if (db) {
+      try {
+        const doc = await db.collection('translation_cache').doc(cacheKey).get();
+        if (doc.exists && doc.data()?.translated) {
+          const d = doc.data();
+          _translateCache.set(cacheKey, {
+            translated: d.translated,
+            detectedSource: d.detectedSource || source,
+            ts: now,
+          });
+          return res.json({
+            translated: d.translated,
+            detectedSource: d.detectedSource || source,
+            cached: true,
+          });
+        }
+      } catch (_) {}
+    }
+
+    // 3. Proveedor
+    let result;
+    try {
+      result = await googleTranslate(text, target, source, format);
+    } catch (e1) {
+      console.log(`⚠️ Google Translate falló: ${e1.message}, probando LibreTranslate`);
+      try {
+        result = await libreTranslate(text, target, source, format);
+      } catch (e2) {
+        console.error(`❌ Ambos traductores fallaron: ${e2.message}`);
+        return res.status(502).json({ error: 'translate_failed' });
+      }
+    }
+
+    // 4. Guardar en caches
+    _translateCache.set(cacheKey, {
+      translated: result.translated,
+      detectedSource: result.detectedSource,
+      ts: now,
+    });
+
+    if (db) {
+      db.collection('translation_cache').doc(cacheKey).set({
+        translated: result.translated,
+        detectedSource: result.detectedSource,
+        target,
+        source,
+        format,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(() => {});
+    }
+
+    res.json({
+      translated: result.translated,
+      detectedSource: result.detectedSource,
+      cached: false,
+    });
+  } catch (e) {
+    console.error('❌ /api/translate error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Limpieza de cache de traducción antigua (cada 12h)
+cron.schedule('0 */12 * * *', async () => {
+  if (!db) return;
+  try {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - 60);
+    const snap = await db
+      .collection('translation_cache')
+      .where('createdAt', '<', admin.firestore.Timestamp.fromDate(cutoff))
+      .limit(500)
+      .get();
+    let deleted = 0;
+    for (const doc of snap.docs) {
+      await doc.ref.delete();
+      deleted++;
+    }
+    if (deleted > 0) {
+      console.log(`🗑️ Limpiadas ${deleted} traducciones antiguas`);
+    }
+  } catch (e) {
+    console.error('⚠️ Error limpiando traducciones:', e.message);
+  }
+});
 
 // ------------------------------------------------------------
 //  WEBSOCKETS
@@ -1783,6 +1956,20 @@ app.get('/api/debug/rules/:email', async (req, res) => {
     if (!doc.exists) return res.json({ count: 0, rules: [] });
     const rules = doc.data()?.rules || [];
     res.json({ count: rules.length, rules });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 🔥 Traducción: debug
+app.get('/api/debug/translate/:email', async (req, res) => {
+  if (!db) return res.status(500).json({ error: 'Firestore no configurado' });
+  try {
+    const doc = await db
+        .collection('translation_configs')
+        .doc(req.params.email)
+        .get();
+    res.json(doc.exists ? doc.data() : { enabled: false });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

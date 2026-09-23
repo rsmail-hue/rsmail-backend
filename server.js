@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿const express = require('express');
+﻿﻿const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -2118,6 +2118,63 @@ app.post('/api/send-notification', async (req, res) => {
   }
 });
 
+// ------------------------------------------------------------
+//  CHAT — Notificar mensaje nuevo
+// ------------------------------------------------------------
+app.post('/api/chat/notify', async (req, res) => {
+  if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
+
+  const {
+    conversationId,
+    senderEmail,
+    senderName,
+    recipientEmails,
+    text,
+    isGroup,
+    groupName,
+  } = req.body;
+
+  if (!conversationId || !senderEmail || !Array.isArray(recipientEmails)) {
+    return res.status(400).json({ success: false, error: 'Faltan parámetros' });
+  }
+
+  const senderDisplay = senderName || senderEmail.split('@')[0];
+  const preview = (text || '').length > 120
+    ? text.substring(0, 120) + '…'
+    : text || 'Nuevo mensaje';
+
+  const title = isGroup && groupName
+    ? `${groupName} · ${senderDisplay}`
+    : `💬 ${senderDisplay}`;
+
+  const notified = [];
+
+  for (const recipient of recipientEmails) {
+    const email = String(recipient).toLowerCase();
+    if (email === senderEmail.toLowerCase()) continue;
+
+    try {
+      await sendPushNotification(email, {
+        title,
+        body: preview,
+        data: {
+          type: 'chat_message',
+          conversationId,
+          senderEmail,
+          senderName: senderDisplay,
+          isGroup: isGroup ? 'true' : 'false',
+          groupName: groupName || '',
+        },
+      });
+      notified.push(email);
+    } catch (e) {
+      console.log(`⚠️ No se pudo notificar a ${email}:`, e.message);
+    }
+  }
+
+  res.json({ success: true, notified });
+});
+
 app.post('/api/send-email', async (req, res) => {
   const { email, password, host, port, to, subject, body, attachments } = req.body;
   if (!email || !password || !to) return res.status(400).json({ success: false, error: 'Faltan campos' });
@@ -2618,12 +2675,10 @@ app.post('/api/download-attachment', async (req, res) => {
 
     let target = null;
 
-    // 1. Por filename
     if (filename) {
       target = attachments.find((a) => a.filename === filename);
     }
 
-    // 2. Por partId numérico → índice
     if (!target && partId) {
       const cleaned = String(partId).trim();
       const parts = cleaned.split('.').map((p) => parseInt(p, 10) || 0);
@@ -2633,7 +2688,6 @@ app.post('/api/download-attachment', async (req, res) => {
       }
     }
 
-    // 3. Si solo hay uno, ese
     if (!target && attachments.length === 1) {
       target = attachments[0];
     }

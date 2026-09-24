@@ -32,39 +32,62 @@ if (CLOUDINARY_ENABLED) {
 }
 
 // ------------------------------------------------------------
-//  FIREBASE ADMIN (FCM)
+//  FIREBASE ADMIN (FCM) — inicialización defensiva
 // ------------------------------------------------------------
-if (!admin.apps.length) {
-  if (process.env.FIREBASE_PRIVATE_KEY) {
-    try {
-      let formattedKey = process.env.FIREBASE_PRIVATE_KEY;
-      formattedKey = formattedKey.replace(/^"|"$/g, '').replace(/\\n/g, '\n');
+let db = null;
+try {
+  let adminVersion = 'desconocida';
+  try {
+    adminVersion = require('firebase-admin/package.json').version;
+  } catch (_) {}
+  console.log('🔧 firebase-admin versión:', adminVersion);
+  console.log('🔧 typeof admin.apps:', typeof admin.apps);
 
-      admin.initializeApp({
-        credential: admin.credential.cert({
-          projectId: process.env.FIREBASE_PROJECT_ID,
-          clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-          privateKey: formattedKey,
-        }),
-      });
-      console.log('✅ Firebase Admin inicializado con variables de entorno');
-    } catch (e) {
-      console.error('❌ Error al inicializar Firebase:', e.message);
+  const hasApps = admin && Array.isArray(admin.apps) && admin.apps.length > 0;
+
+  if (!hasApps) {
+    if (process.env.FIREBASE_PRIVATE_KEY) {
+      try {
+        let formattedKey = process.env.FIREBASE_PRIVATE_KEY;
+        formattedKey = formattedKey.replace(/^"|"$/g, '').replace(/\\n/g, '\n');
+
+        admin.initializeApp({
+          credential: admin.credential.cert({
+            projectId: process.env.FIREBASE_PROJECT_ID,
+            clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+            privateKey: formattedKey,
+          }),
+        });
+        console.log('✅ Firebase Admin inicializado con variables de entorno');
+      } catch (e) {
+        console.error('❌ Error al inicializar Firebase con env vars:', e.message);
+      }
+    } else {
+      try {
+        const serviceAccount = require('./serviceAccountKey.json');
+        admin.initializeApp({
+          credential: admin.credential.cert(serviceAccount),
+        });
+        console.log('✅ Firebase Admin inicializado con serviceAccountKey.json');
+      } catch (e) {
+        console.error('⚠️ Sin credenciales de Firebase. Push deshabilitadas.');
+      }
     }
   } else {
-    try {
-      const serviceAccount = require('./serviceAccountKey.json');
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-      });
-      console.log('✅ Firebase Admin inicializado con serviceAccountKey.json');
-    } catch (e) {
-      console.error('⚠️ Sin credenciales de Firebase. Push deshabilitadas.');
-    }
+    console.log('ℹ️ Firebase Admin ya estaba inicializado');
   }
-}
 
-const db = admin.apps.length ? admin.firestore() : null;
+  if (admin && Array.isArray(admin.apps) && admin.apps.length > 0) {
+    db = admin.firestore();
+    console.log('✅ Firestore listo');
+  } else {
+    console.warn('⚠️ Firestore NO disponible. Se deshabilitan push, workers persistentes, etc.');
+  }
+} catch (e) {
+  console.error('❌ Error crítico inicializando Firebase:', e.message);
+  console.error(e.stack);
+  db = null;
+}
 
 const app = express();
 app.use(cors());
@@ -74,19 +97,17 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
-//  🔥 NUEVO OAuth: Helpers Microsoft OAuth2
+//  🔥 Microsoft OAuth2 — Helpers
 // ------------------------------------------------------------
 const MICROSOFT_CLIENT_ID = process.env.MICROSOFT_CLIENT_ID || '';
 const MICROSOFT_SCOPES =
   'https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send offline_access openid profile';
 
-// Cache de access tokens en memoria: { email: { token, expiresAt } }
+// Cache de access tokens en memoria: { cacheKey: { accessToken, expiresAt } }
 const msAccessTokenCache = new Map();
 
 /**
  * Detecta si una "password" guardada es en realidad un refresh_token de Microsoft.
- * Los refresh tokens de Microsoft suelen tener 500-1500+ caracteres.
- * Las contraseñas normales y app passwords son mucho más cortas.
  */
 function isMicrosoftOAuthAccount(email, password) {
   if (!password) return false;
@@ -99,7 +120,6 @@ function isMicrosoftOAuthAccount(email, password) {
     emailLower.endsWith('@msn.com') ||
     emailLower.includes('.onmicrosoft.com');
 
-  // Un refresh_token de MS es muy largo (>300 chars) y no tiene espacios
   const looksLikeRefreshToken =
     password.length > 300 && !password.includes(' ') && !password.includes('\n');
 
@@ -108,14 +128,12 @@ function isMicrosoftOAuthAccount(email, password) {
 
 /**
  * Intercambia el refresh_token por un access_token nuevo.
- * Cachea el access_token durante ~50 min para no pedir uno nuevo en cada petición.
  */
 async function getMicrosoftAccessToken(refreshToken) {
   if (!MICROSOFT_CLIENT_ID) {
     throw new Error('MICROSOFT_CLIENT_ID no configurado en el servidor');
   }
 
-  // Cache por hash corto del refresh token
   const cacheKey = refreshToken.substring(0, 40);
   const cached = msAccessTokenCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
@@ -150,16 +168,14 @@ async function getMicrosoftAccessToken(refreshToken) {
   const expiresIn = (data.expires_in || 3600) * 1000;
   msAccessTokenCache.set(cacheKey, {
     accessToken: data.access_token,
-    expiresAt: Date.now() + expiresIn - 60000, // 1 min de margen
+    expiresAt: Date.now() + expiresIn - 60000,
   });
 
   return data.access_token;
 }
 
 /**
- * Obtiene el access_token que hay que usar para IMAP/SMTP.
- * Si la cuenta es Microsoft OAuth, renueva el token.
- * Si no, devuelve null (usar password normal).
+ * Obtiene el access_token a usar para IMAP/SMTP.
  */
 async function resolveAccessToken(email, password) {
   if (!isMicrosoftOAuthAccount(email, password)) return null;
@@ -172,12 +188,12 @@ async function resolveAccessToken(email, password) {
 }
 
 // ------------------------------------------------------------
-//  WORKERS IMAP PERSISTENTES (con IDLE)
+//  WORKERS IMAP PERSISTENTES
 // ------------------------------------------------------------
 const activeWorkers = new Map();
 
 // ------------------------------------------------------------
-//  AUTO-CONFIG UNIVERSAL (cualquier proveedor)
+//  AUTO-CONFIG UNIVERSAL
 // ------------------------------------------------------------
 function getAutoConfig(email) {
   if (!email) return null;
@@ -376,10 +392,9 @@ async function saveLastUid(email, uid) {
   }
 }
 
-// 🔥 MODIFICADO: soporta accessToken para Microsoft OAuth2
 async function connectImap(email, password, host, port, secure, accessToken = null) {
   const auth = accessToken
-    ? { user: email, accessToken: accessToken }  // ImapFlow usa XOAUTH2 automáticamente
+    ? { user: email, accessToken: accessToken }
     : { user: email, pass: password };
 
   const config = {
@@ -405,7 +420,6 @@ async function connectImap(email, password, host, port, secure, accessToken = nu
   return client;
 }
 
-// 🔥 MODIFICADO: resuelve access_token si es Microsoft OAuth
 async function connectImapAuto(email, password, preferredHost = null) {
   const accessToken = await resolveAccessToken(email, password);
 
@@ -432,7 +446,7 @@ async function connectImapAuto(email, password, preferredHost = null) {
 }
 
 // ------------------------------------------------------------
-//  🔥 NUEVO OAuth: Crear transporter SMTP con soporte OAuth2
+//  SMTP con soporte OAuth2
 // ------------------------------------------------------------
 async function createSmtpTransporter({ email, password, host, port, secure }) {
   const accessToken = await resolveAccessToken(email, password);
@@ -489,7 +503,7 @@ async function sendViaBrevo({ fromEmail, fromName, to, subject, html }) {
 }
 
 // ------------------------------------------------------------
-//  AUSENCIAS / VACACIONES (multi-período)
+//  AUSENCIAS / VACACIONES
 // ------------------------------------------------------------
 async function getActiveAbsencePeriod(accountEmail) {
   if (!db) return null;
@@ -1175,11 +1189,11 @@ cron.schedule('0 */12 * * *', async () => {
 });
 
 // ------------------------------------------------------------
-//  CHAT — SUBIDA DE ARCHIVOS (Cloudinary + fallback local)
+//  CHAT — SUBIDA DE ARCHIVOS
 // ------------------------------------------------------------
 const multerMemory = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 }, // 25 MB
+  limits: { fileSize: 25 * 1024 * 1024 },
 });
 
 app.post(
@@ -1195,7 +1209,6 @@ app.post(
       const size = req.file.size || 0;
       const mimetype = req.file.mimetype || 'application/octet-stream';
 
-      // 1. Cloudinary (recomendado)
       if (CLOUDINARY_ENABLED) {
         try {
           const isImage = mimetype.startsWith('image/');
@@ -1239,7 +1252,6 @@ app.post(
         }
       }
 
-      // 2. Fallback local (efímero en Render free)
       const fs = require('fs');
       const path = require('path');
       const dir = path.join(__dirname, 'uploads', 'chat');
@@ -1598,7 +1610,7 @@ cron.schedule('* * * * *', async () => {
 });
 
 // ------------------------------------------------------------
-//  CRON: REANIMACIÓN DE WORKERS CAÍDOS (cada 3 min)
+//  CRON: REANIMACIÓN DE WORKERS CAÍDOS
 // ------------------------------------------------------------
 cron.schedule('*/3 * * * *', async () => {
   if (!db) return;
@@ -1627,7 +1639,7 @@ cron.schedule('*/3 * * * *', async () => {
 });
 
 // ------------------------------------------------------------
-//  CRON: RECORDATORIOS DE CORREO (cada minuto)
+//  CRON: RECORDATORIOS DE CORREO
 // ------------------------------------------------------------
 cron.schedule('* * * * *', async () => {
   if (!db) return;
@@ -1708,7 +1720,7 @@ cron.schedule('* * * * *', async () => {
 });
 
 // ------------------------------------------------------------
-//  CRON: LIMPIAR RESPUESTAS VACACIONES ANTIGUAS (cada 6h)
+//  CRON: LIMPIAR RESPUESTAS VACACIONES ANTIGUAS
 // ------------------------------------------------------------
 cron.schedule('0 */6 * * *', async () => {
   if (!db) return;
@@ -2192,7 +2204,7 @@ const handleAuth = async (req, res) => {
 };
 
 // ------------------------------------------------------------
-//  🔥 NUEVO OAuth: Endpoint /api/microsoft/login
+//  OAuth2 Microsoft — Endpoint /api/microsoft/login
 // ------------------------------------------------------------
 app.post('/api/microsoft/login', async (req, res) => {
   const { email, refreshToken } = req.body;
@@ -2214,10 +2226,8 @@ app.post('/api/microsoft/login', async (req, res) => {
   try {
     console.log(`🔐 Microsoft login para ${email}...`);
 
-    // 1. Verificar que el refresh_token es válido obteniendo un access_token
     const accessToken = await getMicrosoftAccessToken(refreshToken);
 
-    // 2. Verificar que podemos conectar IMAP con OAuth2
     const testClient = new ImapFlow({
       host: 'outlook.office365.com',
       port: 993,
@@ -2231,10 +2241,7 @@ app.post('/api/microsoft/login', async (req, res) => {
     await testClient.connect();
     await testClient.logout().catch(() => {});
 
-    // 3. Guardar la cuenta (el refresh_token va en el campo password)
     saveAccount(email, refreshToken, 'outlook.office365.com');
-
-    // 4. Arrancar worker
     startImapWorker(email, refreshToken, 'outlook.office365.com');
 
     return res.json({
@@ -2316,6 +2323,7 @@ app.get('/ping', async (req, res) => {
     alive: true,
     ts: new Date().toISOString(),
     workers: activeWorkers.size,
+    firestore: !!db,
   });
 });
 
@@ -2339,6 +2347,7 @@ app.get('/api/debug/workers', (req, res) => {
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
     microsoftClientIdConfigured: !!MICROSOFT_CLIENT_ID,
+    firestoreAvailable: !!db,
   });
 });
 
@@ -2513,7 +2522,6 @@ app.post('/api/chat/notify', async (req, res) => {
   res.json({ success: true, notified });
 });
 
-// 🔥 MODIFICADO: usa createSmtpTransporter (soporta OAuth2)
 app.post('/api/send-email', async (req, res) => {
   const { email, password, host, port, to, subject, body, attachments } = req.body;
   if (!email || !password || !to) return res.status(400).json({ success: false, error: 'Faltan campos' });
@@ -3177,7 +3185,6 @@ app.post('/api/scan-subscriptions', async (req, res) => {
   }
 });
 
-// 🔥 MODIFICADO: usa createSmtpTransporter para mailto unsubscribe
 app.post('/api/unsubscribe', async (req, res) => {
   const { email, password, listUnsubscribe, listUnsubscribePost } = req.body;
 
@@ -3261,6 +3268,7 @@ app.post('/api/unsubscribe', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, async () => {
   console.log(`✅ Backend RSMAIL activo en puerto ${PORT}`);
+  console.log(`   Firestore: ${db ? 'OK' : 'NO DISPONIBLE'}`);
   console.log(`   Microsoft OAuth client_id: ${MICROSOFT_CLIENT_ID ? MICROSOFT_CLIENT_ID.substring(0, 12) + '...' : '❌ NO CONFIGURADO'}`);
   await restoreWorkers();
 });

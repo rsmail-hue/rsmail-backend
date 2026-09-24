@@ -116,8 +116,6 @@ const msAccessTokenCache = new Map();
 function isMicrosoftOAuthAccount(email, password) {
   if (!password) return false;
 
-  // Un refresh_token real de Microsoft es MUY largo (suele > 500 chars).
-  // Una contraseña normal o app password es < 100 chars.
   const looksLikeRefreshToken =
     password.length > 200 && !password.includes(' ') && !password.includes('\n');
 
@@ -189,6 +187,36 @@ async function resolveAccessToken(email, password) {
 //  WORKERS IMAP PERSISTENTES
 // ------------------------------------------------------------
 const activeWorkers = new Map();
+
+// 🔥 Circuit breaker para cuentas que fallan repetidamente
+const failedAccounts = new Map(); // { email: { count, until } }
+const MAX_FAILURES = 5;
+const FAILURE_COOLDOWN_MS = 60 * 60 * 1000; // 1 hora
+
+function recordWorkerFailure(email) {
+  const entry = failedAccounts.get(email) || { count: 0, until: 0 };
+  entry.count++;
+  if (entry.count >= MAX_FAILURES) {
+    entry.until = Date.now() + FAILURE_COOLDOWN_MS;
+    console.log(`🚫 Cuenta ${email} bloqueada tras ${MAX_FAILURES} intentos. Cooldown 1h.`);
+  }
+  failedAccounts.set(email, entry);
+}
+
+function resetWorkerFailure(email) {
+  failedAccounts.delete(email);
+}
+
+function isAccountBlocked(email) {
+  const entry = failedAccounts.get(email);
+  if (!entry) return false;
+  if (entry.until && Date.now() < entry.until) return true;
+  if (entry.until && Date.now() >= entry.until) {
+    failedAccounts.delete(email);
+    return false;
+  }
+  return false;
+}
 
 // ------------------------------------------------------------
 //  AUTO-CONFIG UNIVERSAL
@@ -1343,6 +1371,12 @@ function startImapWorker(email, password, customHost, ws = null) {
     return;
   }
 
+  // 🔥 Si la cuenta está en cooldown, no arrancar
+  if (isAccountBlocked(email)) {
+    console.log(`🚫 Worker ${email} en cooldown, no se arranca`);
+    return;
+  }
+
   const auto = getAutoConfig(email);
   const host = customHost || (auto ? auto.imapHost : 'mail.' + email.split('@')[1]);
 
@@ -1463,6 +1497,7 @@ async function runImapLoop(state) {
       const conn = await connectImapAuto(state.email, state.password, state.host);
       state.client = conn.client;
       state.host = conn.host;
+      resetWorkerFailure(state.email); // 🔥 Resetear contador de fallos al conectar OK
 
       await state.client.mailboxOpen('INBOX', { readOnly: true });
 
@@ -1525,6 +1560,10 @@ async function runImapLoop(state) {
     } catch (e) {
       if (state.active) {
         console.log(`⚠️ IMAP caído para ${state.email}: ${e.message}`);
+        // 🔥 Si el error es fatal (credenciales), aplicar circuit breaker
+        if (/Login is disabled|invalid credentials|auth/i.test(e.message)) {
+          recordWorkerFailure(state.email);
+        }
       }
     } finally {
       if (state.client) {
@@ -1535,8 +1574,13 @@ async function runImapLoop(state) {
     }
 
     if (state.active) {
-      console.log(`⏳ Reconectando IMAP ${state.email} en 10s...`);
-      await new Promise(r => setTimeout(r, 10000));
+      if (isAccountBlocked(state.email)) {
+        console.log(`🚫 Worker ${state.email} en cooldown. Esperando 30 min antes de reintentar...`);
+        await new Promise(r => setTimeout(r, 30 * 60 * 1000));
+      } else {
+        console.log(`⏳ Reconectando IMAP ${state.email} en 10s...`);
+        await new Promise(r => setTimeout(r, 10000));
+      }
     }
   }
 }
@@ -1617,6 +1661,8 @@ cron.schedule('*/3 * * * *', async () => {
     for (const doc of snapshot.docs) {
       const data = doc.data();
       if (!data.email || !data.password) continue;
+
+      if (isAccountBlocked(data.email)) continue;
 
       const state = activeWorkers.get(data.email);
       const isAlive = state &&
@@ -2240,6 +2286,7 @@ app.post('/api/microsoft/login', async (req, res) => {
     await testClient.logout().catch(() => {});
 
     saveAccount(email, refreshToken, 'outlook.office365.com');
+    resetWorkerFailure(email); // 🔥 limpiar cooldown al añadir con OAuth
     startImapWorker(email, refreshToken, 'outlook.office365.com');
 
     return res.json({
@@ -2291,6 +2338,8 @@ app.get('/ping', async (req, res) => {
         if (state) state.active = false;
         activeWorkers.delete(email);
 
+        if (isAccountBlocked(email)) continue;
+
         const doc = await db.collection('user_accounts').doc(email).get();
         if (doc.exists) {
           const data = doc.data();
@@ -2306,7 +2355,7 @@ app.get('/ping', async (req, res) => {
           console.log(`♻️ /ping: sin workers, arrancando ${snapshot.size}`);
           for (const d of snapshot.docs) {
             const data = d.data();
-            if (data.email && data.password) {
+            if (data.email && data.password && !isAccountBlocked(data.email)) {
               startImapWorker(data.email, data.password, data.imapHost);
             }
           }
@@ -2322,6 +2371,7 @@ app.get('/ping', async (req, res) => {
     ts: new Date().toISOString(),
     workers: activeWorkers.size,
     firestore: !!db,
+    blockedAccounts: Array.from(failedAccounts.keys()),
   });
 });
 
@@ -2346,6 +2396,11 @@ app.get('/api/debug/workers', (req, res) => {
     timestamp: new Date().toISOString(),
     microsoftClientIdConfigured: !!MICROSOFT_CLIENT_ID,
     firestoreAvailable: !!db,
+    blockedAccounts: Array.from(failedAccounts.entries()).map(([e, v]) => ({
+      email: e,
+      count: v.count,
+      until: v.until ? new Date(v.until).toISOString() : null,
+    })),
   });
 });
 
@@ -3256,6 +3311,41 @@ app.post('/api/unsubscribe', async (req, res) => {
     res.json({ success: true, method, result });
   } catch (e) {
     console.error('❌ Error en /api/unsubscribe:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ------------------------------------------------------------
+//  ELIMINAR CUENTA DEL BACKEND
+// ------------------------------------------------------------
+app.delete('/api/account/:email', async (req, res) => {
+  const email = decodeURIComponent(req.params.email);
+  if (!email) return res.status(400).json({ success: false, error: 'Email requerido' });
+
+  try {
+    console.log(`🗑️ Borrando cuenta ${email} del backend...`);
+
+    // 1. Parar worker si está activo
+    if (activeWorkers.has(email)) {
+      const state = activeWorkers.get(email);
+      state.active = false;
+      activeWorkers.delete(email);
+      console.log(`   ✓ Worker detenido`);
+    }
+
+    // 2. Borrar de Firestore
+    if (db) {
+      await db.collection('user_accounts').doc(email).delete().catch(() => {});
+      await db.collection('user_states').doc(email).delete().catch(() => {});
+      console.log(`   ✓ Borrado de Firestore`);
+    }
+
+    // 3. Limpiar circuit breaker
+    failedAccounts.delete(email);
+
+    res.json({ success: true, message: 'Cuenta eliminada del backend' });
+  } catch (e) {
+    console.error('❌ Error borrando cuenta:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });

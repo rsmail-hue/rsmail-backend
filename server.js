@@ -74,6 +74,104 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
+//  🔥 NUEVO OAuth: Helpers Microsoft OAuth2
+// ------------------------------------------------------------
+const MICROSOFT_CLIENT_ID = process.env.MICROSOFT_CLIENT_ID || '';
+const MICROSOFT_SCOPES =
+  'https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send offline_access openid profile';
+
+// Cache de access tokens en memoria: { email: { token, expiresAt } }
+const msAccessTokenCache = new Map();
+
+/**
+ * Detecta si una "password" guardada es en realidad un refresh_token de Microsoft.
+ * Los refresh tokens de Microsoft suelen tener 500-1500+ caracteres.
+ * Las contraseñas normales y app passwords son mucho más cortas.
+ */
+function isMicrosoftOAuthAccount(email, password) {
+  if (!password) return false;
+  const emailLower = (email || '').toLowerCase();
+  const isMicrosoftDomain =
+    emailLower.endsWith('@outlook.com') ||
+    emailLower.endsWith('@hotmail.com') ||
+    emailLower.endsWith('@live.com') ||
+    emailLower.endsWith('@outlook.es') ||
+    emailLower.endsWith('@msn.com') ||
+    emailLower.includes('.onmicrosoft.com');
+
+  // Un refresh_token de MS es muy largo (>300 chars) y no tiene espacios
+  const looksLikeRefreshToken =
+    password.length > 300 && !password.includes(' ') && !password.includes('\n');
+
+  return isMicrosoftDomain || looksLikeRefreshToken;
+}
+
+/**
+ * Intercambia el refresh_token por un access_token nuevo.
+ * Cachea el access_token durante ~50 min para no pedir uno nuevo en cada petición.
+ */
+async function getMicrosoftAccessToken(refreshToken) {
+  if (!MICROSOFT_CLIENT_ID) {
+    throw new Error('MICROSOFT_CLIENT_ID no configurado en el servidor');
+  }
+
+  // Cache por hash corto del refresh token
+  const cacheKey = refreshToken.substring(0, 40);
+  const cached = msAccessTokenCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.accessToken;
+  }
+
+  const params = new URLSearchParams();
+  params.append('client_id', MICROSOFT_CLIENT_ID);
+  params.append('grant_type', 'refresh_token');
+  params.append('refresh_token', refreshToken);
+  params.append('scope', MICROSOFT_SCOPES);
+
+  const res = await fetch(
+    'https://login.microsoftonline.com/common/oauth2/v2.0/token',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
+    }
+  );
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Microsoft token error ${res.status}: ${text.substring(0, 200)}`);
+  }
+
+  const data = await res.json();
+  if (!data.access_token) {
+    throw new Error('Microsoft no devolvió access_token');
+  }
+
+  const expiresIn = (data.expires_in || 3600) * 1000;
+  msAccessTokenCache.set(cacheKey, {
+    accessToken: data.access_token,
+    expiresAt: Date.now() + expiresIn - 60000, // 1 min de margen
+  });
+
+  return data.access_token;
+}
+
+/**
+ * Obtiene el access_token que hay que usar para IMAP/SMTP.
+ * Si la cuenta es Microsoft OAuth, renueva el token.
+ * Si no, devuelve null (usar password normal).
+ */
+async function resolveAccessToken(email, password) {
+  if (!isMicrosoftOAuthAccount(email, password)) return null;
+  try {
+    return await getMicrosoftAccessToken(password);
+  } catch (e) {
+    console.error(`❌ Error obteniendo access_token Microsoft para ${email}:`, e.message);
+    return null;
+  }
+}
+
+// ------------------------------------------------------------
 //  WORKERS IMAP PERSISTENTES (con IDLE)
 // ------------------------------------------------------------
 const activeWorkers = new Map();
@@ -101,6 +199,13 @@ function getAutoConfig(email) {
     };
   }
   if (['office365.com', 'office.com'].some(d => domain.endsWith(d))) {
+    return {
+      imapHost: 'outlook.office365.com', imapPort: 993,
+      smtpHost: 'smtp.office365.com', smtpPort: 587, smtpSecure: false,
+      provider: 'office365',
+    };
+  }
+  if (domain.endsWith('.onmicrosoft.com')) {
     return {
       imapHost: 'outlook.office365.com', imapPort: 993,
       smtpHost: 'smtp.office365.com', smtpPort: 587, smtpSecure: false,
@@ -271,12 +376,17 @@ async function saveLastUid(email, uid) {
   }
 }
 
-async function connectImap(email, password, host, port, secure) {
+// 🔥 MODIFICADO: soporta accessToken para Microsoft OAuth2
+async function connectImap(email, password, host, port, secure, accessToken = null) {
+  const auth = accessToken
+    ? { user: email, accessToken: accessToken }  // ImapFlow usa XOAUTH2 automáticamente
+    : { user: email, pass: password };
+
   const config = {
     host,
     port,
     secure,
-    auth: { user: email, pass: password },
+    auth,
     logger: false,
     tls: {
       rejectUnauthorized: false,
@@ -295,7 +405,10 @@ async function connectImap(email, password, host, port, secure) {
   return client;
 }
 
+// 🔥 MODIFICADO: resuelve access_token si es Microsoft OAuth
 async function connectImapAuto(email, password, preferredHost = null) {
+  const accessToken = await resolveAccessToken(email, password);
+
   const candidates = getImapCandidates(email);
 
   if (preferredHost) {
@@ -306,8 +419,8 @@ async function connectImapAuto(email, password, preferredHost = null) {
   let lastError = null;
   for (const c of candidates) {
     try {
-      console.log(`🔌 Probando IMAP ${email} → ${c.host}:${c.port}...`);
-      const client = await connectImap(email, password, c.host, c.port, c.secure);
+      console.log(`🔌 Probando IMAP ${email} → ${c.host}:${c.port}${accessToken ? ' (OAuth2)' : ''}...`);
+      const client = await connectImap(email, password, c.host, c.port, c.secure, accessToken);
       console.log(`✅ IMAP conectado: ${email} vía ${c.host}:${c.port}`);
       return { client, host: c.host, port: c.port };
     } catch (e) {
@@ -316,6 +429,32 @@ async function connectImapAuto(email, password, preferredHost = null) {
     }
   }
   throw lastError || new Error('Todos los intentos IMAP fallaron');
+}
+
+// ------------------------------------------------------------
+//  🔥 NUEVO OAuth: Crear transporter SMTP con soporte OAuth2
+// ------------------------------------------------------------
+async function createSmtpTransporter({ email, password, host, port, secure }) {
+  const accessToken = await resolveAccessToken(email, password);
+
+  const auth = accessToken
+    ? {
+        type: 'OAuth2',
+        user: email,
+        accessToken: accessToken,
+      }
+    : { user: email, pass: password };
+
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    auth,
+    tls: { rejectUnauthorized: false },
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 15000,
+  });
 }
 
 // ------------------------------------------------------------
@@ -475,13 +614,12 @@ async function checkAndSendAutoReply({
     for (const c of smtpCandidates) {
       try {
         console.log(`📤 Auto-reply: probando ${c.host}:${c.port}...`);
-        const transporter = nodemailer.createTransport({
-          host: c.host, port: c.port, secure: c.secure,
-          auth: { user: accountEmail, pass: accountPassword },
-          tls: { rejectUnauthorized: false },
-          connectionTimeout: 10000,
-          greetingTimeout: 10000,
-          socketTimeout: 15000,
+        const transporter = await createSmtpTransporter({
+          email: accountEmail,
+          password: accountPassword,
+          host: c.host,
+          port: c.port,
+          secure: c.secure,
         });
 
         await transporter.sendMail({
@@ -1098,7 +1236,6 @@ app.post(
           });
         } catch (cloudErr) {
           console.error('❌ Cloudinary falló:', cloudErr.message);
-          // Fallback a disco local si Cloudinary falla
         }
       }
 
@@ -1130,7 +1267,6 @@ app.post(
   }
 );
 
-// Servir archivos del fallback local
 app.get('/api/chat/file/:filename', (req, res) => {
   try {
     const fs = require('fs');
@@ -1536,10 +1672,10 @@ cron.schedule('* * * * *', async () => {
         const subject = data.emailSubject || '(Sin asunto)';
         const note = data.note || '';
 
-        const title = note.isNotEmpty
+        const title = note.length > 0
           ? `🔔 ${note}`
           : `🔔 Recordatorio: ${subject}`;
-        const body = note.isNotEmpty
+        const body = note.length > 0
           ? `Correo de ${from}: ${subject}`
           : `Correo de ${from}`;
 
@@ -2056,6 +2192,74 @@ const handleAuth = async (req, res) => {
 };
 
 // ------------------------------------------------------------
+//  🔥 NUEVO OAuth: Endpoint /api/microsoft/login
+// ------------------------------------------------------------
+app.post('/api/microsoft/login', async (req, res) => {
+  const { email, refreshToken } = req.body;
+
+  if (!email || !refreshToken) {
+    return res.status(400).json({
+      success: false,
+      error: 'Email y refreshToken requeridos'
+    });
+  }
+
+  if (!MICROSOFT_CLIENT_ID) {
+    return res.status(500).json({
+      success: false,
+      error: 'Servidor sin MICROSOFT_CLIENT_ID configurado'
+    });
+  }
+
+  try {
+    console.log(`🔐 Microsoft login para ${email}...`);
+
+    // 1. Verificar que el refresh_token es válido obteniendo un access_token
+    const accessToken = await getMicrosoftAccessToken(refreshToken);
+
+    // 2. Verificar que podemos conectar IMAP con OAuth2
+    const testClient = new ImapFlow({
+      host: 'outlook.office365.com',
+      port: 993,
+      secure: true,
+      auth: { user: email, accessToken },
+      logger: false,
+      tls: { rejectUnauthorized: false, minVersion: 'TLSv1.2' },
+      connectionTimeout: 20000,
+      greetingTimeout: 15000,
+    });
+    await testClient.connect();
+    await testClient.logout().catch(() => {});
+
+    // 3. Guardar la cuenta (el refresh_token va en el campo password)
+    saveAccount(email, refreshToken, 'outlook.office365.com');
+
+    // 4. Arrancar worker
+    startImapWorker(email, refreshToken, 'outlook.office365.com');
+
+    return res.json({
+      success: true,
+      message: 'Microsoft OAuth2 correcto',
+      account: {
+        email,
+        imapHost: 'outlook.office365.com',
+        imapPort: 993,
+        imapSecurity: 'ssl',
+        smtpHost: 'smtp.office365.com',
+        smtpPort: 587,
+        smtpSecurity: 'starttls',
+      }
+    });
+  } catch (e) {
+    console.error(`❌ Microsoft login falló para ${email}:`, e.message);
+    return res.status(401).json({
+      success: false,
+      error: 'Microsoft OAuth2 falló: ' + e.message
+    });
+  }
+});
+
+// ------------------------------------------------------------
 //  API REST
 // ------------------------------------------------------------
 app.post('/api/login', handleAuth);
@@ -2126,6 +2330,7 @@ app.get('/api/debug/workers', (req, res) => {
       clientUsable: state.client?.usable ?? false,
       wsConnected: state.ws?.readyState === 1,
       lastAliveAgo: Math.floor((Date.now() - (state.lastAlive || 0)) / 1000) + 's',
+      isMicrosoftOAuth: isMicrosoftOAuthAccount(email, state.password),
     });
   }
   res.json({
@@ -2133,6 +2338,7 @@ app.get('/api/debug/workers', (req, res) => {
     workers,
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
+    microsoftClientIdConfigured: !!MICROSOFT_CLIENT_ID,
   });
 });
 
@@ -2307,6 +2513,7 @@ app.post('/api/chat/notify', async (req, res) => {
   res.json({ success: true, notified });
 });
 
+// 🔥 MODIFICADO: usa createSmtpTransporter (soporta OAuth2)
 app.post('/api/send-email', async (req, res) => {
   const { email, password, host, port, to, subject, body, attachments } = req.body;
   if (!email || !password || !to) return res.status(400).json({ success: false, error: 'Faltan campos' });
@@ -2315,15 +2522,15 @@ app.post('/api/send-email', async (req, res) => {
   const smtpHost = host || auto.smtpHost;
   const smtpPort = Number(port) || auto.smtpPort || 587;
 
-  const transporter = nodemailer.createTransport({
-    host: smtpHost,
-    port: smtpPort,
-    secure: smtpPort === 465,
-    auth: { user: email, pass: password },
-    tls: { rejectUnauthorized: false }
-  });
-
   try {
+    const transporter = await createSmtpTransporter({
+      email,
+      password,
+      host: smtpHost,
+      port: smtpPort,
+      secure: smtpPort === 465,
+    });
+
     await transporter.sendMail({
       from: email,
       to,
@@ -2336,6 +2543,7 @@ app.post('/api/send-email', async (req, res) => {
     });
     res.json({ success: true });
   } catch (err) {
+    console.error('❌ Error /api/send-email:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -2763,9 +2971,6 @@ app.post('/api/scan-attachments', async (req, res) => {
   }
 });
 
-// ------------------------------------------------------------
-//  DESCARGAR ADJUNTO (versión robusta con simpleParser)
-// ------------------------------------------------------------
 app.post('/api/download-attachment', async (req, res) => {
   const {
     email, password, host, port,
@@ -2972,6 +3177,7 @@ app.post('/api/scan-subscriptions', async (req, res) => {
   }
 });
 
+// 🔥 MODIFICADO: usa createSmtpTransporter para mailto unsubscribe
 app.post('/api/unsubscribe', async (req, res) => {
   const { email, password, listUnsubscribe, listUnsubscribePost } = req.body;
 
@@ -3022,12 +3228,12 @@ app.post('/api/unsubscribe', async (req, res) => {
       const subject = subjectMatch ? decodeURIComponent(subjectMatch[1]) : 'unsubscribe';
 
       const auto = getAutoConfig(email);
-      const transporter = nodemailer.createTransport({
+      const transporter = await createSmtpTransporter({
+        email,
+        password,
         host: auto.smtpHost,
         port: auto.smtpPort,
         secure: auto.smtpSecure,
-        auth: { user: email, pass: password },
-        tls: { rejectUnauthorized: false },
       });
 
       await transporter.sendMail({
@@ -3055,5 +3261,6 @@ app.post('/api/unsubscribe', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, async () => {
   console.log(`✅ Backend RSMAIL activo en puerto ${PORT}`);
+  console.log(`   Microsoft OAuth client_id: ${MICROSOFT_CLIENT_ID ? MICROSOFT_CLIENT_ID.substring(0, 12) + '...' : '❌ NO CONFIGURADO'}`);
   await restoreWorkers();
 });

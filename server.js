@@ -1,4 +1,4 @@
-﻿﻿const express = require('express');
+﻿﻿﻿const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -32,7 +32,7 @@ if (CLOUDINARY_ENABLED) {
 }
 
 // ------------------------------------------------------------
-//  FIREBASE ADMIN (FCM)
+//  FIREBASE ADMIN (FCM) — inicialización defensiva
 // ------------------------------------------------------------
 let db = null;
 try {
@@ -48,7 +48,6 @@ try {
       try {
         let formattedKey = process.env.FIREBASE_PRIVATE_KEY;
         formattedKey = formattedKey.replace(/^"|"$/g, '').replace(/\\n/g, '\n');
-
         admin.initializeApp({
           credential: admin.credential.cert({
             projectId: process.env.FIREBASE_PROJECT_ID,
@@ -63,9 +62,7 @@ try {
     } else {
       try {
         const serviceAccount = require('./serviceAccountKey.json');
-        admin.initializeApp({
-          credential: admin.credential.cert(serviceAccount),
-        });
+        admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
         console.log('✅ Firebase Admin inicializado con serviceAccountKey.json');
       } catch (e) {
         console.error('⚠️ Sin credenciales de Firebase. Push deshabilitadas.');
@@ -99,7 +96,6 @@ const wss = new WebSocket.Server({ server });
 const MICROSOFT_CLIENT_ID = process.env.MICROSOFT_CLIENT_ID || '';
 const MICROSOFT_SCOPES =
   'https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send offline_access openid profile';
-
 const msAccessTokenCache = new Map();
 
 function isMicrosoftOAuthAccount(email, password) {
@@ -109,7 +105,6 @@ function isMicrosoftOAuthAccount(email, password) {
 
 async function getMicrosoftAccessToken(refreshToken) {
   if (!MICROSOFT_CLIENT_ID) throw new Error('MICROSOFT_CLIENT_ID no configurado');
-
   const cacheKey = refreshToken.substring(0, 40);
   const cached = msAccessTokenCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.accessToken;
@@ -125,15 +120,12 @@ async function getMicrosoftAccessToken(refreshToken) {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: params.toString(),
   });
-
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`Microsoft token error ${res.status}: ${text.substring(0, 200)}`);
   }
-
   const data = await res.json();
   if (!data.access_token) throw new Error('Microsoft no devolvió access_token');
-
   const expiresIn = (data.expires_in || 3600) * 1000;
   msAccessTokenCache.set(cacheKey, {
     accessToken: data.access_token,
@@ -265,7 +257,7 @@ function getImapCandidates(email) {
 }
 
 // ------------------------------------------------------------
-//  PERSISTENCIA
+//  PERSISTENCIA DE CUENTAS
 // ------------------------------------------------------------
 async function saveAccount(email, password, imapHost) {
   if (!db) return;
@@ -302,7 +294,9 @@ async function getSavedLastUid(email) {
   try {
     const doc = await db.collection('user_states').doc(email).get();
     if (doc.exists) return doc.data().lastUid || null;
-  } catch (e) {}
+  } catch (e) {
+    console.error(`⚠️ Error al leer lastUid para ${email}:`, e.message);
+  }
   return null;
 }
 
@@ -311,14 +305,16 @@ async function saveLastUid(email, uid) {
   try {
     await db.collection('user_states').doc(email).set({
       lastUid: uid,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
-  } catch (e) {}
+  } catch (e) {
+    console.error(`⚠️ Error al guardar lastUid para ${email}:`, e.message);
+  }
 }
 
 async function connectImap(email, password, host, port, secure, accessToken = null) {
   const auth = accessToken
-    ? { user: email, accessToken: accessToken }
+    ? { user: email, accessToken }
     : { user: email, pass: password };
 
   const config = {
@@ -382,29 +378,23 @@ async function createSmtpTransporter({ email, password, host, port, secure }) {
 async function sendViaBrevo({ fromEmail, fromName, to, subject, html }) {
   const brevoKey = process.env.BREVO_API_KEY;
   if (!brevoKey) throw new Error('BREVO_API_KEY no configurada');
-
   const payload = {
     sender: { name: fromName || fromEmail.split('@')[0], email: fromEmail },
     to: [{ email: to }],
     subject,
     htmlContent: html,
   };
-
   const res = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
     headers: { 'accept': 'application/json', 'api-key': brevoKey, 'content-type': 'application/json' },
     body: JSON.stringify(payload),
   });
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Brevo ${res.status}: ${body}`);
-  }
+  if (!res.ok) { const body = await res.text(); throw new Error(`Brevo ${res.status}: ${body}`); }
   return true;
 }
 
 // ------------------------------------------------------------
-//  AUSENCIAS
+//  AUSENCIAS / VACACIONES
 // ------------------------------------------------------------
 async function getActiveAbsencePeriod(accountEmail) {
   if (!db) return null;
@@ -423,7 +413,10 @@ async function getActiveAbsencePeriod(accountEmail) {
       return p;
     }
     return null;
-  } catch (e) { return null; }
+  } catch (e) {
+    console.error('⚠️ Error leyendo absences_configs:', e.message);
+    return null;
+  }
 }
 
 async function checkAndSendAutoReply({
@@ -433,21 +426,14 @@ async function checkAndSendAutoReply({
   try {
     const period = await getActiveAbsencePeriod(accountEmail);
     if (!period) return;
-
     const fromLower = (incomingFrom || '').toLowerCase();
     if (!fromLower.includes('@')) return;
     if (fromLower === accountEmail.toLowerCase()) return;
-
-    const ignorePatterns = [
-      'noreply@', 'no-reply@', 'no_reply@', 'mailer-daemon@', 'postmaster@',
-      'notifications@', 'notification@', 'bounce@', 'bounces@',
-    ];
+    const ignorePatterns = ['noreply@', 'no-reply@', 'no_reply@', 'mailer-daemon@', 'postmaster@', 'notifications@', 'notification@', 'bounce@', 'bounces@'];
     if (ignorePatterns.some((p) => fromLower.includes(p))) return;
-
     if (period.onlyContacts) {
       try {
-        const cs = await db.collection('users').doc(accountEmail)
-          .collection('contacts').where('email', '==', fromLower).limit(1).get();
+        const cs = await db.collection('users').doc(accountEmail).collection('contacts').where('email', '==', fromLower).limit(1).get();
         if (cs.empty) return;
       } catch (_) {}
     }
@@ -461,11 +447,8 @@ async function checkAndSendAutoReply({
       if (prevTs && Date.now() - prevTs < intervalMs) return;
     }
 
-    const escapedBody = (period.body || '')
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/\n/g, '<br>');
+    const escapedBody = (period.body || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
     const escapedTitle = (period.title || 'Ausencia').replace(/&/g, '&amp;').replace(/</g, '&lt;');
-
     const html = `
 <div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#333;line-height:1.6;">
   <div style="background:#E3F2FD;border-left:4px solid #1A73E8;padding:10px 14px;margin-bottom:16px;border-radius:6px;">
@@ -477,13 +460,11 @@ async function checkAndSendAutoReply({
 </div>`;
 
     const replySubject = `Re: ${incomingSubject || '(Sin asunto)'}`;
-    const autoReplySubject = period.subject
-      ? `${period.subject} — ${replySubject}` : replySubject;
+    const autoReplySubject = period.subject ? `${period.subject} — ${replySubject}` : replySubject;
 
     let sent = false;
     let lastError = null;
     const smtpCandidates = getSmtpCandidates(accountEmail);
-
     for (const c of smtpCandidates) {
       try {
         const transporter = await createSmtpTransporter({
@@ -500,17 +481,12 @@ async function checkAndSendAutoReply({
         break;
       } catch (e) { lastError = e; }
     }
-
     if (!sent && process.env.BREVO_API_KEY) {
       try {
-        await sendViaBrevo({
-          fromEmail: accountEmail, fromName: '',
-          to: incomingFrom, subject: autoReplySubject, html,
-        });
+        await sendViaBrevo({ fromEmail: accountEmail, fromName: '', to: incomingFrom, subject: autoReplySubject, html });
         sent = true;
       } catch (e) { lastError = e; }
     }
-
     if (sent) {
       await sentRef.set({
         accountEmail, periodId: period.id, periodTitle: period.title,
@@ -525,7 +501,7 @@ async function checkAndSendAutoReply({
 }
 
 // ------------------------------------------------------------
-//  MOTOR DE REGLAS
+//  MOTOR DE REGLAS / FILTROS
 // ------------------------------------------------------------
 const _rulesCache = new Map();
 const RULES_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -540,7 +516,10 @@ async function getRulesForAccount(email) {
     const rules = doc.exists ? (doc.data()?.rules || []).filter((r) => r && r.enabled) : [];
     _rulesCache.set(email, { rules, expiresAt: now + RULES_CACHE_TTL_MS });
     return rules;
-  } catch (e) { return []; }
+  } catch (e) {
+    console.error('⚠️ Error cargando reglas:', e.message);
+    return [];
+  }
 }
 
 function rulesNeedBody(rules) {
@@ -587,9 +566,7 @@ function ruleMatches(rule, ctx) {
   return rule.matchAll ? results.every(Boolean) : results.some(Boolean);
 }
 
-async function executeRuleActions({
-  accountEmail, accountPassword, accountHost, folder, uid, actions,
-}) {
+async function executeRuleActions({ accountEmail, accountPassword, accountHost, folder, uid, actions }) {
   let client;
   const forwards = [];
   try {
@@ -609,8 +586,7 @@ async function executeRuleActions({
         if (t === 'moveTo') {
           if (!v) continue;
           const list = await client.list();
-          const found = list.find(f =>
-            f.path.toLowerCase() === v.toLowerCase() || f.name.toLowerCase() === v.toLowerCase());
+          const found = list.find(f => f.path.toLowerCase() === v.toLowerCase() || f.name.toLowerCase() === v.toLowerCase());
           const target = found ? found.path : v;
           try { await client.messageMove(String(uid), target, { uid: true }); } catch (_) {}
           try { lock.release(); } catch (_) {}
@@ -643,24 +619,19 @@ async function executeRuleActions({
     } finally { try { lock.release(); } catch (_) {} }
     await client.logout(); client = null;
   } catch (e) {
+    console.log(`⚠️ Error ejecutando acciones: ${e.message}`);
     if (client) await client.logout().catch(() => {});
     return false;
   }
   for (const to of forwards) {
     try {
-      await sendViaBrevo({
-        fromEmail: accountEmail, fromName: '', to,
-        subject: '[Reenviado por regla]',
-        html: '<p>Este mensaje ha sido reenviado por una regla de RSMail.</p>',
-      });
+      await sendViaBrevo({ fromEmail: accountEmail, fromName: '', to, subject: '[Reenviado por regla]', html: '<p>Este mensaje ha sido reenviado por una regla de RSMail.</p>' });
     } catch (_) {}
   }
   return true;
 }
 
-async function applyRulesToMessage({
-  accountEmail, accountPassword, accountHost, uid, folder, parsed, envelope, size,
-}) {
+async function applyRulesToMessage({ accountEmail, accountPassword, accountHost, uid, folder, parsed, envelope, size }) {
   if (!db) return;
   const rules = await getRulesForAccount(accountEmail);
   if (rules.length === 0) return;
@@ -673,24 +644,18 @@ async function applyRulesToMessage({
   const hasAttachment = (parsed?.attachments || []).length > 0;
   const sizeKb = Math.round((size || 0) / 1024);
 
-  const ctx = {
-    from: `${fromName} <${fromAddr}>`, to: toAddr, cc: ccAddr, subject,
-    body: parsed?.text || '', hasAttachment, sizeKb,
-  };
+  const ctx = { from: `${fromName} <${fromAddr}>`, to: toAddr, cc: ccAddr, subject, body: parsed?.text || '', hasAttachment, sizeKb };
 
   for (const rule of rules) {
     if (!ruleMatches(rule, ctx)) continue;
     console.log(`✅ Regla "${rule.name}" coincide (UID ${uid})`);
-    await executeRuleActions({
-      accountEmail, accountPassword, accountHost, folder, uid,
-      actions: rule.actions || [],
-    });
+    await executeRuleActions({ accountEmail, accountPassword, accountHost, folder, uid, actions: rule.actions || [] });
     if (rule.stopProcessing) break;
   }
 }
 
 // ------------------------------------------------------------
-//  TRADUCCIÓN
+//  TRADUCCIÓN AUTOMÁTICA
 // ------------------------------------------------------------
 const _translateCache = new Map();
 const TRANSLATE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -725,10 +690,7 @@ async function libreTranslate(text, target, source = 'auto', format = 'text') {
   });
   if (!res.ok) throw new Error(`libre ${res.status}`);
   const data = await res.json();
-  return {
-    translated: data?.translatedText || text,
-    detectedSource: data?.detectedLanguage?.language || source,
-  };
+  return { translated: data?.translatedText || text, detectedSource: data?.detectedLanguage?.language || source };
 }
 
 function _chunkText(text, maxLen = GOOGLE_HARD_LIMIT) {
@@ -807,6 +769,7 @@ app.post('/api/translate', async (req, res) => {
     }
     res.json({ translated: result.translated, detectedSource: result.detectedSource, cached: false, chunked: !!result.chunked });
   } catch (e) {
+    console.error('❌ /api/translate error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
@@ -821,7 +784,7 @@ cron.schedule('0 */12 * * *', async () => {
 });
 
 // ------------------------------------------------------------
-//  CHAT UPLOAD
+//  CHAT — SUBIDA DE ARCHIVOS
 // ------------------------------------------------------------
 const multerMemory = multer({
   storage: multer.memoryStorage(),
@@ -874,6 +837,7 @@ app.post('/api/chat/upload', multerMemory.single('file'), async (req, res) => {
       filename: originalName, size, provider: 'local',
     });
   } catch (e) {
+    console.error('❌ Error en /api/chat/upload:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
@@ -894,7 +858,6 @@ app.get('/api/chat/file/:filename', (req, res) => {
 wss.on('connection', (ws) => {
   console.log('🔌 Nuevo WebSocket conectado');
   let userEmail = null;
-
   ws.on('message', async (message) => {
     try {
       const data = JSON.parse(message);
@@ -907,11 +870,8 @@ wss.on('connection', (ws) => {
           startImapWorker(data.email, data.password, data.imapHost, ws);
         }
       }
-    } catch (e) {
-      console.error('❌ Error WebSocket:', e.message);
-    }
+    } catch (e) { console.error('❌ Error WebSocket:', e.message); }
   });
-
   ws.on('close', () => {
     console.log(`🔌 WebSocket desconectado (${userEmail || '?'})`);
     if (userEmail && activeWorkers.has(userEmail)) {
@@ -921,7 +881,7 @@ wss.on('connection', (ws) => {
 });
 
 // ------------------------------------------------------------
-//  MOTOR IMAP PERSISTENTE
+//  MOTOR IMAP PERSISTENTE CON IDLE
 // ------------------------------------------------------------
 function startImapWorker(email, password, customHost, ws = null) {
   if (activeWorkers.has(email)) {
@@ -929,16 +889,8 @@ function startImapWorker(email, password, customHost, ws = null) {
     if (ws) existing.ws = ws;
     return;
   }
-
-  if (!password) {
-    console.error(`❌ startImapWorker: SIN PASSWORD para ${email}`);
-    return;
-  }
-
-  if (isAccountBlocked(email)) {
-    console.log(`🚫 Worker ${email} en cooldown, no se arranca`);
-    return;
-  }
+  if (!password) { console.error(`❌ startImapWorker: SIN PASSWORD para ${email}`); return; }
+  if (isAccountBlocked(email)) { console.log(`🚫 Worker ${email} en cooldown, no se arranca`); return; }
 
   const auto = getAutoConfig(email);
   const host = customHost || (auto ? auto.imapHost : 'mail.' + email.split('@')[1]);
@@ -956,48 +908,38 @@ function startImapWorker(email, password, customHost, ws = null) {
 async function processEmailsInRange(state, startUid, endUidNext) {
   const safeStartUid = Math.max(1, startUid || 1);
   const safeEndUid = endUidNext - 1;
-
   if (safeStartUid > safeEndUid) {
     state.lastUidNext = endUidNext;
     await saveLastUid(state.email, endUidNext);
     return;
   }
-
   try {
     const fetchRange = `${safeStartUid}:${safeEndUid}`;
     console.log(`📥 Procesando correos en rango ${fetchRange} para ${state.email}`);
-    const newIter = state.client.fetch(fetchRange,
-      { uid: true, envelope: true },
-      { uid: true, markAsSeen: false }  // 🔥 NO marcar como leído al escanear
-    );
-
+    const newIter = state.client.fetch(fetchRange, { uid: true, envelope: true }, { uid: true });
     for await (const msg of newIter) {
       if (msg.uid && msg.uid >= safeStartUid && msg.uid < endUidNext) {
         const from = msg.envelope?.from?.[0]?.address || 'Remitente desconocido';
         const subject = msg.envelope?.subject || 'Nuevo correo';
-
         console.log(`🔔 Correo entrante UID:${msg.uid} | De: ${from} | Asunto: ${subject}`);
-
         try {
           const rules = await getRulesForAccount(state.email);
           if (rules.length > 0) {
             const needBody = rulesNeedBody(rules);
-            let parsed = null;
-            let source = null;
+            let parsed = null, source = null;
             try {
               const fetchOpts = needBody ? { source: true } : { size: true };
-              const full = await state.client.fetchOne(String(msg.uid), fetchOpts, { uid: true, markAsSeen: false });
+              const full = await state.client.fetchOne(String(msg.uid), fetchOpts, { uid: true });
               if (full?.source) parsed = await simpleParser(full.source);
               source = full;
-            } catch (e) {}
-
+            } catch (e) { console.log(`⚠️ No se pudo bajar source: ${e.message}`); }
             await applyRulesToMessage({
               accountEmail: state.email, accountPassword: state.password,
               accountHost: state.host, uid: msg.uid, folder: 'INBOX',
               parsed, envelope: msg.envelope, size: source?.size || 0,
             });
           }
-        } catch (e) {}
+        } catch (e) { console.log(`⚠️ Error aplicando reglas: ${e.message}`); }
 
         if (state.ws && state.ws.readyState === WebSocket.OPEN) {
           state.ws.send(JSON.stringify({
@@ -1007,13 +949,11 @@ async function processEmailsInRange(state, startUid, endUidNext) {
           }));
         }
 
+        console.log(`📤 Enviando push para nuevo correo UID:${msg.uid}...`);
         await sendPushNotification(state.email, {
           title: `📧 Nuevo correo de ${from}`,
           body: subject,
-          data: {
-            type: 'new_email', sender: from, subject,
-            uid: String(msg.uid), folder: 'INBOX',
-          },
+          data: { type: 'new_email', sender: from, subject, uid: String(msg.uid), folder: 'INBOX' },
         });
 
         await checkAndSendAutoReply({
@@ -1050,7 +990,7 @@ async function runImapLoop(state) {
             console.log(`⚡ IDLE: nuevo correo detectado. Rango ${state.lastUidNext} a ${currentUidNext - 1}`);
             await processEmailsInRange(state, state.lastUidNext, currentUidNext);
           }
-        } catch (e) {}
+        } catch (e) { console.error(`❌ Error en handleExists:`, e.message); }
       };
 
       state.client.on('exists', handleExists);
@@ -1073,12 +1013,10 @@ async function runImapLoop(state) {
       while (state.active && state.client.usable) {
         await new Promise(resolve => setTimeout(resolve, 5000));
         aliveLogCounter++;
-
         if (aliveLogCounter % 6 === 0) {
           state.lastAlive = Date.now();
           console.log(`💓 [${state.email}] IDLE activo (${Math.floor(aliveLogCounter * 5)}s)`);
         }
-
         if (aliveLogCounter % 12 === 0) {
           try {
             const s = await state.client.status('INBOX', { uidNext: true });
@@ -1087,6 +1025,7 @@ async function runImapLoop(state) {
               await processEmailsInRange(state, state.lastUidNext, s.uidNext);
             }
           } catch (e) {
+            console.log(`⚠️ Fallback poll falló, cerrando conexión: ${e.message}`);
             break;
           }
         }
@@ -1134,8 +1073,7 @@ cron.schedule('* * * * *', async () => {
       const diffMs = eventDate.getTime() - now.getTime();
       const diffHours = diffMs / (1000 * 60 * 60);
       const formattedTime = eventDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      const recipientEmail = event.email ||
-        (Array.isArray(event.sharedEmails) && event.sharedEmails.length > 0 ? event.sharedEmails[0] : null);
+      const recipientEmail = event.email || (Array.isArray(event.sharedEmails) && event.sharedEmails.length > 0 ? event.sharedEmails[0] : null);
       if (!recipientEmail) continue;
 
       if (!event.notified1Day && diffHours <= 25 && diffHours > 23) {
@@ -1157,11 +1095,11 @@ cron.schedule('* * * * *', async () => {
         await doc.ref.update({ notifiedEvent: true });
       }
     }
-  } catch (e) {}
+  } catch (e) { console.error('❌ Error en Cron Job:', e.message); }
 });
 
 // ------------------------------------------------------------
-//  CRON: REANIMACIÓN
+//  CRON: REANIMACIÓN DE WORKERS
 // ------------------------------------------------------------
 cron.schedule('*/3 * * * *', async () => {
   if (!db) return;
@@ -1180,7 +1118,7 @@ cron.schedule('*/3 * * * *', async () => {
         startImapWorker(data.email, data.password, data.imapHost);
       }
     }
-  } catch (e) {}
+  } catch (e) { console.error('⚠️ Error en cron de reanimación:', e.message); }
 });
 
 // ------------------------------------------------------------
@@ -1219,67 +1157,95 @@ cron.schedule('* * * * *', async () => {
           data: { type: 'email_reminder', uid: String(data.emailUid || ''), folder: data.emailFolder || 'INBOX', subject, sender: from },
         });
         await docRef.update({ status: 'sent', sentAt: admin.firestore.FieldValue.serverTimestamp() });
+        console.log(`✅ Recordatorio enviado: "${subject}"`);
       } catch (e) {
+        console.error(`❌ Error recordatorio ${doc.id}:`, e.message);
         await docRef.update({ status: 'failed', error: e.message });
       }
     }
-  } catch (e) {}
+  } catch (e) { console.error('❌ Error en cron de recordatorios:', e.message); }
 });
 
 // ------------------------------------------------------------
-//  CRON: LIMPIAR VACACIONES
+//  CRON: LIMPIAR RESPUESTAS VACACIONES ANTIGUAS
 // ------------------------------------------------------------
 cron.schedule('0 */6 * * *', async () => {
   if (!db) return;
   try {
     const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - 30);
     const snap = await db.collection('vacation_sent_replies').where('sentAt', '<', admin.firestore.Timestamp.fromDate(cutoff)).get();
-    for (const doc of snap.docs) await doc.ref.delete();
-  } catch (_) {}
+    let deleted = 0;
+    for (const doc of snap.docs) { await doc.ref.delete(); deleted++; }
+    if (deleted > 0) console.log(`🗑️ Limpiados ${deleted} registros de auto-reply antiguos`);
+  } catch (e) { console.error('⚠️ Error limpiando auto-replies:', e.message); }
 });
 
 // ------------------------------------------------------------
-//  FCM PUSH
+//  FCM PUSH — 🔥 CAMBIO #2: soporta data-only para chats
 // ------------------------------------------------------------
-async function sendPushNotification(email, payload) {
+async function sendPushNotification(email, payload, options = {}) {
   if (!db) return;
+  const dataOnly = options.dataOnly === true;
   try {
     const tokensSnapshot = await db.collection('fcm_tokens').where('email', '==', email).get();
-    if (tokensSnapshot.empty) return;
+    if (tokensSnapshot.empty) { console.log(`📴 Sin token FCM para ${email}`); return; }
     const tokens = [];
     tokensSnapshot.forEach(doc => tokens.push(doc.data().token));
+    console.log(`🚀 Enviando push${dataOnly ? ' (data-only)' : ''} a ${tokens.length} token(s) para ${email}`);
+
+    // Forzar que todos los valores del data map sean strings
+    const rawData = payload.data || { type: 'general' };
+    const safeData = {};
+    Object.keys(rawData).forEach((k) => {
+      safeData[k] = rawData[k] == null ? '' : String(rawData[k]);
+    });
 
     const message = {
-      notification: {
-        title: payload.title || 'RSMAIL',
-        body: payload.body || 'Nueva notificación',
-      },
-      data: payload.data || { type: 'general' },
+      data: safeData,
       android: {
-        priority: 'high', ttl: 60 * 60 * 1000,
-        notification: {
-          channelId: 'rsmail_high_importance_channel',
-          sound: 'default', priority: 'max', visibility: 'public',
-          defaultVibrateTimings: true, defaultSound: true,
-        },
+        priority: 'high',
+        ttl: 60 * 60 * 1000,
       },
       apns: {
-        headers: { 'apns-priority': '10', 'apns-push-type': 'alert' },
-        payload: { aps: { sound: 'default', badge: 1, 'content-available': 1 } },
+        headers: {
+          'apns-priority': '10',
+          'apns-push-type': dataOnly ? 'background' : 'alert',
+        },
+        payload: {
+          aps: dataOnly
+            ? { 'content-available': 1 }
+            : { sound: 'default', badge: 1, 'content-available': 1 },
+        },
       },
       tokens,
     };
 
+    if (!dataOnly) {
+      message.notification = {
+        title: payload.title || 'RSMAIL',
+        body: payload.body || 'Nueva notificación',
+      };
+      message.android.notification = {
+        channelId: 'rsmail_high_importance_channel',
+        sound: 'default',
+        priority: 'max',
+        visibility: 'public',
+        defaultVibrateTimings: true,
+        defaultSound: true,
+      };
+    }
+
     const response = await admin.messaging().sendEachForMulticast(message);
+    console.log(`✅ Push enviado | éxito: ${response.successCount}, fallos: ${response.failureCount}`);
     if (response.failureCount > 0) {
       const failedTokens = [];
       response.responses.forEach((resp, idx) => { if (!resp.success) failedTokens.push(tokens[idx]); });
       for (const token of failedTokens) {
-        const s = await db.collection('fcm_tokens').where('token', '==', token).get();
-        s.forEach(doc => doc.ref.delete());
+        const snapshots = await db.collection('fcm_tokens').where('token', '==', token).get();
+        snapshots.forEach(doc => doc.ref.delete());
       }
     }
-  } catch (e) {}
+  } catch (e) { console.error('❌ Error enviando Push:', e.message); }
 }
 
 // ------------------------------------------------------------
@@ -1307,7 +1273,7 @@ app.post('/api/confidential/create', async (req, res) => {
       url: `https://rsmail-backend.onrender.com/confidential/${ref.id}`,
       expiresAt: expiresAt.toISOString(),
     });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  } catch (e) { console.error('❌ Error creando confidencial:', e.message); res.status(500).json({ success: false, error: e.message }); }
 });
 
 app.post('/api/confidential/open/:id', async (req, res) => {
@@ -1427,7 +1393,8 @@ document.addEventListener('keydown', e => {
 async function loadContent(password) {
   const body = { password: password || null };
   const res = await fetch('/api/confidential/open/' + CONF_ID, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  return { status: res.status, data: await res.json() };
+  const data = await res.json();
+  return { status: res.status, data };
 }
 async function init(password) {
   const app = document.getElementById('app');
@@ -1468,7 +1435,7 @@ cron.schedule('*/30 * * * *', async () => {
       if (now - exp.getTime() > 30 * 24 * 60 * 60 * 1000) { await doc.ref.delete(); deleted++; }
     }
     if (deleted > 0) console.log(`🗑️ Eliminados ${deleted} confidenciales antiguos`);
-  } catch (e) {}
+  } catch (e) { console.error('❌ Error limpiando confidenciales:', e.message); }
 });
 
 // ------------------------------------------------------------
@@ -1572,13 +1539,14 @@ app.get('/ping', async (req, res) => {
       if (activeWorkers.size === 0) {
         const snapshot = await db.collection('user_accounts').get();
         if (snapshot.size > 0) {
+          console.log(`♻️ /ping: sin workers, arrancando ${snapshot.size}`);
           for (const d of snapshot.docs) {
             const data = d.data();
             if (data.email && data.password && !isAccountBlocked(data.email)) startImapWorker(data.email, data.password, data.imapHost);
           }
         }
       }
-    } catch (e) {}
+    } catch (e) { console.error('⚠️ Error en /ping:', e.message); }
   }
   res.json({ alive: true, ts: new Date().toISOString(), workers: activeWorkers.size, firestore: !!db, blockedAccounts: Array.from(failedAccounts.keys()) });
 });
@@ -1692,6 +1660,7 @@ app.post('/api/send-notification', async (req, res) => {
 
 // ------------------------------------------------------------
 //  CHAT — Notificar mensaje nuevo
+//  🔥 CAMBIO #2: data-only + text en data para poder cancelar en la app
 // ------------------------------------------------------------
 app.post('/api/chat/notify', async (req, res) => {
   if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
@@ -1714,16 +1683,17 @@ app.post('/api/chat/notify', async (req, res) => {
           senderName: senderDisplay,
           isGroup: isGroup ? 'true' : 'false',
           groupName: groupName || '',
+          text: preview,
         },
-      });
+      }, { dataOnly: true });
       notified.push(email);
-    } catch (e) {}
+    } catch (e) { console.log(`⚠️ No se pudo notificar a ${email}:`, e.message); }
   }
   res.json({ success: true, notified });
 });
 
 // ------------------------------------------------------------
-//  SEND EMAIL
+//  SEND EMAIL (SMTP directo)
 // ------------------------------------------------------------
 app.post('/api/send-email', async (req, res) => {
   const { email, password, host, port, to, subject, body, attachments } = req.body;
@@ -1846,7 +1816,7 @@ app.post('/api/save-to-sent', async (req, res) => {
     client = null;
 
     if (!saved) {
-      console.error(`❌ [save-to-sent] No se pudo guardar en ninguna carpeta Enviados`);
+      console.error(`❌ [save-to-sent] No se pudo guardar en ninguna carpeta`);
       return res.status(500).json({
         success: false,
         error: 'No se pudo guardar en ninguna carpeta Enviados',
@@ -1882,7 +1852,7 @@ app.post('/api/folders', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  MENSAJES — 🔥 NO marcar como leído automáticamente
+//  MENSAJES
 // ------------------------------------------------------------
 function detectAttachmentsFromStructure(structure) {
   if (!structure) return false;
@@ -1908,12 +1878,9 @@ app.post('/api/messages', async (req, res) => {
     const lock = await client.getMailboxLock(folder, { readOnly: true });
     const messages = [];
     try {
-      // 🔥 markAsSeen: false → NO marcar como leído al listar
-      const iter = client.fetch(
-        '1:*',
+      const iter = client.fetch('1:*',
         { envelope: true, flags: true, bodyStructure: true },
-        { max: limit, reverse: true, markAsSeen: false }
-      );
+        { max: limit, reverse: true });
       for await (const msg of iter) {
         let flags = msg.flags;
         if (flags instanceof Set) flags = Array.from(flags);
@@ -1950,24 +1917,17 @@ app.post('/api/message-detail', async (req, res) => {
     const lock = await client.getMailboxLock(folder, { readOnly: true });
     let parsed;
     try {
-      // 🔥 markAsSeen: false → NO marcar como leído al abrir el detalle
-      const msg = await client.fetchOne(
-        String(uid),
-        { source: true },
-        { uid: true, markAsSeen: false }
-      );
+      const msg = await client.fetchOne(String(uid), { source: true }, { uid: true });
       if (msg?.source) parsed = await simpleParser(msg.source);
     } finally { lock.release(); }
     await client.logout();
     if (!parsed) return res.status(404).json({ success: false, error: 'Correo no encontrado' });
-
     const attachments = (parsed.attachments || []).map(att => ({
       filename: att.filename || 'adjunto',
       contentType: att.contentType,
       size: att.size,
       content: att.content ? att.content.toString('base64') : '',
     }));
-
     res.json({
       success: true,
       message: {
@@ -2123,10 +2083,9 @@ app.post('/api/scan-attachments', async (req, res) => {
       const total = status.messages || 0;
       const startSeq = Math.max(1, total - limit + 1);
       console.log(`☁️ Escaneando adjuntos en ${email}: ${total} msgs, desde ${startSeq}`);
-      // 🔥 markAsSeen: false
       const iter = client.fetch(`${startSeq}:*`,
         { uid: true, envelope: true, bodyStructure: true },
-        { uid: true, markAsSeen: false });
+        { uid: true });
       for await (const msg of iter) {
         const parts = collectAttachmentParts(msg.bodyStructure);
         if (parts.length === 0) continue;
@@ -2162,8 +2121,7 @@ app.post('/api/download-attachment', async (req, res) => {
     const lock = await client.getMailboxLock(folder, { readOnly: true });
     let parsed;
     try {
-      // 🔥 markAsSeen: false
-      const msg = await client.fetchOne(String(uid), { source: true }, { uid: true, markAsSeen: false });
+      const msg = await client.fetchOne(String(uid), { source: true }, { uid: true });
       if (msg?.source) parsed = await simpleParser(msg.source);
     } finally { lock.release(); }
     await client.logout();
@@ -2240,11 +2198,10 @@ app.post('/api/scan-subscriptions', async (req, res) => {
       const total = status.messages || 0;
       const startSeq = Math.max(1, total - maxMessages + 1);
       console.log(`📬 Escaneando suscripciones en ${email}: ${total} mensajes`);
-      // 🔥 markAsSeen: false
       const iter = client.fetch(`${startSeq}:*`, {
         uid: true, envelope: true,
         headers: ['list-unsubscribe', 'list-unsubscribe-post'],
-      }, { markAsSeen: false });
+      });
       for await (const msg of iter) {
         const fromAddr = msg.envelope?.from?.[0]?.address || '';
         const fromName = msg.envelope?.from?.[0]?.name || '';
@@ -2253,10 +2210,10 @@ app.post('/api/scan-subscriptions', async (req, res) => {
         let headerListUnsub = '', headerListUnsubPost = '';
         if (msg.headers) {
           const raw = msg.headers.toString();
-          const mU = raw.match(/^List-Unsubscribe:\s*(.+)$/im);
-          if (mU) headerListUnsub = mU[1].trim();
-          const mP = raw.match(/^List-Unsubscribe-Post:\s*(.+)$/im);
-          if (mP) headerListUnsubPost = mP[1].trim();
+          const mUnsub = raw.match(/^List-Unsubscribe:\s*(.+)$/im);
+          if (mUnsub) headerListUnsub = mUnsub[1].trim();
+          const mPost = raw.match(/^List-Unsubscribe-Post:\s*(.+)$/im);
+          if (mPost) headerListUnsubPost = mPost[1].trim();
         }
         if (!fromAddr) continue;
         const isSub = analyzeIsSubscription({
@@ -2314,14 +2271,14 @@ app.post('/api/unsubscribe', async (req, res) => {
         });
         method = 'https-post';
         result = { status: r.status, ok: r.ok };
-      } catch (e) {}
+      } catch (e) { console.log('⚠️ POST one-click falló:', e.message); }
     }
     if (!result && parsed.http.length > 0) {
       try {
         const r = await fetch(parsed.http[0], { method: 'GET', headers: { 'User-Agent': 'RSMail/3.0' }, redirect: 'follow' });
         method = 'https-get';
         result = { status: r.status, ok: r.ok };
-      } catch (e) {}
+      } catch (e) { console.log('⚠️ GET falló:', e.message); }
     }
     if (!result && parsed.mailto.length > 0) {
       const mailtoUrl = parsed.mailto[0].replace(/^mailto:/i, '');
@@ -2340,6 +2297,7 @@ app.post('/api/unsubscribe', async (req, res) => {
     if (!result) return res.status(400).json({ success: false, error: 'No se encontró un método de baja válido' });
     res.json({ success: true, method, result });
   } catch (e) {
+    console.error('❌ Error en /api/unsubscribe:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
@@ -2366,6 +2324,7 @@ app.delete('/api/account/:email', async (req, res) => {
     failedAccounts.delete(email);
     res.json({ success: true, message: 'Cuenta eliminada del backend' });
   } catch (e) {
+    console.error('❌ Error borrando cuenta:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });

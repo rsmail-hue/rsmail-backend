@@ -1,4 +1,4 @@
-﻿﻿﻿const express = require('express');
+﻿const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -949,12 +949,19 @@ async function processEmailsInRange(state, startUid, endUidNext) {
           }));
         }
 
-        console.log(`📤 Enviando push para nuevo correo UID:${msg.uid}...`);
+        console.log(`📤 Enviando push (data-only) para nuevo correo UID:${msg.uid}...`);
         await sendPushNotification(state.email, {
           title: `📧 Nuevo correo de ${from}`,
           body: subject,
-          data: { type: 'new_email', sender: from, subject, uid: String(msg.uid), folder: 'INBOX' },
-        });
+          data: {
+            type: 'new_email',
+            sender: from,
+            subject,
+            uid: String(msg.uid),
+            folder: 'INBOX',
+            text: subject,
+          },
+        }, { dataOnly: true });
 
         await checkAndSendAutoReply({
           accountEmail: state.email, accountPassword: state.password,
@@ -1058,7 +1065,7 @@ async function runImapLoop(state) {
 }
 
 // ------------------------------------------------------------
-//  CRON: CALENDARIO
+//  CRON: CALENDARIO (data-only)
 // ------------------------------------------------------------
 cron.schedule('* * * * *', async () => {
   if (!db) return;
@@ -1081,8 +1088,16 @@ cron.schedule('* * * * *', async () => {
         await sendPushNotification(recipientEmail, {
           title: `📅 Mañana: ${event.title}`,
           body: `Tienes este evento programado para mañana a las ${formattedTime}`,
-          data: { type: 'calendar_event', eventId: doc.id, eventTitle: event.title, eventTime: eventDate.toISOString(), eventDate: formattedTime, notice: '1day' },
-        });
+          data: {
+            type: 'calendar_event',
+            eventId: doc.id,
+            eventTitle: event.title,
+            eventTime: eventDate.toISOString(),
+            eventDate: formattedTime,
+            notice: '1day',
+            text: `Tienes este evento programado para mañana a las ${formattedTime}`,
+          },
+        }, { dataOnly: true });
         await doc.ref.update({ notified1Day: true });
       }
       if (!event.notifiedEvent && diffMs <= 15 * 60 * 1000 && diffMs > 0) {
@@ -1090,8 +1105,16 @@ cron.schedule('* * * * *', async () => {
         await sendPushNotification(recipientEmail, {
           title: `⏰ Comienza pronto: ${event.title}`,
           body: event.description || `El evento comienza a las ${formattedTime}`,
-          data: { type: 'calendar_event', eventId: doc.id, eventTitle: event.title, eventTime: eventDate.toISOString(), eventDate: formattedTime, notice: '15min' },
-        });
+          data: {
+            type: 'calendar_event',
+            eventId: doc.id,
+            eventTitle: event.title,
+            eventTime: eventDate.toISOString(),
+            eventDate: formattedTime,
+            notice: '15min',
+            text: event.description || `El evento comienza a las ${formattedTime}`,
+          },
+        }, { dataOnly: true });
         await doc.ref.update({ notifiedEvent: true });
       }
     }
@@ -1154,8 +1177,14 @@ cron.schedule('* * * * *', async () => {
         const body = note.length > 0 ? `Correo de ${from}: ${subject}` : `Correo de ${from}`;
         await sendPushNotification(accountEmail, {
           title, body,
-          data: { type: 'email_reminder', uid: String(data.emailUid || ''), folder: data.emailFolder || 'INBOX', subject, sender: from },
-        });
+          data: {
+            type: 'email_reminder',
+            uid: String(data.emailUid || ''),
+            folder: data.emailFolder || 'INBOX',
+            subject, sender: from,
+            text: body,
+          },
+        }, { dataOnly: true });
         await docRef.update({ status: 'sent', sentAt: admin.firestore.FieldValue.serverTimestamp() });
         console.log(`✅ Recordatorio enviado: "${subject}"`);
       } catch (e) {
@@ -1181,7 +1210,7 @@ cron.schedule('0 */6 * * *', async () => {
 });
 
 // ------------------------------------------------------------
-//  FCM PUSH — 🔥 CAMBIO #2: soporta data-only para chats
+//  FCM PUSH — con soporte data-only
 // ------------------------------------------------------------
 async function sendPushNotification(email, payload, options = {}) {
   if (!db) return;
@@ -1193,7 +1222,6 @@ async function sendPushNotification(email, payload, options = {}) {
     tokensSnapshot.forEach(doc => tokens.push(doc.data().token));
     console.log(`🚀 Enviando push${dataOnly ? ' (data-only)' : ''} a ${tokens.length} token(s) para ${email}`);
 
-    // Forzar que todos los valores del data map sean strings
     const rawData = payload.data || { type: 'general' };
     const safeData = {};
     Object.keys(rawData).forEach((k) => {
@@ -1659,8 +1687,7 @@ app.post('/api/send-notification', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  CHAT — Notificar mensaje nuevo
-//  🔥 CAMBIO #2: data-only + text en data para poder cancelar en la app
+//  CHAT — Notificar mensaje nuevo (data-only)
 // ------------------------------------------------------------
 app.post('/api/chat/notify', async (req, res) => {
   if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });

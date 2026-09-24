@@ -108,22 +108,20 @@ const msAccessTokenCache = new Map();
 
 /**
  * Detecta si una "password" guardada es en realidad un refresh_token de Microsoft.
+ * IMPORTANTE: NO comprobamos el dominio del email; solo miramos si el "password"
+ * guardado es un refresh_token real (muy largo). Así, cuentas de Microsoft con
+ * contraseñas normales (que ya no funcionan) NO se tratan como OAuth y el error
+ * que sale es más limpio.
  */
 function isMicrosoftOAuthAccount(email, password) {
   if (!password) return false;
-  const emailLower = (email || '').toLowerCase();
-  const isMicrosoftDomain =
-    emailLower.endsWith('@outlook.com') ||
-    emailLower.endsWith('@hotmail.com') ||
-    emailLower.endsWith('@live.com') ||
-    emailLower.endsWith('@outlook.es') ||
-    emailLower.endsWith('@msn.com') ||
-    emailLower.includes('.onmicrosoft.com');
 
+  // Un refresh_token real de Microsoft es MUY largo (suele > 500 chars).
+  // Una contraseña normal o app password es < 100 chars.
   const looksLikeRefreshToken =
-    password.length > 300 && !password.includes(' ') && !password.includes('\n');
+    password.length > 200 && !password.includes(' ') && !password.includes('\n');
 
-  return isMicrosoftDomain || looksLikeRefreshToken;
+  return looksLikeRefreshToken;
 }
 
 /**

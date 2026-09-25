@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const cors = require('cors');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -2353,6 +2353,232 @@ app.delete('/api/account/:email', async (req, res) => {
   } catch (e) {
     console.error('❌ Error borrando cuenta:', e.message);
     res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ------------------------------------------------------------
+// 🔥 NUEVO — COMPARTIR EVENTO POR EMAIL (página pública con botones)
+// ------------------------------------------------------------
+app.get('/event/invite/:id', async (req, res) => {
+  if (!db) return res.status(500).send('Firestore no disponible');
+  try {
+    const id = req.params.id;
+    const doc = await db.collection('calendar_events').doc(id).get();
+    if (!doc.exists) {
+      return res.status(404).send(`<!DOCTYPE html>
+<html lang="es"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RSMail · Evento no encontrado</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0D47A1,#1A73E8);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;margin:0;color:#333;}
+.box{background:#fff;padding:32px;border-radius:16px;max-width:480px;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,0.25);}
+h1{color:#c62828;font-size:20px;margin:0 0 8px;}p{color:#666;font-size:14px;margin:0;}</style>
+</head><body><div class="box"><h1>❌ Evento no encontrado</h1><p>Este evento ya no existe o el enlace no es válido.</p></div></body></html>`);
+    }
+
+    const ev = doc.data() || {};
+    const title = ev.title || 'Evento';
+    const type = ev.type || 'cita';
+    const isUrgent = ev.urgent === true;
+    const desc = ev.description || '';
+    const location = ev.location || '';
+    const voiceUrl = ev.voiceUrl || '';
+    const hasVoice = typeof voiceUrl === 'string' && voiceUrl.length > 0;
+
+    // Parse fecha
+    let startDate = null;
+    const raw = ev.eventTime || ev.startTime;
+    if (raw && typeof raw.toDate === 'function') startDate = raw.toDate();
+    else if (raw) startDate = new Date(raw);
+    if (startDate && isNaN(startDate.getTime())) startDate = null;
+
+    const fmtDisplay = (d) =>
+      d.toLocaleString('es-ES', {
+        day: '2-digit', month: 'long', year: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+        timeZone: 'Europe/Madrid',
+      });
+
+    const timeStr = startDate ? fmtDisplay(startDate) : 'Fecha no especificada';
+
+    let typeLabel = 'Evento';
+    let typeEmoji = '📌';
+    if (type === 'cita') { typeLabel = 'Cita'; typeEmoji = '📅'; }
+    else if (type === 'alarma') { typeLabel = 'Alarma'; typeEmoji = '⏰'; }
+    else if (type === 'tarea') { typeLabel = 'Tarea'; typeEmoji = '✅'; }
+
+    // Escapes
+    const esc = (s) => String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+    const escNl = (s) => esc(s).replace(/\n/g, '<br>');
+
+    // Google Calendar URL
+    let googleUrl = '';
+    if (startDate) {
+      const end = new Date(startDate.getTime() + 60 * 60 * 1000);
+      const fmtG = (d) =>
+        d.getUTCFullYear().toString() +
+        String(d.getUTCMonth() + 1).padStart(2, '0') +
+        String(d.getUTCDate()).padStart(2, '0') + 'T' +
+        String(d.getUTCHours()).padStart(2, '0') +
+        String(d.getUTCMinutes()).padStart(2, '0') + '00Z';
+      const params = new URLSearchParams({
+        action: 'TEMPLATE',
+        text: title,
+        dates: `${fmtG(startDate)}/${fmtG(end)}`,
+      });
+      if (desc) params.set('details', desc);
+      if (location) params.set('location', location);
+      googleUrl = `https://calendar.google.com/calendar/render?${params.toString()}`;
+    }
+
+    // Outlook Calendar URL
+    let outlookUrl = '';
+    if (startDate) {
+      const end = new Date(startDate.getTime() + 60 * 60 * 1000);
+      const params = new URLSearchParams({
+        path: '/calendar/action/compose',
+        rru: 'addevent',
+        subject: title,
+        startdt: startDate.toISOString(),
+        enddt: end.toISOString(),
+      });
+      if (desc) params.set('body', desc);
+      if (location) params.set('location', location);
+      outlookUrl = `https://outlook.live.com/calendar/0/deeplink/compose?${params.toString()}`;
+    }
+
+    // Deep link a RSMail
+    const rsmailLink = `rsmail://event/invite/${id}`;
+
+    // HTML final
+    res.send(`<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RSMail · ${esc(title)}</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: linear-gradient(135deg, #0D47A1 0%, #1A73E8 100%);
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    padding: 16px; color: #333;
+  }
+  .container {
+    background: #fff; border-radius: 16px; max-width: 640px; width: 100%;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.25); overflow: hidden;
+  }
+  .header {
+    background: #1A73E8; color: #fff; padding: 22px 24px;
+    display: flex; align-items: center; gap: 12px;
+  }
+  .header .icon { font-size: 28px; }
+  .header h1 { font-size: 18px; font-weight: 600; }
+  .content { padding: 24px; }
+  .event-title {
+    font-size: 22px; font-weight: 700; color: #111;
+    margin-bottom: 14px; word-wrap: break-word;
+  }
+  .info-box {
+    background: #E3F2FD; border-left: 4px solid #1A73E8;
+    padding: 14px 18px; border-radius: 8px; margin-bottom: 18px;
+  }
+  .info-box p { font-size: 14px; color: #333; margin: 6px 0; line-height: 1.5; }
+  .info-box .urgent { color: #D32F2F; font-weight: bold; }
+  .desc {
+    background: #F5F5F5; padding: 14px 16px; border-radius: 8px;
+    font-size: 14px; line-height: 1.6; color: #333; margin-bottom: 18px;
+    white-space: pre-wrap; word-wrap: break-word;
+  }
+  .voice-note {
+    font-size: 13px; color: #666; margin-bottom: 20px; font-style: italic;
+  }
+  .buttons { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
+  .btn {
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    padding: 14px 18px; border-radius: 10px; text-decoration: none;
+    font-weight: 600; font-size: 15px; transition: transform .1s, opacity .2s;
+    cursor: pointer; border: none;
+  }
+  .btn:active { transform: scale(0.98); }
+  .btn-google { background: #1A73E8; color: #fff; }
+  .btn-outlook { background: #0078D4; color: #fff; }
+  .btn-rsmail { background: #fff; color: #1A73E8; border: 2px solid #1A73E8; }
+  .btn:hover { opacity: 0.92; }
+  .divider {
+    text-align: center; font-size: 12px; color: #aaa;
+    margin: 20px 0 12px 0; position: relative;
+  }
+  .divider::before, .divider::after {
+    content: ''; position: absolute; top: 50%; width: 40%;
+    height: 1px; background: #e0e0e0;
+  }
+  .divider::before { left: 0; }
+  .divider::after { right: 0; }
+  .note {
+    font-size: 12px; color: #888; text-align: center;
+    margin-top: 16px; line-height: 1.5;
+  }
+  .footer {
+    padding: 16px 24px; background: #f5f5f5; font-size: 11px; color: #999;
+    text-align: center; border-top: 1px solid #e0e0e0;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <span class="icon">${typeEmoji}</span>
+    <h1>Invitación a evento · RSMail</h1>
+  </div>
+  <div class="content">
+    <div class="event-title">${esc(title)}</div>
+
+    <div class="info-box">
+      <p><b>🗓 Fecha:</b> ${esc(timeStr)}</p>
+      <p><b>${typeEmoji} Tipo:</b> ${esc(typeLabel)}</p>
+      ${isUrgent ? '<p class="urgent">🔴 URGENTE</p>' : ''}
+      ${location ? `<p><b>📍 Lugar:</b> ${esc(location)}</p>` : ''}
+    </div>
+
+    ${desc ? `<div class="desc">${escNl(desc)}</div>` : ''}
+    ${hasVoice ? '<p class="voice-note">🎤 Nota de voz adjunta en RSMail</p>' : ''}
+
+    <div class="buttons">
+      ${googleUrl ? `
+        <a class="btn btn-google" href="${googleUrl}" target="_blank" rel="noopener">
+          📅 Añadir a Google Calendar
+        </a>` : ''}
+      ${outlookUrl ? `
+        <a class="btn btn-outlook" href="${outlookUrl}" target="_blank" rel="noopener">
+          📆 Añadir a Outlook Calendar
+        </a>` : ''}
+
+      <div class="divider">o</div>
+
+      <a class="btn btn-rsmail" href="${rsmailLink}">
+        📲 Abrir en RSMail
+      </a>
+    </div>
+
+    <p class="note">
+      Los botones de calendario abren tu calendario con el evento ya
+      precargado. Solo tienes que pulsar <b>Guardar</b>.
+    </p>
+  </div>
+  <div class="footer">
+    📅 Enviado desde RSMail · rsmail-backend.onrender.com
+  </div>
+</div>
+</body>
+</html>`);
+  } catch (e) {
+    console.error('❌ Error en /event/invite/:id:', e.message);
+    res.status(500).send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Error</title></head>
+<body style="font-family:sans-serif;padding:40px;text-align:center;">
+<h1 style="color:#c62828;">Error del servidor</h1><p>${e.message}</p></body></html>`);
   }
 });
 

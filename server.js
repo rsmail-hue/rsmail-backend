@@ -28,13 +28,14 @@ if (CLOUDINARY_ENABLED) {
   });
   console.log('✅ Cloudinary configurado');
 } else {
-  console.log('⚠️ Cloudinary sin configurar → fallback a almacenamiento local');
+  console.log('⚠️ Cloudinary sin configurar → fallback a Firebase Storage / local');
 }
 
 // ------------------------------------------------------------
 //  FIREBASE ADMIN (FCM) — inicialización defensiva
 // ------------------------------------------------------------
 let db = null;
+let storageBucket = null;
 try {
   let adminVersion = 'desconocida';
   try { adminVersion = require('firebase-admin/package.json').version; } catch (_) {}
@@ -54,6 +55,8 @@ try {
             clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
             privateKey: formattedKey,
           }),
+          storageBucket: process.env.FIREBASE_STORAGE_BUCKET ||
+            `${process.env.FIREBASE_PROJECT_ID}.appspot.com`,
         });
         console.log('✅ Firebase Admin inicializado con variables de entorno');
       } catch (e) {
@@ -62,7 +65,11 @@ try {
     } else {
       try {
         const serviceAccount = require('./serviceAccountKey.json');
-        admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+        admin.initializeApp({
+          credential: admin.credential.cert(serviceAccount),
+          storageBucket: process.env.FIREBASE_STORAGE_BUCKET ||
+            `${serviceAccount.project_id}.appspot.com`,
+        });
         console.log('✅ Firebase Admin inicializado con serviceAccountKey.json');
       } catch (e) {
         console.error('⚠️ Sin credenciales de Firebase. Push deshabilitadas.');
@@ -75,6 +82,13 @@ try {
   if (admin && Array.isArray(admin.apps) && admin.apps.length > 0) {
     db = admin.firestore();
     console.log('✅ Firestore listo');
+    try {
+      storageBucket = admin.storage().bucket();
+      console.log('✅ Firebase Storage listo:', storageBucket.name);
+    } catch (e) {
+      console.warn('⚠️ Firebase Storage NO disponible:', e.message);
+      storageBucket = null;
+    }
   } else {
     console.warn('⚠️ Firestore NO disponible.');
   }
@@ -784,7 +798,7 @@ cron.schedule('0 */12 * * *', async () => {
 });
 
 // ------------------------------------------------------------
-//  CHAT — SUBIDA DE ARCHIVOS
+//  CHAT — SUBIDA DE ARCHIVOS (Cloudinary → Firebase Storage → local)
 // ------------------------------------------------------------
 const multerMemory = multer({
   storage: multer.memoryStorage(),
@@ -798,6 +812,7 @@ app.post('/api/chat/upload', multerMemory.single('file'), async (req, res) => {
     const size = req.file.size || 0;
     const mimetype = req.file.mimetype || 'application/octet-stream';
 
+    // 1) Intentar Cloudinary si está configurado
     if (CLOUDINARY_ENABLED) {
       try {
         const isImage = mimetype.startsWith('image/');
@@ -808,22 +823,61 @@ app.post('/api/chat/upload', multerMemory.single('file'), async (req, res) => {
               folder: 'rsmail_chat',
               resource_type: isImage ? 'image' : isVideo ? 'video' : 'raw',
               public_id: `${Date.now()}_${originalName.replace(/\.[^/.]+$/, '').replace(/[^\w\-]/g, '_')}`,
-              unique_filename: true, overwrite: false, access_mode: 'public',
+              unique_filename: true,
+              overwrite: false,
+              type: 'upload',             // 🔥 público permanente (no caduca)
+              access_mode: 'public',
             },
             (error, result) => { if (error) reject(error); else resolve(result); }
           );
           stream.end(req.file.buffer);
         });
+        console.log('✅ Subido a Cloudinary:', uploadResult.secure_url);
         return res.json({
-          success: true, url: uploadResult.secure_url,
-          filename: originalName, size, provider: 'cloudinary',
+          success: true,
+          url: uploadResult.secure_url,
+          filename: originalName,
+          size,
+          provider: 'cloudinary',
           publicId: uploadResult.public_id,
         });
       } catch (cloudErr) {
-        console.error('❌ Cloudinary falló:', cloudErr.message);
+        console.error('❌ Cloudinary falló, probando Firebase Storage:', cloudErr.message);
       }
     }
 
+    // 2) Fallback: Firebase Storage (persistente, NO se borra en Render)
+    if (storageBucket) {
+      try {
+        const safeName = originalName.replace(/[^\w\.\-]/g, '_');
+        const fileName = `chat/${Date.now()}_${safeName}`;
+        const fileRef = storageBucket.file(fileName);
+
+        await fileRef.save(req.file.buffer, {
+          contentType: mimetype,
+          metadata: { cacheControl: 'public, max-age=31536000' },
+          public: true,
+          resumable: false,
+        });
+
+        // Generar URL pública directa
+        const publicUrl =
+          `https://storage.googleapis.com/${storageBucket.name}/${fileName}`;
+
+        console.log('✅ Subido a Firebase Storage:', publicUrl);
+        return res.json({
+          success: true,
+          url: publicUrl,
+          filename: originalName,
+          size,
+          provider: 'firebase-storage',
+        });
+      } catch (fbErr) {
+        console.error('❌ Firebase Storage falló:', fbErr.message);
+      }
+    }
+
+    // 3) Último recurso: local (⚠️ se borra al reiniciar Render)
     const fs = require('fs'), path = require('path');
     const dir = path.join(__dirname, 'uploads', 'chat');
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -831,10 +885,13 @@ app.post('/api/chat/upload', multerMemory.single('file'), async (req, res) => {
     const filePath = path.join(dir, uniqueName);
     fs.writeFileSync(filePath, req.file.buffer);
     const baseUrl = `${req.protocol}://${req.get('host')}`;
+    console.warn('⚠️ Usando fallback local TEMPORAL:', uniqueName);
     res.json({
       success: true,
       url: `${baseUrl}/api/chat/file/${encodeURIComponent(uniqueName)}`,
-      filename: originalName, size, provider: 'local',
+      filename: originalName,
+      size,
+      provider: 'local',
     });
   } catch (e) {
     console.error('❌ Error en /api/chat/upload:', e.message);
@@ -1576,7 +1633,7 @@ app.get('/ping', async (req, res) => {
       }
     } catch (e) { console.error('⚠️ Error en /ping:', e.message); }
   }
-  res.json({ alive: true, ts: new Date().toISOString(), workers: activeWorkers.size, firestore: !!db, blockedAccounts: Array.from(failedAccounts.keys()) });
+  res.json({ alive: true, ts: new Date().toISOString(), workers: activeWorkers.size, firestore: !!db, storage: !!storageBucket, blockedAccounts: Array.from(failedAccounts.keys()) });
 });
 
 app.get('/api/debug/workers', (req, res) => {
@@ -1596,6 +1653,7 @@ app.get('/api/debug/workers', (req, res) => {
     uptime: process.uptime(), timestamp: new Date().toISOString(),
     microsoftClientIdConfigured: !!MICROSOFT_CLIENT_ID,
     firestoreAvailable: !!db,
+    storageAvailable: !!storageBucket,
     blockedAccounts: Array.from(failedAccounts.entries()).map(([e, v]) => ({ email: e, count: v.count, until: v.until ? new Date(v.until).toISOString() : null })),
   });
 });
@@ -1764,9 +1822,6 @@ app.post('/api/save-to-sent', async (req, res) => {
     client = conn.client;
 
     const list = await client.list();
-    const folderNames = list.map(f => `${f.path} (name=${f.name}, su=${f.specialUse || '-'})`);
-    console.log(`📁 [save-to-sent] Carpetas de ${email}: ${folderNames.join(' | ')}`);
-
     const candidates = list.filter(f => {
       const name = (f.name || '').toLowerCase();
       const path = (f.path || '').toLowerCase();
@@ -2357,7 +2412,7 @@ app.delete('/api/account/:email', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-// 🔥 NUEVO — COMPARTIR EVENTO POR EMAIL (página pública con botones)
+//  COMPARTIR EVENTO POR EMAIL (página pública con botones)
 // ------------------------------------------------------------
 app.get('/event/invite/:id', async (req, res) => {
   if (!db) return res.status(500).send('Firestore no disponible');
@@ -2384,7 +2439,6 @@ h1{color:#c62828;font-size:20px;margin:0 0 8px;}p{color:#666;font-size:14px;marg
     const voiceUrl = ev.voiceUrl || '';
     const hasVoice = typeof voiceUrl === 'string' && voiceUrl.length > 0;
 
-    // Parse fecha
     let startDate = null;
     const raw = ev.eventTime || ev.startTime;
     if (raw && typeof raw.toDate === 'function') startDate = raw.toDate();
@@ -2406,13 +2460,11 @@ h1{color:#c62828;font-size:20px;margin:0 0 8px;}p{color:#666;font-size:14px;marg
     else if (type === 'alarma') { typeLabel = 'Alarma'; typeEmoji = '⏰'; }
     else if (type === 'tarea') { typeLabel = 'Tarea'; typeEmoji = '✅'; }
 
-    // Escapes
     const esc = (s) => String(s)
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;');
     const escNl = (s) => esc(s).replace(/\n/g, '<br>');
 
-    // Google Calendar URL
     let googleUrl = '';
     if (startDate) {
       const end = new Date(startDate.getTime() + 60 * 60 * 1000);
@@ -2432,7 +2484,6 @@ h1{color:#c62828;font-size:20px;margin:0 0 8px;}p{color:#666;font-size:14px;marg
       googleUrl = `https://calendar.google.com/calendar/render?${params.toString()}`;
     }
 
-    // Outlook Calendar URL
     let outlookUrl = '';
     if (startDate) {
       const end = new Date(startDate.getTime() + 60 * 60 * 1000);
@@ -2448,10 +2499,8 @@ h1{color:#c62828;font-size:20px;margin:0 0 8px;}p{color:#666;font-size:14px;marg
       outlookUrl = `https://outlook.live.com/calendar/0/deeplink/compose?${params.toString()}`;
     }
 
-    // Deep link a RSMail
     const rsmailLink = `rsmail://event/invite/${id}`;
 
-    // HTML final
     res.send(`<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -2589,6 +2638,8 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, async () => {
   console.log(`✅ Backend RSMAIL activo en puerto ${PORT}`);
   console.log(`   Firestore: ${db ? 'OK' : 'NO DISPONIBLE'}`);
+  console.log(`   Firebase Storage: ${storageBucket ? storageBucket.name : 'NO DISPONIBLE'}`);
+  console.log(`   Cloudinary: ${CLOUDINARY_ENABLED ? 'OK' : 'NO'}`);
   console.log(`   Microsoft OAuth client_id: ${MICROSOFT_CLIENT_ID ? MICROSOFT_CLIENT_ID.substring(0, 12) + '...' : '❌ NO CONFIGURADO'}`);
   await restoreWorkers();
 });

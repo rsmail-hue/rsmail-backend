@@ -32,7 +32,7 @@ if (CLOUDINARY_ENABLED) {
 }
 
 // ------------------------------------------------------------
-//  FIREBASE ADMIN (FCM) — inicialización defensiva
+//  FIREBASE ADMIN (FCM)
 // ------------------------------------------------------------
 let db = null;
 let storageBucket = null;
@@ -105,7 +105,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ------------------------------------------------------------
-//  Microsoft OAuth2 — Helpers
+//  Microsoft OAuth2
 // ------------------------------------------------------------
 const MICROSOFT_CLIENT_ID = process.env.MICROSOFT_CLIENT_ID || '';
 const MICROSOFT_SCOPES =
@@ -798,7 +798,7 @@ cron.schedule('0 */12 * * *', async () => {
 });
 
 // ------------------------------------------------------------
-//  CHAT — SUBIDA DE ARCHIVOS (Cloudinary → Firebase Storage → local)
+//  CHAT — SUBIDA DE ARCHIVOS
 // ------------------------------------------------------------
 const multerMemory = multer({
   storage: multer.memoryStorage(),
@@ -812,7 +812,6 @@ app.post('/api/chat/upload', multerMemory.single('file'), async (req, res) => {
     const size = req.file.size || 0;
     const mimetype = req.file.mimetype || 'application/octet-stream';
 
-    // 1) Intentar Cloudinary si está configurado
     if (CLOUDINARY_ENABLED) {
       try {
         const isImage = mimetype.startsWith('image/');
@@ -825,7 +824,7 @@ app.post('/api/chat/upload', multerMemory.single('file'), async (req, res) => {
               public_id: `${Date.now()}_${originalName.replace(/\.[^/.]+$/, '').replace(/[^\w\-]/g, '_')}`,
               unique_filename: true,
               overwrite: false,
-              type: 'upload',             // 🔥 público permanente (no caduca)
+              type: 'upload',
               access_mode: 'public',
             },
             (error, result) => { if (error) reject(error); else resolve(result); }
@@ -846,7 +845,6 @@ app.post('/api/chat/upload', multerMemory.single('file'), async (req, res) => {
       }
     }
 
-    // 2) Fallback: Firebase Storage (persistente, NO se borra en Render)
     if (storageBucket) {
       try {
         const safeName = originalName.replace(/[^\w\.\-]/g, '_');
@@ -860,7 +858,6 @@ app.post('/api/chat/upload', multerMemory.single('file'), async (req, res) => {
           resumable: false,
         });
 
-        // Generar URL pública directa
         const publicUrl =
           `https://storage.googleapis.com/${storageBucket.name}/${fileName}`;
 
@@ -877,7 +874,6 @@ app.post('/api/chat/upload', multerMemory.single('file'), async (req, res) => {
       }
     }
 
-    // 3) Último recurso: local (⚠️ se borra al reiniciar Render)
     const fs = require('fs'), path = require('path');
     const dir = path.join(__dirname, 'uploads', 'chat');
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -1267,7 +1263,7 @@ cron.schedule('0 */6 * * *', async () => {
 });
 
 // ------------------------------------------------------------
-//  FCM PUSH — con soporte data-only
+//  FCM PUSH
 // ------------------------------------------------------------
 async function sendPushNotification(email, payload, options = {}) {
   if (!db) return;
@@ -2029,6 +2025,153 @@ app.post('/api/message-detail', async (req, res) => {
   }
 });
 
+// ------------------------------------------------------------
+//  🔥 MOVER MENSAJE A CARPETA (NUEVO)
+// ------------------------------------------------------------
+app.post('/api/move-message', async (req, res) => {
+  const { email, password, host, port, uid, fromFolder, toFolder } = req.body;
+
+  if (!email || !password || !uid || !fromFolder || !toFolder) {
+    return res.status(400).json({
+      success: false,
+      error: 'Faltan parámetros (email, password, uid, fromFolder, toFolder)',
+    });
+  }
+
+  let client;
+  try {
+    console.log(`📦 Mover UID ${uid} de "${fromFolder}" → "${toFolder}"`);
+
+    const conn = await connectImapAuto(email, password, host);
+    client = conn.client;
+
+    const lock = await client.getMailboxLock(fromFolder);
+    try {
+      // Resolver el nombre real de la carpeta destino
+      let targetFolder = toFolder;
+      try {
+        const list = await client.list();
+        const found = list.find(
+          (f) =>
+            f.path.toLowerCase() === toFolder.toLowerCase() ||
+            f.name.toLowerCase() === toFolder.toLowerCase()
+        );
+        if (found) targetFolder = found.path;
+      } catch (_) {}
+
+      console.log(`📂 Carpeta destino real: "${targetFolder}"`);
+
+      await client.messageMove(String(uid), targetFolder, { uid: true });
+
+      try { lock.release(); } catch (_) {}
+      await client.logout();
+      client = null;
+
+      console.log(`✅ Mensaje ${uid} movido a "${targetFolder}"`);
+      return res.json({ success: true, movedTo: targetFolder });
+    } catch (e) {
+      try { lock.release(); } catch (_) {}
+      throw e;
+    }
+  } catch (e) {
+    if (client) await client.logout().catch(() => {});
+    console.error('❌ Error /api/move-message:', e.message);
+    return res.status(500).json({
+      success: false,
+      error: e.message || 'Error al mover el mensaje',
+    });
+  }
+});
+
+// ------------------------------------------------------------
+//  🔥 CREAR CARPETA (NUEVO)
+// ------------------------------------------------------------
+app.post('/api/create-folder', async (req, res) => {
+  const { email, password, host, port, folderName } = req.body;
+
+  if (!email || !password || !folderName) {
+    return res.status(400).json({
+      success: false,
+      error: 'Faltan parámetros (email, password, folderName)',
+    });
+  }
+
+  let client;
+  try {
+    console.log(`📁 Creando carpeta "${folderName}" para ${email}`);
+
+    const conn = await connectImapAuto(email, password, host);
+    client = conn.client;
+
+    await client.mailboxCreate(folderName);
+
+    await client.logout();
+    client = null;
+
+    console.log(`✅ Carpeta creada: "${folderName}"`);
+    return res.json({ success: true, folder: folderName });
+  } catch (e) {
+    if (client) await client.logout().catch(() => {});
+    console.error('❌ Error /api/create-folder:', e.message);
+    return res.status(500).json({
+      success: false,
+      error: e.message || 'Error al crear la carpeta',
+    });
+  }
+});
+
+// ------------------------------------------------------------
+//  🔥 ELIMINAR CARPETA (NUEVO)
+// ------------------------------------------------------------
+app.post('/api/delete-folder', async (req, res) => {
+  const { email, password, host, port, folderName } = req.body;
+
+  if (!email || !password || !folderName) {
+    return res.status(400).json({
+      success: false,
+      error: 'Faltan parámetros (email, password, folderName)',
+    });
+  }
+
+  let client;
+  try {
+    console.log(`🗑️ Borrando carpeta "${folderName}" de ${email}`);
+
+    const conn = await connectImapAuto(email, password, host);
+    client = conn.client;
+
+    // Buscar el path real
+    let targetFolder = folderName;
+    try {
+      const list = await client.list();
+      const found = list.find(
+        (f) =>
+          f.path.toLowerCase() === folderName.toLowerCase() ||
+          f.name.toLowerCase() === folderName.toLowerCase()
+      );
+      if (found) targetFolder = found.path;
+    } catch (_) {}
+
+    await client.mailboxDelete(targetFolder);
+
+    await client.logout();
+    client = null;
+
+    console.log(`✅ Carpeta borrada: "${targetFolder}"`);
+    return res.json({ success: true, folder: targetFolder });
+  } catch (e) {
+    if (client) await client.logout().catch(() => {});
+    console.error('❌ Error /api/delete-folder:', e.message);
+    return res.status(500).json({
+      success: false,
+      error: e.message || 'Error al borrar la carpeta',
+    });
+  }
+});
+
+// ------------------------------------------------------------
+//  DELETE MESSAGE
+// ------------------------------------------------------------
 app.post('/api/delete-message', async (req, res) => {
   const { email, password, host, port, uid, folder = 'INBOX' } = req.body;
   if (!uid) return res.status(400).json({ success: false, error: 'Falta UID' });

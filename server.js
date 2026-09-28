@@ -410,7 +410,6 @@ async function sendViaBrevo({ fromEmail, fromName, to, subject, html }) {
 // ------------------------------------------------------------
 //  HELPERS DE TIMEZONE
 // ------------------------------------------------------------
-// Devuelve el offset (minutos) guardado para el destinatario, o 0 si no hay.
 async function getUserTimezoneOffset(email) {
   if (!db || !email) return 0;
   try {
@@ -422,11 +421,8 @@ async function getUserTimezoneOffset(email) {
   } catch (_) { return 0; }
 }
 
-// Formatea una fecha UTC aplicándole el offset local del usuario.
-// Devuelve { dayStr, timeStr, fullStr }.
 function formatEventLocal(eventDate, offsetMinutes, referenceNow = new Date()) {
   const off = Number(offsetMinutes) || 0;
-  // Aplicamos el offset al timestamp UTC para "simular" hora local
   const evLocal = new Date(eventDate.getTime() + off * 60 * 1000);
   const nowLocal = new Date(referenceNow.getTime() + off * 60 * 1000);
 
@@ -464,8 +460,6 @@ function formatEventLocal(eventDate, offsetMinutes, referenceNow = new Date()) {
   return { dayStr, timeStr, fullStr };
 }
 
-// Formatea la hora local del usuario "ahora" (útil para saber cuándo se le
-// está notificando, en su huso).
 function formatNowLocal(offsetMinutes, referenceNow = new Date()) {
   const off = Number(offsetMinutes) || 0;
   const local = new Date(referenceNow.getTime() + off * 60 * 1000);
@@ -1200,7 +1194,6 @@ cron.schedule('* * * * *', async () => {
     const now = new Date();
     const snapshot = await db.collection('calendar_events').get();
 
-    // Cache de offsets por email en esta ejecución (evita hits repetidos)
     const offsetCache = new Map();
     const getOffset = async (email) => {
       const key = (email || '').toLowerCase();
@@ -1227,11 +1220,9 @@ cron.schedule('* * * * *', async () => {
 
       const offsetMin = await getOffset(recipientEmail);
 
-      // 🔥 Fecha/hora del evento en la zona local del destinatario
       const { dayStr, timeStr, fullStr } =
         formatEventLocal(eventDate, offsetMin, now);
 
-      // 🔥 Etiqueta del tipo de evento
       const type = (event.type || 'cita').toLowerCase();
       let typeLabel, typeEmoji;
       if (type === 'cita') { typeLabel = 'Cita'; typeEmoji = '📅'; }
@@ -1239,13 +1230,13 @@ cron.schedule('* * * * *', async () => {
       else if (type === 'alarma') { typeLabel = 'Alarma'; typeEmoji = '⏰'; }
       else { typeLabel = 'Evento'; typeEmoji = '📌'; }
 
-      // 🔥 Línea de información que va debajo del título
-      //    Ej: "📅 Cita · Hoy 28/09 a las 13:15"
-      const infoLine = `${typeEmoji} ${typeLabel} · ${fullStr}`;
+      // 🔥 Dos líneas: cuándo ES el evento + cuándo SE NOTIFICA
+      const nowLocalStr = formatNowLocal(offsetMin, now);
+      const infoLine =
+        `${typeEmoji} ${typeLabel} · ${fullStr}\n` +
+        `🔔 Aviso enviado: ${nowLocalStr}`;
 
-      // ─────────────────────────────────────────
-      //  📅 1 DÍA ANTES
-      // ─────────────────────────────────────────
+      // 📅 1 DÍA ANTES
       if (!event.notified1Day && diffHours <= 25 && diffHours > 23) {
         console.log(`📅 1 DÍA ANTES: ${event.title} → ${recipientEmail} (offset ${offsetMin}min)`);
         await sendPushNotification(recipientEmail, {
@@ -1268,9 +1259,7 @@ cron.schedule('* * * * *', async () => {
         await doc.ref.update({ notified1Day: true });
       }
 
-      // ─────────────────────────────────────────
-      //  ⏰ 1 HORA ANTES
-      // ─────────────────────────────────────────
+      // ⏰ 1 HORA ANTES
       if (!event.notified1Hour && diffMs <= 65 * 60 * 1000 && diffMs > 55 * 60 * 1000) {
         console.log(`⏰ 1 HORA ANTES: ${event.title} → ${recipientEmail} (offset ${offsetMin}min)`);
         await sendPushNotification(recipientEmail, {
@@ -1293,9 +1282,7 @@ cron.schedule('* * * * *', async () => {
         await doc.ref.update({ notified1Hour: true });
       }
 
-      // ─────────────────────────────────────────
-      //  ⏰ 15 MIN ANTES
-      // ─────────────────────────────────────────
+      // ⏰ 15 MIN ANTES
       if (!event.notifiedEvent && diffMs <= 15 * 60 * 1000 && diffMs > 0) {
         console.log(`⏰ 15 MIN ANTES: ${event.title} → ${recipientEmail} (offset ${offsetMin}min)`);
         await sendPushNotification(recipientEmail, {
@@ -2130,7 +2117,7 @@ app.post('/api/fcm-token', async (req, res) => {
 
     const offset =
       (typeof timezoneOffset === 'number' && !isNaN(timezoneOffset))
-        ? Math.max(-840, Math.min(840, Math.round(timezoneOffset))) // -14h..+14h
+        ? Math.max(-840, Math.min(840, Math.round(timezoneOffset)))
         : 0;
 
     await db.collection('fcm_tokens').add({
@@ -2368,6 +2355,7 @@ function detectAttachmentsFromStructure(structure) {
   return false;
 }
 
+// 🔥 NUEVO: incluye preview + fromName + toName
 app.post('/api/messages', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
   let client;
@@ -2378,18 +2366,34 @@ app.post('/api/messages', async (req, res) => {
     const messages = [];
     try {
       const iter = client.fetch('1:*',
-        { envelope: true, flags: true, bodyStructure: true },
+        { envelope: true, flags: true, bodyStructure: true, preview: true },
         { max: limit, reverse: true });
       for await (const msg of iter) {
         let flags = msg.flags;
         if (flags instanceof Set) flags = Array.from(flags);
         else if (!Array.isArray(flags)) flags = [];
         const hasAttachments = detectAttachmentsFromStructure(msg.bodyStructure);
+
+        const fromAddr = msg.envelope?.from?.[0]?.address || '';
+        const fromName = msg.envelope?.from?.[0]?.name || '';
+        const toAddr = msg.envelope?.to?.[0]?.address || '';
+        const toName = msg.envelope?.to?.[0]?.name || '';
+
+        // 🔥 Vista previa: limpiar espacios/saltos y limitar a 160 chars
+        let preview = (msg.preview || '').toString();
+        preview = preview.replace(/\s+/g, ' ').trim();
+        if (preview.length > 160) {
+          preview = preview.substring(0, 160).trim() + '…';
+        }
+
         messages.push({
           uid: msg.uid, id: msg.uid.toString(),
           subject: msg.envelope?.subject || '(Sin asunto)',
-          from: msg.envelope?.from?.[0]?.address || msg.envelope?.from?.[0]?.name || '',
-          to: msg.envelope?.to?.[0]?.address || '',
+          from: fromAddr || fromName,
+          fromName,
+          to: toAddr || toName,
+          toName,
+          preview,
           date: msg.envelope?.date ? new Date(msg.envelope.date).toISOString() : new Date().toISOString(),
           hasAttachments, flags,
           isRead: flags.includes('\\Seen'),

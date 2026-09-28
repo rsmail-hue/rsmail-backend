@@ -583,6 +583,56 @@ async function checkAndSendAutoReply({
 const _rulesCache = new Map();
 const RULES_CACHE_TTL_MS = 5 * 60 * 1000;
 
+// ------------------------------------------------------------
+//  🔥 IA — Preferencias del usuario (leídas desde Firestore)
+// ------------------------------------------------------------
+const _aiPrefsCache = new Map();
+const AI_PREFS_CACHE_TTL_MS = 5 * 60 * 1000;
+
+const AI_PREFS_DEFAULTS = {
+  chat: true,
+  naturalLanguageRules: false,
+  detectUrgency: false,
+  urgencyLevel: 'medium',
+  autoClassify: false,
+  categories: ['personal', 'trabajo', 'facturas', 'publicidad',
+               'notificaciones', 'social', 'otro'],
+};
+
+async function getAiPreferences(email) {
+  if (!db || !email) return { ...AI_PREFS_DEFAULTS };
+  const now = Date.now();
+  const cached = _aiPrefsCache.get(email);
+  if (cached && cached.expiresAt > now) return cached.prefs;
+  try {
+    const doc = await db.collection('ai_preferences').doc(email).get();
+    const data = doc.exists ? (doc.data() || {}) : {};
+    const prefs = {
+      chat: typeof data.chat === 'boolean' ? data.chat : AI_PREFS_DEFAULTS.chat,
+      naturalLanguageRules: typeof data.naturalLanguageRules === 'boolean'
+        ? data.naturalLanguageRules : AI_PREFS_DEFAULTS.naturalLanguageRules,
+      detectUrgency: typeof data.detectUrgency === 'boolean'
+        ? data.detectUrgency : AI_PREFS_DEFAULTS.detectUrgency,
+      urgencyLevel: ['low', 'medium', 'high'].includes(data.urgencyLevel)
+        ? data.urgencyLevel : AI_PREFS_DEFAULTS.urgencyLevel,
+      autoClassify: typeof data.autoClassify === 'boolean'
+        ? data.autoClassify : AI_PREFS_DEFAULTS.autoClassify,
+      categories: Array.isArray(data.categories) && data.categories.length > 0
+        ? data.categories.map((c) => String(c).toLowerCase())
+        : AI_PREFS_DEFAULTS.categories,
+    };
+    _aiPrefsCache.set(email, { prefs, expiresAt: now + AI_PREFS_CACHE_TTL_MS });
+    return prefs;
+  } catch (e) {
+    console.error('⚠️ Error leyendo ai_preferences:', e.message);
+    return { ...AI_PREFS_DEFAULTS };
+  }
+}
+
+function invalidateAiPreferencesCache(email) {
+  if (email) _aiPrefsCache.delete(email);
+}
+
 async function getRulesForAccount(email) {
   if (!db) return [];
   const now = Date.now();
@@ -2099,6 +2149,42 @@ app.get('/api/debug/reminders', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ------------------------------------------------------------
+//  🔥 DIAGNÓSTICO: ver flags reales de un mensaje
+//  POST /api/debug/flags { email, password, host, folder, uid }
+//  Devuelve los flags IMAP actuales del mensaje en el servidor.
+// ------------------------------------------------------------
+app.post('/api/debug/flags', async (req, res) => {
+  const { email, password, host, folder = 'INBOX', uid } = req.body;
+  if (!uid) return res.status(400).json({ success: false, error: 'uid requerido' });
+  let client;
+  try {
+    const conn = await connectImapAuto(email, password, host);
+    client = conn.client;
+    const lock = await client.getMailboxLock(folder, { readOnly: true });
+    let flags = [];
+    try {
+      const msg = await client.fetchOne(String(uid), { flags: true }, { uid: true });
+      let f = msg?.flags;
+      if (f instanceof Set) f = Array.from(f);
+      else if (!Array.isArray(f)) f = [];
+      flags = f;
+    } finally { lock.release(); }
+    await client.logout();
+    res.json({
+      success: true,
+      email, folder, uid,
+      flags,
+      isSeen: flags.includes('\\Seen'),
+      isFlagged: flags.includes('\\Flagged'),
+      isAnswered: flags.includes('\\Answered'),
+    });
+  } catch (e) {
+    if (client) await client.logout().catch(() => {});
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 app.post('/api/fcm-token', async (req, res) => {
   const { email, token, password, imapHost, timezoneOffset } = req.body;
   if (!email || !token) return res.status(400).json({ success: false, error: 'Email y token requeridos' });
@@ -2353,12 +2439,11 @@ app.post('/api/messages', async (req, res) => {
   try {
     const conn = await connectImapAuto(email, password, host);
     client = conn.client;
-    // 🔥 Lock en modo readOnly ESTRICTO: ImapFlow no envía STORE \Seen.
+    // readOnly ESTRICTO: ImapFlow no envía STORE \Seen en este modo.
     const lock = await client.getMailboxLock(folder, { readOnly: true });
     const messages = [];
     try {
-      // 🔥 PASO 1 — Fetch base SIN `preview` (evita que servidores IMAP
-      //             estrictos marquen como leído al bajar bytes del TEXT).
+      // SOLO envelope + flags + bodyStructure. NI preview NI source NI text.
       const iter = client.fetch('1:*',
         { envelope: true, flags: true, bodyStructure: true },
         { max: limit, reverse: true });
@@ -2386,20 +2471,6 @@ app.post('/api/messages', async (req, res) => {
           isRead: flags.includes('\\Seen'),
           isFlagged: flags.includes('\\Flagged'),
         });
-      }
-
-      // 🔥 PASO 2 — Fetch secundario de previews, UID a UID, dentro del MISMO
-      //             lock readOnly. ImapFlow usa BODY.PEEK[TEXT]<0.256> en este
-      //             modo, por lo que NO marca el mensaje como leído.
-      for (const m of messages) {
-        try {
-          const full = await client.fetchOne(String(m.uid), { preview: true }, { uid: true });
-          if (full?.preview) {
-            let prev = full.preview.toString().replace(/\s+/g, ' ').trim();
-            if (prev.length > 160) prev = prev.substring(0, 160).trim() + '…';
-            m.preview = prev;
-          }
-        } catch (_) {}
       }
     } finally { lock.release(); }
     await client.logout();
@@ -3353,6 +3424,65 @@ app.post('/api/ai/chat', async (req, res) => {
         ? 'El asistente está recibiendo muchas peticiones. Inténtalo de nuevo en unos segundos.'
         : e.message,
     });
+  }
+});
+
+// ------------------------------------------------------------
+//  🔥 IA — Preferencias: guardar y leer
+// ------------------------------------------------------------
+app.post('/api/ai/preferences', async (req, res) => {
+  if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
+  try {
+    const {
+      email,
+      chat,
+      naturalLanguageRules,
+      detectUrgency,
+      urgencyLevel,
+      autoClassify,
+      categories,
+    } = req.body || {};
+
+    if (!email || typeof email !== 'string') {
+      return res.status(400).json({ success: false, error: 'email_required' });
+    }
+
+    const safeCategories = Array.isArray(categories)
+      ? categories
+          .map((c) => String(c).trim().toLowerCase())
+          .filter((c) => c.length > 0)
+          .slice(0, 40)
+      : undefined;
+
+    const payload = {
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    if (typeof chat === 'boolean') payload.chat = chat;
+    if (typeof naturalLanguageRules === 'boolean') payload.naturalLanguageRules = naturalLanguageRules;
+    if (typeof detectUrgency === 'boolean') payload.detectUrgency = detectUrgency;
+    if (['low', 'medium', 'high'].includes(urgencyLevel)) payload.urgencyLevel = urgencyLevel;
+    if (typeof autoClassify === 'boolean') payload.autoClassify = autoClassify;
+    if (safeCategories && safeCategories.length > 0) payload.categories = safeCategories;
+
+    await db.collection('ai_preferences').doc(email).set(payload, { merge: true });
+    invalidateAiPreferencesCache(email);
+
+    console.log(`✨ ai_preferences actualizadas para ${email}`);
+    res.json({ success: true });
+  } catch (e) {
+    console.error('❌ Error guardando ai_preferences:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get('/api/ai/preferences/:email', async (req, res) => {
+  if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
+  try {
+    const email = decodeURIComponent(req.params.email);
+    const prefs = await getAiPreferences(email);
+    res.json({ success: true, preferences: prefs });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 

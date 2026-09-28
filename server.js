@@ -3188,14 +3188,21 @@ h1{color:#c62828;font-size:20px;margin:0 0 8px;}p{color:#666;font-size:14px;marg
 });
 
 // ------------------------------------------------------------
-//  🔥 IA — GROQ (API compatible con OpenAI, sin dependencias extra)
+//  🔥 IA — GROQ (con fallback entre modelos)
 // ------------------------------------------------------------
+const GROQ_MODELS_FALLBACK = [
+  'llama-3.1-8b-instant',
+  'llama-3.3-70b-versatile',
+  'llama-3.1-70b-versatile',
+  'mixtral-8x7b-32768',
+];
+
 let groqEnabled = false;
 try {
   const groqKey = process.env.GROQ_API_KEY;
   if (groqKey) {
     groqEnabled = true;
-    console.log('✅ Groq AI configurado (modelo: llama-3.3-70b-versatile)');
+    console.log('✅ Groq AI configurado (con fallback de modelos)');
   } else {
     console.log('⚠️ GROQ_API_KEY no configurada → IA deshabilitada');
   }
@@ -3204,8 +3211,8 @@ try {
   groqEnabled = false;
 }
 
-// Helper: llamada a Groq vía fetch (sin dependencias) + reintentos con backoff
-async function callGroqChat({ history, prompt, maxRetries = 3, baseDelayMs = 1500 }) {
+// Helper: prueba varios modelos de Groq hasta que uno funcione
+async function callGroqChat({ history, prompt }) {
   const groqKey = process.env.GROQ_API_KEY;
   if (!groqKey) throw new Error('GROQ_API_KEY no configurada');
 
@@ -3223,8 +3230,9 @@ async function callGroqChat({ history, prompt, maxRetries = 3, baseDelayMs = 150
   ];
 
   let lastError = null;
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+  for (const model of GROQ_MODELS_FALLBACK) {
     try {
+      console.log(`🤖 [AI-Groq] Probando modelo: ${model}`);
       const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -3232,7 +3240,7 @@ async function callGroqChat({ history, prompt, maxRetries = 3, baseDelayMs = 150
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
+          model,
           messages,
           temperature: 0.7,
           max_tokens: 1024,
@@ -3241,27 +3249,30 @@ async function callGroqChat({ history, prompt, maxRetries = 3, baseDelayMs = 150
 
       if (!res.ok) {
         const errBody = await res.text();
-        const err = new Error(`Groq ${res.status}: ${errBody.substring(0, 200)}`);
+        const err = new Error(`Groq ${res.status} (${model}): ${errBody.substring(0, 200)}`);
         err.status = res.status;
-        throw err;
+        err.model = model;
+        console.log(`⚠️ Modelo ${model} falló: ${res.status}`);
+        lastError = err;
+        // Si es error de modelo no encontrado, probar el siguiente
+        if (res.status === 404 || res.status === 400) continue;
+        // Si es rate limit, no probar más
+        if (res.status === 429) throw err;
+        // Otros errores, probar el siguiente
+        continue;
       }
 
       const data = await res.json();
       const reply = data?.choices?.[0]?.message?.content || '(Sin respuesta)';
-      return reply;
+      console.log(`✅ [AI-Groq] Respuesta obtenida con ${model}`);
+      return { reply, model };
     } catch (e) {
       lastError = e;
-      const isRateLimit = e.status === 429 || /rate limit/i.test(e.message);
-      if (isRateLimit && attempt < maxRetries) {
-        const delay = baseDelayMs * Math.pow(2, attempt - 1);
-        console.log(`⏳ Rate limit de Groq. Reintentando en ${delay / 1000}s (${attempt}/${maxRetries})...`);
-        await new Promise((r) => setTimeout(r, delay));
-        continue;
-      }
-      throw e;
+      console.log(`⚠️ Error con modelo ${model}: ${e.message}`);
+      continue;
     }
   }
-  throw lastError;
+  throw lastError || new Error('Todos los modelos de Groq fallaron');
 }
 
 app.post('/api/ai/chat', async (req, res) => {
@@ -3284,17 +3295,15 @@ app.post('/api/ai/chat', async (req, res) => {
 
     console.log(`🤖 [AI-Groq] Consulta: "${message.substring(0, 80)}..."`);
 
-    const replyText = await callGroqChat({
+    const result = await callGroqChat({
       history: historyMessages.slice(-6),
       prompt: message,
     });
 
-    console.log(`✅ [AI-Groq] Respuesta (${replyText.length} chars)`);
-
     res.json({
       success: true,
-      reply: replyText,
-      model: 'llama-3.3-70b-versatile',
+      reply: result.reply,
+      model: result.model,
     });
   } catch (e) {
     console.error('❌ Error en /api/ai/chat (Groq):', e.message);
@@ -3308,18 +3317,25 @@ app.post('/api/ai/chat', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  DIAGNÓSTICO: test rápido de Groq
+//  DIAGNÓSTICO: lista los modelos disponibles en Groq
 // ------------------------------------------------------------
-app.get('/api/ai/test', async (req, res) => {
+app.get('/api/ai/models', async (req, res) => {
   try {
-    if (!process.env.GROQ_API_KEY) {
+    const key = process.env.GROQ_API_KEY;
+    if (!key) {
       return res.status(503).json({ success: false, error: 'GROQ_API_KEY no configurada' });
     }
-    const reply = await callGroqChat({
-      history: [],
-      prompt: 'Di "Hola desde RSMail" en una sola frase corta.',
+    const r = await fetch('https://api.groq.com/openai/v1/models', {
+      headers: { 'Authorization': `Bearer ${key}` },
     });
-    res.json({ success: true, reply, model: 'llama-3.3-70b-versatile' });
+    const data = await r.json();
+    const models = (data.data || []).map((m) => ({
+      id: m.id,
+      contextWindow: m.context_window,
+      ownedBy: m.owned_by,
+      active: m.active,
+    }));
+    res.json({ success: true, total: models.length, models });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }

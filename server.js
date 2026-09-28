@@ -2042,7 +2042,7 @@ app.get('/api/debug/workers', (req, res) => {
     microsoftClientIdConfigured: !!MICROSOFT_CLIENT_ID,
     firestoreAvailable: !!db,
     storageAvailable: !!storageBucket,
-    geminiConfigured: !!geminiClient,
+    groqConfigured: !!process.env.GROQ_API_KEY,
     blockedAccounts: Array.from(failedAccounts.entries()).map(([e, v]) => ({ email: e, count: v.count, until: v.until ? new Date(v.until).toISOString() : null })),
   });
 });
@@ -3188,28 +3188,87 @@ h1{color:#c62828;font-size:20px;margin:0 0 8px;}p{color:#666;font-size:14px;marg
 });
 
 // ------------------------------------------------------------
-//  🔥 IA — GEMINI 3.8 FLASH (SDK @google/genai + Interactions API)
+//  🔥 IA — GROQ (API compatible con OpenAI, sin dependencias extra)
 // ------------------------------------------------------------
-let geminiClient = null;
+let groqEnabled = false;
 try {
-  const { GoogleGenAI } = require('@google/genai');
-  const geminiKey = process.env.GEMINI_API_KEY;
-  if (geminiKey) {
-    geminiClient = new GoogleGenAI({ apiKey: geminiKey });
-    console.log('✅ Gemini 3.8 Flash inicializado (SDK @google/genai + Interactions API)');
+  const groqKey = process.env.GROQ_API_KEY;
+  if (groqKey) {
+    groqEnabled = true;
+    console.log('✅ Groq AI configurado (modelo: llama-3.3-70b-versatile)');
   } else {
-    console.log('⚠️ GEMINI_API_KEY no configurada → IA deshabilitada');
+    console.log('⚠️ GROQ_API_KEY no configurada → IA deshabilitada');
   }
 } catch (e) {
-  console.error('❌ Error inicializando Gemini:', e.message);
-  geminiClient = null;
+  console.error('❌ Error inicializando Groq:', e.message);
+  groqEnabled = false;
+}
+
+// Helper: llamada a Groq vía fetch (sin dependencias) + reintentos con backoff
+async function callGroqChat({ history, prompt, maxRetries = 3, baseDelayMs = 1500 }) {
+  const groqKey = process.env.GROQ_API_KEY;
+  if (!groqKey) throw new Error('GROQ_API_KEY no configurada');
+
+  const messages = [
+    {
+      role: 'system',
+      content:
+        'Eres RSMail AI, el asistente inteligente integrado en la aplicación RSMail. ' +
+        'Ayudas con dudas sobre correo, calendario, contactos, reglas y automatizaciones. ' +
+        'Hablas SIEMPRE en español, con tono cercano y profesional. ' +
+        'Eres conciso (máximo 150 palabras por respuesta salvo que pidan detalle).',
+    },
+    ...history,
+    { role: 'user', content: prompt },
+  ];
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${groqKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          messages,
+          temperature: 0.7,
+          max_tokens: 1024,
+        }),
+      });
+
+      if (!res.ok) {
+        const errBody = await res.text();
+        const err = new Error(`Groq ${res.status}: ${errBody.substring(0, 200)}`);
+        err.status = res.status;
+        throw err;
+      }
+
+      const data = await res.json();
+      const reply = data?.choices?.[0]?.message?.content || '(Sin respuesta)';
+      return reply;
+    } catch (e) {
+      lastError = e;
+      const isRateLimit = e.status === 429 || /rate limit/i.test(e.message);
+      if (isRateLimit && attempt < maxRetries) {
+        const delay = baseDelayMs * Math.pow(2, attempt - 1);
+        console.log(`⏳ Rate limit de Groq. Reintentando en ${delay / 1000}s (${attempt}/${maxRetries})...`);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastError;
 }
 
 app.post('/api/ai/chat', async (req, res) => {
-  if (!geminiClient) {
+  if (!groqEnabled) {
     return res.status(503).json({
       success: false,
-      error: 'IA no disponible. Configura GEMINI_API_KEY en el servidor.',
+      error: 'IA no disponible. Configura GROQ_API_KEY en el servidor.',
     });
   }
   try {
@@ -3218,61 +3277,49 @@ app.post('/api/ai/chat', async (req, res) => {
       return res.status(400).json({ success: false, error: 'message_required' });
     }
 
-    let prompt = message;
-    if (Array.isArray(history) && history.length > 0) {
-      const historyText = history
-        .slice(-6)
-        .map((m) => `${m.role === 'user' ? 'Usuario' : 'RSMail AI'}: ${m.content}`)
-        .join('\n');
-      prompt = `Contexto de la conversación previa:\n${historyText}\n\nNuevo mensaje del usuario:\n${message}`;
-    }
+    const historyMessages = (Array.isArray(history) ? history : []).map((m) => ({
+      role: m.role === 'user' ? 'user' : 'assistant',
+      content: m.content || '',
+    }));
 
-    console.log(`🤖 [AI] Consulta: "${message.substring(0, 80)}..."`);
+    console.log(`🤖 [AI-Groq] Consulta: "${message.substring(0, 80)}..."`);
 
-    const interaction = await geminiClient.interactions.create({
-      model: 'gemini-3.8-flash',
-      input: prompt,
-      system_instruction:
-        'Eres RSMail AI, el asistente inteligente integrado en la aplicación RSMail. ' +
-        'Ayudas con dudas sobre correo, calendario, contactos, reglas y automatizaciones. ' +
-        'Hablas SIEMPRE en español, con tono cercano y profesional. ' +
-        'Eres conciso (máximo 150 palabras por respuesta salvo que pidan detalle).',
+    const replyText = await callGroqChat({
+      history: historyMessages.slice(-6),
+      prompt: message,
     });
 
-    const replyText = interaction.output_text || '(Sin respuesta)';
-    console.log(`✅ [AI] Respuesta (${replyText.length} chars)`);
+    console.log(`✅ [AI-Groq] Respuesta (${replyText.length} chars)`);
 
     res.json({
       success: true,
       reply: replyText,
-      model: 'gemini-3.8-flash',
+      model: 'llama-3.3-70b-versatile',
     });
   } catch (e) {
-    console.error('❌ Error en /api/ai/chat:', e.message);
-    if (e.stack) console.error('   Stack:', e.stack.split('\n').slice(0, 3).join(' | '));
-    res.status(500).json({ success: false, error: e.message });
+    console.error('❌ Error en /api/ai/chat (Groq):', e.message);
+    res.status(500).json({
+      success: false,
+      error: /429|rate limit/i.test(e.message)
+        ? 'El asistente está recibiendo muchas peticiones. Inténtalo de nuevo en unos segundos.'
+        : e.message,
+    });
   }
 });
 
 // ------------------------------------------------------------
-//  DIAGNÓSTICO: lista los modelos disponibles
+//  DIAGNÓSTICO: test rápido de Groq
 // ------------------------------------------------------------
-app.get('/api/ai/models', async (req, res) => {
+app.get('/api/ai/test', async (req, res) => {
   try {
-    const key = process.env.GEMINI_API_KEY;
-    if (!key) {
-      return res.status(503).json({ success: false, error: 'GEMINI_API_KEY no configurada' });
+    if (!process.env.GROQ_API_KEY) {
+      return res.status(503).json({ success: false, error: 'GROQ_API_KEY no configurada' });
     }
-    const r = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models?key=${key}`
-    );
-    const data = await r.json();
-    const models = (data.models || []).map((m) => ({
-      name: m.name,
-      displayName: m.displayName,
-      methods: m.supportedGenerationMethods,
-    }));
-    res.json({ success: true, total: models.length, models });
+    const reply = await callGroqChat({
+      history: [],
+      prompt: 'Di "Hola desde RSMail" en una sola frase corta.',
+    });
+    res.json({ success: true, reply, model: 'llama-3.3-70b-versatile' });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -3288,6 +3335,6 @@ server.listen(PORT, async () => {
   console.log(`   Firebase Storage: ${storageBucket ? storageBucket.name : 'NO DISPONIBLE'}`);
   console.log(`   Cloudinary: ${CLOUDINARY_ENABLED ? 'OK' : 'NO'}`);
   console.log(`   Microsoft OAuth client_id: ${MICROSOFT_CLIENT_ID ? MICROSOFT_CLIENT_ID.substring(0, 12) + '...' : '❌ NO CONFIGURADO'}`);
-  console.log(`   Gemini AI: ${geminiClient ? 'OK' : 'NO CONFIGURADO'}`);
+  console.log(`   Groq AI: ${groqEnabled ? 'OK' : 'NO CONFIGURADO'}`);
   await restoreWorkers();
 });

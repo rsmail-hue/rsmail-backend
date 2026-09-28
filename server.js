@@ -3191,10 +3191,8 @@ h1{color:#c62828;font-size:20px;margin:0 0 8px;}p{color:#666;font-size:14px;marg
 //  🔥 IA — GROQ (con fallback entre modelos)
 // ------------------------------------------------------------
 const GROQ_MODELS_FALLBACK = [
-  'llama-3.1-8b-instant',
-  'llama-3.3-70b-versatile',
-  'llama-3.1-70b-versatile',
-  'mixtral-8x7b-32768',
+  'openai/gpt-oss-20b',
+  'openai/gpt-oss-120b',
 ];
 
 let groqEnabled = false;
@@ -3202,7 +3200,7 @@ try {
   const groqKey = process.env.GROQ_API_KEY;
   if (groqKey) {
     groqEnabled = true;
-    console.log('✅ Groq AI configurado (con fallback de modelos)');
+    console.log('✅ Groq AI configurado (modelos: gpt-oss-20b / gpt-oss-120b)');
   } else {
     console.log('⚠️ GROQ_API_KEY no configurada → IA deshabilitada');
   }
@@ -3254,11 +3252,8 @@ async function callGroqChat({ history, prompt }) {
         err.model = model;
         console.log(`⚠️ Modelo ${model} falló: ${res.status}`);
         lastError = err;
-        // Si es error de modelo no encontrado, probar el siguiente
         if (res.status === 404 || res.status === 400) continue;
-        // Si es rate limit, no probar más
         if (res.status === 429) throw err;
-        // Otros errores, probar el siguiente
         continue;
       }
 

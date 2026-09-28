@@ -2353,11 +2353,14 @@ app.post('/api/messages', async (req, res) => {
   try {
     const conn = await connectImapAuto(email, password, host);
     client = conn.client;
+    // 🔥 Lock en modo readOnly ESTRICTO: ImapFlow no envía STORE \Seen.
     const lock = await client.getMailboxLock(folder, { readOnly: true });
     const messages = [];
     try {
+      // 🔥 PASO 1 — Fetch base SIN `preview` (evita que servidores IMAP
+      //             estrictos marquen como leído al bajar bytes del TEXT).
       const iter = client.fetch('1:*',
-        { envelope: true, flags: true, bodyStructure: true, preview: true },
+        { envelope: true, flags: true, bodyStructure: true },
         { max: limit, reverse: true });
       for await (const msg of iter) {
         let flags = msg.flags;
@@ -2370,12 +2373,6 @@ app.post('/api/messages', async (req, res) => {
         const toAddr = msg.envelope?.to?.[0]?.address || '';
         const toName = msg.envelope?.to?.[0]?.name || '';
 
-        let preview = (msg.preview || '').toString();
-        preview = preview.replace(/\s+/g, ' ').trim();
-        if (preview.length > 160) {
-          preview = preview.substring(0, 160).trim() + '…';
-        }
-
         messages.push({
           uid: msg.uid, id: msg.uid.toString(),
           subject: msg.envelope?.subject || '(Sin asunto)',
@@ -2383,12 +2380,26 @@ app.post('/api/messages', async (req, res) => {
           fromName,
           to: toAddr || toName,
           toName,
-          preview,
+          preview: '',
           date: msg.envelope?.date ? new Date(msg.envelope.date).toISOString() : new Date().toISOString(),
           hasAttachments, flags,
           isRead: flags.includes('\\Seen'),
           isFlagged: flags.includes('\\Flagged'),
         });
+      }
+
+      // 🔥 PASO 2 — Fetch secundario de previews, UID a UID, dentro del MISMO
+      //             lock readOnly. ImapFlow usa BODY.PEEK[TEXT]<0.256> en este
+      //             modo, por lo que NO marca el mensaje como leído.
+      for (const m of messages) {
+        try {
+          const full = await client.fetchOne(String(m.uid), { preview: true }, { uid: true });
+          if (full?.preview) {
+            let prev = full.preview.toString().replace(/\s+/g, ' ').trim();
+            if (prev.length > 160) prev = prev.substring(0, 160).trim() + '…';
+            m.preview = prev;
+          }
+        } catch (_) {}
       }
     } finally { lock.release(); }
     await client.logout();

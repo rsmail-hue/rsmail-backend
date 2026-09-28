@@ -1182,9 +1182,6 @@ async function runImapLoop(state) {
 
 // ------------------------------------------------------------
 //  CRON: CALENDARIO (data-only)
-//  - 1 DÍA ANTES
-//  - 1 HORA ANTES
-//  - 15 MIN ANTES
 // ------------------------------------------------------------
 cron.schedule('* * * * *', async () => {
   if (!db) return;
@@ -1233,7 +1230,6 @@ cron.schedule('* * * * *', async () => {
         `${typeEmoji} ${typeLabel} · ${fullStr}\n` +
         `🔔 Aviso enviado: ${nowLocalStr}`;
 
-      // 📅 1 DÍA ANTES
       if (!event.notified1Day && diffHours <= 25 && diffHours > 23) {
         console.log(`📅 1 DÍA ANTES: ${event.title} → ${recipientEmail} (offset ${offsetMin}min)`);
         await sendPushNotification(recipientEmail, {
@@ -1256,7 +1252,6 @@ cron.schedule('* * * * *', async () => {
         await doc.ref.update({ notified1Day: true });
       }
 
-      // ⏰ 1 HORA ANTES
       if (!event.notified1Hour && diffMs <= 65 * 60 * 1000 && diffMs > 55 * 60 * 1000) {
         console.log(`⏰ 1 HORA ANTES: ${event.title} → ${recipientEmail} (offset ${offsetMin}min)`);
         await sendPushNotification(recipientEmail, {
@@ -1279,7 +1274,6 @@ cron.schedule('* * * * *', async () => {
         await doc.ref.update({ notified1Hour: true });
       }
 
-      // ⏰ 15 MIN ANTES
       if (!event.notifiedEvent && diffMs <= 15 * 60 * 1000 && diffMs > 0) {
         console.log(`⏰ 15 MIN ANTES: ${event.title} → ${recipientEmail} (offset ${offsetMin}min)`);
         await sendPushNotification(recipientEmail, {
@@ -3194,7 +3188,7 @@ h1{color:#c62828;font-size:20px;margin:0 0 8px;}p{color:#666;font-size:14px;marg
 });
 
 // ------------------------------------------------------------
-//  🔥 IA — GEMINI 1.5 FLASH
+//  🔥 IA — GEMINI 2.0 FLASH (modelo actualizado)
 // ------------------------------------------------------------
 let geminiModel = null;
 try {
@@ -3203,7 +3197,7 @@ try {
   if (geminiKey) {
     const genAI = new GoogleGenerativeAI(geminiKey);
     geminiModel = genAI.getGenerativeModel({
-      model: 'gemini-1.5-flash',
+      model: 'gemini-2.0-flash',
       systemInstruction: `Eres RSMail AI, el asistente inteligente integrado en la aplicación RSMail.
 
 RSMail es una app de correo electrónico y productividad empresarial con estas funciones:
@@ -3231,7 +3225,7 @@ Tu trabajo:
         maxOutputTokens: 1024,
       },
     });
-    console.log('✅ Gemini 1.5 Flash inicializado');
+    console.log('✅ Gemini 2.0 Flash inicializado');
   } else {
     console.log('⚠️ GEMINI_API_KEY no configurada → IA deshabilitada');
   }
@@ -3270,7 +3264,7 @@ app.post('/api/ai/chat', async (req, res) => {
     res.json({
       success: true,
       reply: text,
-      model: 'gemini-1.5-flash',
+      model: 'gemini-2.0-flash',
     });
   } catch (e) {
     console.error('❌ Error en /api/ai/chat:', e.message);

@@ -39,7 +39,6 @@ let storageBucket = null;
 try {
   let adminVersion = 'desconocida';
   try { adminVersion = require('firebase-admin/package.json').version; } catch (_) {}
-  console.log('🔧 firebase-admin versión:', adminVersion);
 
   const hasApps = admin && Array.isArray(admin.apps) && admin.apps.length > 0;
 
@@ -746,8 +745,6 @@ async function applyRulesToMessage({ accountEmail, accountPassword, accountHost,
 // ------------------------------------------------------------
 //  🔥 IA — Detección de urgencia (FASE 2)
 // ------------------------------------------------------------
-
-/** Umbrales según nivel de sensibilidad configurado por el usuario. */
 function urgencyThresholdForLevel(level) {
   switch (level) {
     case 'low': return 85;
@@ -757,10 +754,6 @@ function urgencyThresholdForLevel(level) {
   }
 }
 
-/**
- * Llama a Groq para saber si un correo es urgente.
- * Devuelve { score: 0-100, reason: '...' } o lanza.
- */
 async function detectUrgencyWithGroq({ from, subject, preview, level }) {
   const groqKey = process.env.GROQ_API_KEY;
   if (!groqKey) throw new Error('GROQ_API_KEY no configurada');
@@ -783,14 +776,7 @@ Interpretación del score:
 - 85-100: urgencia extrema (plazo hoy, emergencia, cancelación importante)
 - 70-84: urgente (requiere acción hoy o mañana)
 - 50-69: importante pero no urgente
-- 0-49: no urgente (newsletters, notificaciones rutinarias, publicidad)
-
-Analiza con criterio:
-- Los correos de personas reales > correos automáticos
-- Palabras como "urgente", "hoy", "mañana", "plazo", "vence", "importante" suben el score
-- Palabras como "newsletter", "promoción", "no-reply", "suscripción" bajan el score
-- Correos de remitentes no-reply o marketing raramente son urgentes
-- Correos de jefes, clientes o con asunto personal pueden ser urgentes`;
+- 0-49: no urgente (newsletters, notificaciones rutinarias, publicidad)`;
 
   const messages = [
     { role: 'system', content: 'Eres un clasificador de urgencia de correos. Devuelves SOLO JSON válido, sin markdown ni texto extra.' },
@@ -836,10 +822,6 @@ Analiza con criterio:
   throw lastError || new Error('Todos los modelos fallaron');
 }
 
-/**
- * Evalúa urgencia, guarda en Firestore y (si supera umbral) marca con \Flagged
- * y envía push prioritario.
- */
 async function checkUrgencyAndNotify({
   email, password, host, uid, from, subject, preview, folder = 'INBOX',
 }) {
@@ -866,7 +848,6 @@ async function checkUrgencyAndNotify({
 
   console.log(`🔥 [AI-Urgency] UID ${uid}: score=${result.score} (${prefs.urgencyLevel}, umbral ${threshold}) → ${isUrgent ? 'URGENTE' : 'normal'}`);
 
-  // Guardar en Firestore (incluso si no es urgente, guardamos score bajo para debug)
   try {
     await db
       .collection('email_urgency')
@@ -889,7 +870,6 @@ async function checkUrgencyAndNotify({
 
   if (!isUrgent) return;
 
-  // Marcar \Flagged
   try {
     const conn = await connectImapAuto(email, password, host);
     const client = conn.client;
@@ -903,7 +883,6 @@ async function checkUrgencyAndNotify({
     console.log(`⚠️ No se pudo marcar \\Flagged: ${e.message}`);
   }
 
-  // Push prioritario (título distinto)
   try {
     await sendPushNotification(email, {
       title: `🔥 URGENTE · ${subject || '(Sin asunto)'}`,
@@ -925,42 +904,129 @@ async function checkUrgencyAndNotify({
   }
 }
 
-app.post('/api/ai/detect-urgency', async (req, res) => {
-  if (!groqEnabled) {
-    return res.status(503).json({ success: false, error: 'ai_unavailable' });
-  }
-  try {
-    const { email, from, subject, preview, level } = req.body || {};
-    if (!email) return res.status(400).json({ success: false, error: 'email_required' });
+// ------------------------------------------------------------
+//  🔥 IA — Clasificación automática (FASE 3)
+// ------------------------------------------------------------
+async function classifyEmailWithGroq({ from, subject, preview, categories }) {
+  const groqKey = process.env.GROQ_API_KEY;
+  if (!groqKey) throw new Error('GROQ_API_KEY no configurada');
 
-    const prefs = await getAiPreferences(email);
-    if (!prefs.detectUrgency && !req.body.force) {
-      return res.status(403).json({
-        success: false,
-        error: 'urgency_disabled',
-        message: 'Activa "Detección de urgencia" en Mi Perfil → Asistente IA.',
+  const catsList = (categories || []).filter((c) => c && c.length > 0);
+  if (catsList.length === 0) throw new Error('Sin categorías configuradas');
+
+  const prompt = `Clasifica este correo en UNA de estas categorías: ${JSON.stringify(catsList)}
+
+Remitente: ${from || '(desconocido)'}
+Asunto: ${subject || '(sin asunto)'}
+Vista previa: ${(preview || '').substring(0, 300)}
+
+Reglas de decisión:
+- "personal": correos de amigos, familia, conocidos personales
+- "trabajo": correos profesionales, de compañeros, clientes, jefes
+- "facturas": facturas, recibos, pagos, bancos, seguros, contratos
+- "publicidad": newsletters comerciales, promociones, ofertas, marketing
+- "notificaciones": avisos automáticos de plataformas (envíos, redes sociales, apps)
+- "social": redes sociales, foros, comunidades
+- "otro": lo que no encaje en ninguna
+
+Si el asunto menciona factura/recibo/pago/importe → "facturas"
+Si el remitente incluye noreply/newsletter/marketing → "publicidad" o "notificaciones"
+Si el dominio es de redes sociales → "social"
+
+Devuelve SOLO un JSON con esta forma exacta:
+{ "category": "<una de las categorías>", "confidence": <número 0-1>, "reason": "<frase muy corta en español, máx 50 caracteres>" }`;
+
+  const messages = [
+    { role: 'system', content: 'Eres un clasificador de correos. Devuelves SOLO JSON válido, sin markdown ni texto extra.' },
+    { role: 'user', content: prompt },
+  ];
+
+  let lastError = null;
+  for (const model of GROQ_MODELS_FALLBACK) {
+    try {
+      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${groqKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature: 0.1,
+          max_tokens: 200,
+          response_format: { type: 'json_object' },
+        }),
       });
-    }
 
-    const result = await detectUrgencyWithGroq({
-      from: from || '',
-      subject: subject || '',
-      preview: preview || '',
-      level: level || prefs.urgencyLevel,
-    });
-    const threshold = urgencyThresholdForLevel(level || prefs.urgencyLevel);
-    res.json({
-      success: true,
-      score: result.score,
-      reason: result.reason,
-      isUrgent: result.score >= threshold,
-      threshold,
-      level: level || prefs.urgencyLevel,
+      if (!res.ok) {
+        lastError = new Error(`Groq ${res.status} (${model})`);
+        if (res.status === 404 || res.status === 400) continue;
+        if (res.status === 429) throw lastError;
+        continue;
+      }
+
+      const data = await res.json();
+      const raw = data?.choices?.[0]?.message?.content || '{}';
+      const parsed = JSON.parse(raw);
+
+      let category = String(parsed.category || 'otro').toLowerCase();
+      if (!catsList.includes(category)) category = 'otro';
+      const confidence = Math.max(0, Math.min(1, parseFloat(parsed.confidence) || 0));
+      const reason = String(parsed.reason || '').substring(0, 80);
+
+      return { category, confidence, reason, model };
+    } catch (e) {
+      lastError = e;
+      continue;
+    }
+  }
+  throw lastError || new Error('Todos los modelos fallaron');
+}
+
+async function checkAndClassifyEmail({
+  email, uid, from, subject, preview, folder = 'INBOX',
+}) {
+  if (!db) return;
+
+  let prefs;
+  try { prefs = await getAiPreferences(email); }
+  catch (_) { return; }
+  if (!prefs.autoClassify) return;
+  if (!Array.isArray(prefs.categories) || prefs.categories.length === 0) return;
+
+  let result;
+  try {
+    result = await classifyEmailWithGroq({
+      from, subject, preview,
+      categories: prefs.categories,
     });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    console.log(`⚠️ [AI-Classify] Fallo clasificando UID ${uid}: ${e.message}`);
+    return;
   }
-});
+
+  console.log(`🏷️ [AI-Classify] UID ${uid}: ${result.category} (${(result.confidence * 100).toFixed(0)}%) — ${result.reason}`);
+
+  try {
+    await db
+      .collection('email_classifications')
+      .doc(email)
+      .collection('messages')
+      .doc(String(uid))
+      .set({
+        category: result.category,
+        confidence: result.confidence,
+        reason: result.reason,
+        folder,
+        subject: subject || '',
+        from: from || '',
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+  } catch (e) {
+    console.log(`⚠️ No se pudo guardar clasificación en Firestore: ${e.message}`);
+  }
+}
 
 // ------------------------------------------------------------
 //  TRADUCCIÓN AUTOMÁTICA
@@ -1290,7 +1356,7 @@ async function processEmailsInRange(state, startUid, endUidNext) {
           },
         }, { dataOnly: true });
 
-        // 🔥 NUEVO: detección de urgencia (si el usuario la tiene activada)
+        // 🔥 Detección de urgencia
         try {
           await checkUrgencyAndNotify({
             email: state.email,
@@ -1299,11 +1365,25 @@ async function processEmailsInRange(state, startUid, endUidNext) {
             uid: msg.uid,
             from,
             subject,
-            preview: subject, // sin preview real; la IA usará solo from+subject
+            preview: subject,
             folder: 'INBOX',
           });
         } catch (e) {
           console.log(`⚠️ Error en detección de urgencia: ${e.message}`);
+        }
+
+        // 🏷️ Clasificación automática
+        try {
+          await checkAndClassifyEmail({
+            email: state.email,
+            uid: msg.uid,
+            from,
+            subject,
+            preview: subject,
+            folder: 'INBOX',
+          });
+        } catch (e) {
+          console.log(`⚠️ Error en clasificación automática: ${e.message}`);
         }
 
         // Auto-reply de ausencia
@@ -1589,7 +1669,6 @@ function buildWeeklyReportHtml({ recipientEmail, recipientName, weekStart, weekE
 
     const esc = (s) => String(s)
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-    const escNl = (s) => esc(s).replace(/\n/g, '<br>');
 
     return `<table width="100%" style="margin-bottom:14px;background:#fff;border-radius:14px;border:1px solid #E0E7EF;overflow:hidden;">
       <tr><td style="width:6px;background:${typeColor};"></td>
@@ -2316,7 +2395,7 @@ app.post('/api/messages', async (req, res) => {
     } finally { lock.release(); }
     await client.logout();
 
-    // 🔥 NUEVO: enriquecer con urgencia desde Firestore (si la hay)
+    // Enriquecer con urgencia desde Firestore
     if (db) {
       try {
         const urgencyCol = db.collection('email_urgency').doc(email).collection('messages');
@@ -2330,6 +2409,28 @@ app.post('/api/messages', async (req, res) => {
               m['urgentReason'] = d.reason || '';
             }
           } catch (_) {}
+        }
+      } catch (_) {}
+    }
+
+    // Enriquecer con clasificación desde Firestore
+    if (db) {
+      try {
+        const classCol = db.collection('email_classifications').doc(email).collection('messages');
+        for (const m of messages) {
+          try {
+            const doc = await classCol.doc(String(m.uid)).get();
+            if (doc.exists) {
+              const d = doc.data();
+              m['category'] = d.category || null;
+              m['categoryConfidence'] = d.confidence || 0;
+              m['categoryReason'] = d.reason || '';
+            } else {
+              m['category'] = null;
+            }
+          } catch (_) {
+            m['category'] = null;
+          }
         }
       } catch (_) {}
     }
@@ -2364,7 +2465,7 @@ app.post('/api/message-detail', async (req, res) => {
       content: att.content ? att.content.toString('base64') : '',
     }));
 
-    // 🔥 NUEVO: leer urgencia
+    // Leer urgencia
     let urgency = null;
     if (db) {
       try {
@@ -2381,6 +2482,22 @@ app.post('/api/message-detail', async (req, res) => {
       } catch (_) {}
     }
 
+    // Leer clasificación
+    let classification = null;
+    if (db) {
+      try {
+        const doc = await db.collection('email_classifications').doc(email).collection('messages').doc(String(uid)).get();
+        if (doc.exists) {
+          const d = doc.data();
+          classification = {
+            category: d.category || 'otro',
+            confidence: d.confidence || 0,
+            reason: d.reason || '',
+          };
+        }
+      } catch (_) {}
+    }
+
     res.json({
       success: true,
       message: {
@@ -2392,7 +2509,8 @@ app.post('/api/message-detail', async (req, res) => {
         text: parsed.text || '',
         html: parsed.html || parsed.textAsHtml || parsed.text || '',
         attachments,
-        urgency, // 🔥 nuevo
+        urgency,
+        classification,
       },
     });
   } catch (err) {
@@ -2402,7 +2520,7 @@ app.post('/api/message-detail', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  MOVER / CREAR / BORRAR CARPETA, DELETE MESSAGE, READ, FLAG
+//  MOVER / CREAR / BORRAR CARPETA, DELETE, READ, FLAG
 // ------------------------------------------------------------
 app.post('/api/move-message', async (req, res) => {
   const { email, password, host, port, uid, fromFolder, toFolder } = req.body;
@@ -3150,6 +3268,105 @@ app.get('/api/ai/preferences/:email', async (req, res) => {
     const email = decodeURIComponent(req.params.email);
     const prefs = await getAiPreferences(email);
     res.json({ success: true, preferences: prefs });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ------------------------------------------------------------
+//  🔥 IA — Detección de urgencia (endpoint manual)
+// ------------------------------------------------------------
+app.post('/api/ai/detect-urgency', async (req, res) => {
+  if (!groqEnabled) {
+    return res.status(503).json({ success: false, error: 'ai_unavailable' });
+  }
+  try {
+    const { email, from, subject, preview, level } = req.body || {};
+    if (!email) return res.status(400).json({ success: false, error: 'email_required' });
+
+    const prefs = await getAiPreferences(email);
+    if (!prefs.detectUrgency && !req.body.force) {
+      return res.status(403).json({
+        success: false,
+        error: 'urgency_disabled',
+        message: 'Activa "Detección de urgencia" en Mi Perfil → Asistente IA.',
+      });
+    }
+
+    const result = await detectUrgencyWithGroq({
+      from: from || '',
+      subject: subject || '',
+      preview: preview || '',
+      level: level || prefs.urgencyLevel,
+    });
+    const threshold = urgencyThresholdForLevel(level || prefs.urgencyLevel);
+    res.json({
+      success: true,
+      score: result.score,
+      reason: result.reason,
+      isUrgent: result.score >= threshold,
+      threshold,
+      level: level || prefs.urgencyLevel,
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ------------------------------------------------------------
+//  🏷️ IA — Clasificación: endpoints
+// ------------------------------------------------------------
+app.post('/api/ai/classify', async (req, res) => {
+  if (!groqEnabled) return res.status(503).json({ success: false, error: 'ai_unavailable' });
+  try {
+    const { email, from, subject, preview, categories } = req.body || {};
+    if (!email) return res.status(400).json({ success: false, error: 'email_required' });
+
+    const prefs = await getAiPreferences(email);
+    const cats = Array.isArray(categories) && categories.length > 0
+      ? categories
+      : prefs.categories;
+
+    const result = await classifyEmailWithGroq({
+      from: from || '',
+      subject: subject || '',
+      preview: preview || '',
+      categories: cats,
+    });
+
+    res.json({
+      success: true,
+      category: result.category,
+      confidence: result.confidence,
+      reason: result.reason,
+      categoriesUsed: cats,
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get('/api/ai/classify/:email/:uid', async (req, res) => {
+  if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
+  try {
+    const email = decodeURIComponent(req.params.email);
+    const uid = req.params.uid;
+    const doc = await db
+      .collection('email_classifications')
+      .doc(email)
+      .collection('messages')
+      .doc(String(uid))
+      .get();
+    if (!doc.exists) return res.json({ success: true, classification: null });
+    const d = doc.data();
+    res.json({
+      success: true,
+      classification: {
+        category: d.category,
+        confidence: d.confidence || 0,
+        reason: d.reason || '',
+      },
+    });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }

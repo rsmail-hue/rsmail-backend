@@ -408,6 +408,75 @@ async function sendViaBrevo({ fromEmail, fromName, to, subject, html }) {
 }
 
 // ------------------------------------------------------------
+//  HELPERS DE TIMEZONE
+// ------------------------------------------------------------
+// Devuelve el offset (minutos) guardado para el destinatario, o 0 si no hay.
+async function getUserTimezoneOffset(email) {
+  if (!db || !email) return 0;
+  try {
+    const snap = await db.collection('fcm_tokens').where('email', '==', email).limit(1).get();
+    if (snap.empty) return 0;
+    const off = snap.docs[0].data().timezoneOffset;
+    if (typeof off === 'number' && !isNaN(off)) return off;
+    return 0;
+  } catch (_) { return 0; }
+}
+
+// Formatea una fecha UTC aplicándole el offset local del usuario.
+// Devuelve { dayStr, timeStr, fullStr }.
+function formatEventLocal(eventDate, offsetMinutes, referenceNow = new Date()) {
+  const off = Number(offsetMinutes) || 0;
+  // Aplicamos el offset al timestamp UTC para "simular" hora local
+  const evLocal = new Date(eventDate.getTime() + off * 60 * 1000);
+  const nowLocal = new Date(referenceNow.getTime() + off * 60 * 1000);
+
+  const evY = evLocal.getUTCFullYear();
+  const evM = evLocal.getUTCMonth();
+  const evD = evLocal.getUTCDate();
+  const evH = evLocal.getUTCHours();
+  const evMin = evLocal.getUTCMinutes();
+
+  const todayUtc = Date.UTC(
+    nowLocal.getUTCFullYear(),
+    nowLocal.getUTCMonth(),
+    nowLocal.getUTCDate()
+  );
+  const evDayUtc = Date.UTC(evY, evM, evD);
+  const diffDays = Math.round((evDayUtc - todayUtc) / (1000 * 60 * 60 * 24));
+
+  const timeStr = `${String(evH).padStart(2, '0')}:${String(evMin).padStart(2, '0')}`;
+  const dd = String(evD).padStart(2, '0');
+  const mo = String(evM + 1).padStart(2, '0');
+
+  let dayStr;
+  if (diffDays === 0) dayStr = 'Hoy';
+  else if (diffDays === 1) dayStr = 'Mañana';
+  else if (diffDays === -1) dayStr = 'Ayer';
+  else if (diffDays > 1 && diffDays < 7) {
+    const days = ['dom', 'lun', 'mar', 'mié', 'jue', 'vie', 'sáb'];
+    const idx = new Date(evDayUtc).getUTCDay();
+    dayStr = days[idx];
+  } else {
+    dayStr = `${dd}/${mo}`;
+  }
+
+  const fullStr = `${dayStr} ${dd}/${mo} a las ${timeStr}`;
+  return { dayStr, timeStr, fullStr };
+}
+
+// Formatea la hora local del usuario "ahora" (útil para saber cuándo se le
+// está notificando, en su huso).
+function formatNowLocal(offsetMinutes, referenceNow = new Date()) {
+  const off = Number(offsetMinutes) || 0;
+  const local = new Date(referenceNow.getTime() + off * 60 * 1000);
+  const h = String(local.getUTCHours()).padStart(2, '0');
+  const m = String(local.getUTCMinutes()).padStart(2, '0');
+  const d = String(local.getUTCDate()).padStart(2, '0');
+  const mo = String(local.getUTCMonth() + 1).padStart(2, '0');
+  return `${d}/${mo} ${h}:${m}`;
+}
+
+// ------------------------------------------------------------
 //  AUSENCIAS / VACACIONES
 // ------------------------------------------------------------
 async function getActiveAbsencePeriod(accountEmail) {
@@ -1118,76 +1187,132 @@ async function runImapLoop(state) {
 }
 
 // ------------------------------------------------------------
-//  CRON: CALENDARIO (data-only) + 1 DÍA + 1 HORA + 15 MIN
+//  CRON: CALENDARIO (data-only)
+//  - 1 DÍA ANTES
+//  - 1 HORA ANTES
+//  - 15 MIN ANTES
+//  Hora/fecha del evento formateada en la zona LOCAL del destinatario
+//  (offset enviado por el móvil vía /api/fcm-token).
 // ------------------------------------------------------------
 cron.schedule('* * * * *', async () => {
   if (!db) return;
   try {
     const now = new Date();
     const snapshot = await db.collection('calendar_events').get();
+
+    // Cache de offsets por email en esta ejecución (evita hits repetidos)
+    const offsetCache = new Map();
+    const getOffset = async (email) => {
+      const key = (email || '').toLowerCase();
+      if (!key) return 0;
+      if (offsetCache.has(key)) return offsetCache.get(key);
+      const off = await getUserTimezoneOffset(key);
+      offsetCache.set(key, off);
+      return off;
+    };
+
     for (const doc of snapshot.docs) {
       const event = doc.data();
       const rawTime = event.eventTime;
       const eventDate = rawTime?.toDate ? rawTime.toDate() : new Date(rawTime);
       if (isNaN(eventDate.getTime())) continue;
+
       const diffMs = eventDate.getTime() - now.getTime();
       const diffHours = diffMs / (1000 * 60 * 60);
-      const formattedTime = eventDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      const recipientEmail = event.email || (Array.isArray(event.sharedEmails) && event.sharedEmails.length > 0 ? event.sharedEmails[0] : null);
+
+      const recipientEmail = event.email
+        || (Array.isArray(event.sharedEmails) && event.sharedEmails.length > 0
+          ? event.sharedEmails[0] : null);
       if (!recipientEmail) continue;
 
-      // 📅 Recordatorio 1 DÍA ANTES
+      const offsetMin = await getOffset(recipientEmail);
+
+      // 🔥 Fecha/hora del evento en la zona local del destinatario
+      const { dayStr, timeStr, fullStr } =
+        formatEventLocal(eventDate, offsetMin, now);
+
+      // 🔥 Etiqueta del tipo de evento
+      const type = (event.type || 'cita').toLowerCase();
+      let typeLabel, typeEmoji;
+      if (type === 'cita') { typeLabel = 'Cita'; typeEmoji = '📅'; }
+      else if (type === 'tarea') { typeLabel = 'Tarea'; typeEmoji = '✅'; }
+      else if (type === 'alarma') { typeLabel = 'Alarma'; typeEmoji = '⏰'; }
+      else { typeLabel = 'Evento'; typeEmoji = '📌'; }
+
+      // 🔥 Línea de información que va debajo del título
+      //    Ej: "📅 Cita · Hoy 28/09 a las 13:15"
+      const infoLine = `${typeEmoji} ${typeLabel} · ${fullStr}`;
+
+      // ─────────────────────────────────────────
+      //  📅 1 DÍA ANTES
+      // ─────────────────────────────────────────
       if (!event.notified1Day && diffHours <= 25 && diffHours > 23) {
-        console.log(`📅 Recordatorio 1 DÍA ANTES: ${event.title} → ${recipientEmail}`);
+        console.log(`📅 1 DÍA ANTES: ${event.title} → ${recipientEmail} (offset ${offsetMin}min)`);
         await sendPushNotification(recipientEmail, {
           title: `📅 Mañana: ${event.title}`,
-          body: `Tienes este evento programado para mañana a las ${formattedTime}`,
+          body: infoLine,
           data: {
             type: 'calendar_event',
             eventId: doc.id,
             eventTitle: event.title,
             eventTime: eventDate.toISOString(),
-            eventDate: formattedTime,
+            eventDate: fullStr,
+            eventDayShort: dayStr,
+            eventTimeShort: timeStr,
+            eventType: type,
+            eventTypeLabel: typeLabel,
             notice: '1day',
-            text: `Tienes este evento programado para mañana a las ${formattedTime}`,
+            text: infoLine,
           },
         }, { dataOnly: true });
         await doc.ref.update({ notified1Day: true });
       }
 
-      // ⏰ Recordatorio 1 HORA ANTES
+      // ─────────────────────────────────────────
+      //  ⏰ 1 HORA ANTES
+      // ─────────────────────────────────────────
       if (!event.notified1Hour && diffMs <= 65 * 60 * 1000 && diffMs > 55 * 60 * 1000) {
-        console.log(`⏰ Recordatorio 1 HORA ANTES: ${event.title} → ${recipientEmail}`);
+        console.log(`⏰ 1 HORA ANTES: ${event.title} → ${recipientEmail} (offset ${offsetMin}min)`);
         await sendPushNotification(recipientEmail, {
           title: `⏰ En 1 hora: ${event.title}`,
-          body: event.description || `El evento comienza a las ${formattedTime}`,
+          body: infoLine,
           data: {
             type: 'calendar_event',
             eventId: doc.id,
             eventTitle: event.title,
             eventTime: eventDate.toISOString(),
-            eventDate: formattedTime,
+            eventDate: fullStr,
+            eventDayShort: dayStr,
+            eventTimeShort: timeStr,
+            eventType: type,
+            eventTypeLabel: typeLabel,
             notice: '1hour',
-            text: `En 1 hora: ${event.title}. Comienza a las ${formattedTime}`,
+            text: infoLine,
           },
         }, { dataOnly: true });
         await doc.ref.update({ notified1Hour: true });
       }
 
-      // ⏰ Recordatorio 15 MIN ANTES
+      // ─────────────────────────────────────────
+      //  ⏰ 15 MIN ANTES
+      // ─────────────────────────────────────────
       if (!event.notifiedEvent && diffMs <= 15 * 60 * 1000 && diffMs > 0) {
-        console.log(`⏰ Recordatorio 15 MIN ANTES: ${event.title} → ${recipientEmail}`);
+        console.log(`⏰ 15 MIN ANTES: ${event.title} → ${recipientEmail} (offset ${offsetMin}min)`);
         await sendPushNotification(recipientEmail, {
           title: `⏰ Comienza pronto: ${event.title}`,
-          body: event.description || `El evento comienza a las ${formattedTime}`,
+          body: infoLine,
           data: {
             type: 'calendar_event',
             eventId: doc.id,
             eventTitle: event.title,
             eventTime: eventDate.toISOString(),
-            eventDate: formattedTime,
+            eventDate: fullStr,
+            eventDayShort: dayStr,
+            eventTimeShort: timeStr,
+            eventType: type,
+            eventTypeLabel: typeLabel,
             notice: '15min',
-            text: event.description || `El evento comienza a las ${formattedTime}`,
+            text: infoLine,
           },
         }, { dataOnly: true });
         await doc.ref.update({ notifiedEvent: true });
@@ -1204,14 +1329,12 @@ cron.schedule('0 8 * * 0', async () => {
   console.log('📧 [Weekly] Generando reporte semanal de eventos...');
 
   try {
-    // 1) Coger todas las cuentas activas
     const accountsSnap = await db.collection('user_accounts').get();
     if (accountsSnap.empty) {
       console.log('📧 [Weekly] Sin cuentas registradas');
       return;
     }
 
-    // 2) Calcular rango: próximo lunes 00:00 → domingo siguiente 23:59
     const now = new Date();
     const nextMonday = new Date(now);
     const daysUntilMonday = (8 - now.getDay()) % 7 || 7;
@@ -1234,21 +1357,18 @@ cron.schedule('0 8 * * 0', async () => {
       try {
         const emailLower = email.toLowerCase();
 
-        // Eventos como dueño
         const ownerSnap = await db.collection('calendar_events')
           .where('ownerEmail', '==', emailLower)
           .where('eventTime', '>=', admin.firestore.Timestamp.fromDate(nextMonday))
           .where('eventTime', '<=', admin.firestore.Timestamp.fromDate(nextSundayEnd))
           .get();
 
-        // Eventos como invitado
         const sharedSnap = await db.collection('calendar_events')
           .where('sharedEmails', 'arrayContains', email)
           .where('eventTime', '>=', admin.firestore.Timestamp.fromDate(nextMonday))
           .where('eventTime', '<=', admin.firestore.Timestamp.fromDate(nextSundayEnd))
           .get();
 
-        // Unir sin duplicados
         const seenIds = new Set();
         const events = [];
         for (const d of ownerSnap.docs) {
@@ -1264,31 +1384,30 @@ cron.schedule('0 8 * * 0', async () => {
           }
         }
 
-        // Si no hay eventos, NO enviar nada
         if (events.length === 0) {
           console.log(`📧 [Weekly] ${email}: sin eventos → no se envía`);
           continue;
         }
 
-        // Ordenar por fecha ascendente
         events.sort((a, b) => {
           const ta = a.eventTime?.toDate ? a.eventTime.toDate() : new Date(a.eventTime);
           const tb = b.eventTime?.toDate ? b.eventTime.toDate() : new Date(b.eventTime);
           return ta - tb;
         });
 
+        const userOffset = await getUserTimezoneOffset(emailLower);
+
         console.log(`📧 [Weekly] ${email}: ${events.length} evento(s) → enviando email`);
 
-        // Construir HTML
         const html = buildWeeklyReportHtml({
           recipientEmail: email,
           recipientName: (acc.email || '').split('@')[0],
           weekStart: nextMonday,
           weekEnd: nextSundayEnd,
           events,
+          offsetMinutes: userOffset,
         });
 
-        // Enviar vía Brevo
         try {
           await sendViaBrevo({
             fromEmail: 'hola@rsmail.app',
@@ -1318,15 +1437,21 @@ cron.schedule('0 8 * * 0', async () => {
 // ------------------------------------------------------------
 //  HELPER: HTML del reporte semanal
 // ------------------------------------------------------------
-function buildWeeklyReportHtml({ recipientEmail, recipientName, weekStart, weekEnd, events }) {
-  const fmtDate = (d) => d.toLocaleDateString('es-ES', {
-    weekday: 'long', day: 'numeric', month: 'long',
-    timeZone: 'Europe/Madrid',
-  });
-  const fmtTime = (d) => d.toLocaleTimeString('es-ES', {
-    hour: '2-digit', minute: '2-digit',
-    timeZone: 'Europe/Madrid',
-  });
+function buildWeeklyReportHtml({ recipientEmail, recipientName, weekStart, weekEnd, events, offsetMinutes }) {
+  const off = Number(offsetMinutes) || 0;
+  const fmtDate = (d) => {
+    const local = new Date(d.getTime() + off * 60 * 1000);
+    const days = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
+    const months = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
+      'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
+    return `${days[local.getUTCDay()]} ${local.getUTCDate()} de ${months[local.getUTCMonth()]}`;
+  };
+  const fmtTime = (d) => {
+    const local = new Date(d.getTime() + off * 60 * 1000);
+    const h = String(local.getUTCHours()).padStart(2, '0');
+    const m = String(local.getUTCMinutes()).padStart(2, '0');
+    return `${h}:${m}`;
+  };
 
   const rangeStr = `${fmtDate(weekStart)} → ${fmtDate(weekEnd)}`;
 
@@ -1996,17 +2121,24 @@ app.get('/api/debug/reminders', async (req, res) => {
 });
 
 app.post('/api/fcm-token', async (req, res) => {
-  const { email, token, password, imapHost } = req.body;
+  const { email, token, password, imapHost, timezoneOffset } = req.body;
   if (!email || !token) return res.status(400).json({ success: false, error: 'Email y token requeridos' });
   if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
   try {
     const existing = await db.collection('fcm_tokens').where('email', '==', email).get();
     existing.forEach(doc => doc.ref.delete());
+
+    const offset =
+      (typeof timezoneOffset === 'number' && !isNaN(timezoneOffset))
+        ? Math.max(-840, Math.min(840, Math.round(timezoneOffset))) // -14h..+14h
+        : 0;
+
     await db.collection('fcm_tokens').add({
       email, token,
+      timezoneOffset: offset,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
-    console.log(`📱 Token FCM actualizado en Firestore para ${email}`);
+    console.log(`📱 Token FCM actualizado en Firestore para ${email} (tz offset ${offset}min)`);
     if (password) {
       console.log(`🔧 fcm-token: iniciando worker para ${email}`);
       saveAccount(email, password, imapHost);
@@ -2315,7 +2447,7 @@ app.post('/api/message-detail', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  🔥 MOVER MENSAJE A CARPETA
+//  MOVER MENSAJE A CARPETA
 // ------------------------------------------------------------
 app.post('/api/move-message', async (req, res) => {
   const { email, password, host, port, uid, fromFolder, toFolder } = req.body;
@@ -2372,7 +2504,7 @@ app.post('/api/move-message', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  🔥 CREAR CARPETA
+//  CREAR CARPETA
 // ------------------------------------------------------------
 app.post('/api/create-folder', async (req, res) => {
   const { email, password, host, port, folderName } = req.body;
@@ -2409,7 +2541,7 @@ app.post('/api/create-folder', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  🔥 ELIMINAR CARPETA
+//  ELIMINAR CARPETA
 // ------------------------------------------------------------
 app.post('/api/delete-folder', async (req, res) => {
   const { email, password, host, port, folderName } = req.body;

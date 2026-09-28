@@ -2439,11 +2439,9 @@ app.post('/api/messages', async (req, res) => {
   try {
     const conn = await connectImapAuto(email, password, host);
     client = conn.client;
-    // readOnly ESTRICTO: ImapFlow no envía STORE \Seen en este modo.
     const lock = await client.getMailboxLock(folder, { readOnly: true });
     const messages = [];
     try {
-      // SOLO envelope + flags + bodyStructure. NI preview NI source NI text.
       const iter = client.fetch('1:*',
         { envelope: true, flags: true, bodyStructure: true },
         { max: limit, reverse: true });
@@ -3313,6 +3311,77 @@ EJEMPLO DE RESPUESTA CORRECTA (cuando preguntan cómo crear una regla para mover
 
 Sé conciso, claro y directo. Si no sabes algo, dilo claramente en vez de inventarlo.`;
 
+// ------------------------------------------------------------
+//  🔥 IA — Prompt del sistema para REGLAS con lenguaje natural
+// ------------------------------------------------------------
+const AI_RULE_SYSTEM_PROMPT = `Eres un asistente que convierte instrucciones en español a reglas de correo electrónico.
+Debes devolver SIEMPRE un JSON válido, sin markdown, sin texto extra, sin comentarios.
+
+FORMATO EXACTO:
+{
+  "name": "nombre corto descriptivo en español",
+  "enabled": true,
+  "matchAll": true,
+  "stopProcessing": false,
+  "conditions": [
+    { "field": "...", "operator": "...", "value": "..." }
+  ],
+  "actions": [
+    { "type": "...", "value": "..." }
+  ]
+}
+
+CAMPOS VÁLIDOS (field):
+- "from": remitente
+- "to": destinatario
+- "cc": en copia
+- "subject": asunto
+- "body": cuerpo del mensaje
+- "hasAttachment": tiene adjuntos (operator "isTrue" o "isFalse", SIN value)
+- "sizeKb": tamaño en KB (operator "greaterThan" o "lessThan", value numérico)
+
+OPERADORES VÁLIDOS:
+- Para texto: "contains", "notContains", "equals", "notEquals", "startsWith", "endsWith", "regex"
+- Solo para hasAttachment: "isTrue", "isFalse"
+- Solo para sizeKb: "greaterThan", "lessThan"
+
+ACCIONES VÁLIDAS (type):
+- "moveTo": mover a carpeta (REQUIERE value = nombre exacto de una carpeta disponible)
+- "markRead": marcar como leído (SIN value)
+- "markUnread": marcar como no leído (SIN value)
+- "star": marcar como importante (SIN value)
+- "unstar": quitar importante (SIN value)
+- "deleteMessage": mover a papelera (SIN value)
+- "markSpam": marcar como spam (SIN value)
+- "forward": reenviar a un email (REQUIERE value = dirección de email)
+
+REGLAS IMPORTANTES:
+1. Si el usuario dice "todas/todos/y" → "matchAll": true
+2. Si dice "alguno/algunos/o" → "matchAll": false
+3. "moveTo" SOLO puede usar nombres de la lista de CARPETAS DISPONIBLES.
+4. Máximo 3 condiciones y 3 acciones por regla.
+5. El "name" debe ser descriptivo y corto (max 40 caracteres).
+6. Para texto, usa minúsculas en "value" cuando aplique (ej: "factura", no "Factura") salvo nombres propios.
+7. Si el prompt NO describe una regla clara, devuelve: {"error": "No he entendido qué regla quieres crear"}
+
+EJEMPLOS:
+
+Prompt: "mueve todo lo de facturas a la carpeta Facturas"
+Respuesta:
+{"name":"Facturas a Facturas","enabled":true,"matchAll":true,"stopProcessing":false,"conditions":[{"field":"subject","operator":"contains","value":"factura"}],"actions":[{"type":"moveTo","value":"Facturas"}]}
+
+Prompt: "los correos de juan lopez márcalos como importantes y leídos"
+Respuesta:
+{"name":"Juan López importante","enabled":true,"matchAll":true,"stopProcessing":false,"conditions":[{"field":"from","operator":"contains","value":"juan lopez"}],"actions":[{"type":"star"},{"type":"markRead"}]}
+
+Prompt: "si viene de noreply o tiene newsletter en el asunto, borrar"
+Respuesta:
+{"name":"Borrar newsletters","enabled":true,"matchAll":false,"stopProcessing":true,"conditions":[{"field":"from","operator":"contains","value":"noreply"},{"field":"subject","operator":"contains","value":"newsletter"}],"actions":[{"type":"deleteMessage"}]}
+
+Prompt: "los correos con adjuntos que pesen más de 5 MB, avisarme reenviando a backup@miempresa.com"
+Respuesta:
+{"name":"Adjuntos grandes a backup","enabled":true,"matchAll":true,"stopProcessing":false,"conditions":[{"field":"hasAttachment","operator":"isTrue"},{"field":"sizeKb","operator":"greaterThan","value":"5000"}],"actions":[{"type":"forward","value":"backup@miempresa.com"}]}`;
+
 let groqEnabled = false;
 try {
   const groqKey = process.env.GROQ_API_KEY;
@@ -3370,7 +3439,6 @@ async function callGroqChat({ history, prompt }) {
       const data = await res.json();
       let reply = data?.choices?.[0]?.message?.content || '(Sin respuesta)';
 
-      // 🔥 Limpieza final: por si el modelo desobedece y mete markdown
       reply = reply.replace(/\*\*/g, '');
       reply = reply.replace(/^#+\s*/gm, '');
       reply = reply.replace(/`([^`]+)`/g, '$1');
@@ -3483,6 +3551,191 @@ app.get('/api/ai/preferences/:email', async (req, res) => {
     res.json({ success: true, preferences: prefs });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ------------------------------------------------------------
+//  🔥 IA — Reglas con lenguaje natural (FASE 1)
+//  POST /api/ai/rules/parse { email, prompt, folders[] }
+// ------------------------------------------------------------
+async function callGroqForRuleJson(prompt, folders) {
+  const groqKey = process.env.GROQ_API_KEY;
+  if (!groqKey) throw new Error('GROQ_API_KEY no configurada');
+
+  const foldersList = (folders || []).filter((f) => f && f !== 'INBOX');
+  const userMessage = `CARPETAS DISPONIBLES: ${JSON.stringify(foldersList)}
+
+PROMPT DEL USUARIO:
+"${prompt}"
+
+Devuelve SOLO el JSON de la regla (o {"error": "..."}).`;
+
+  const messages = [
+    { role: 'system', content: AI_RULE_SYSTEM_PROMPT },
+    { role: 'user', content: userMessage },
+  ];
+
+  let lastError = null;
+  for (const model of GROQ_MODELS_FALLBACK) {
+    try {
+      console.log(`🤖 [AI-Rules] Probando modelo: ${model}`);
+      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${groqKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature: 0.2,
+          max_tokens: 800,
+          response_format: { type: 'json_object' },
+        }),
+      });
+
+      if (!res.ok) {
+        const errBody = await res.text();
+        console.log(`⚠️ [AI-Rules] Modelo ${model} falló: ${res.status} ${errBody.substring(0, 120)}`);
+        lastError = new Error(`Groq ${res.status}`);
+        if (res.status === 404 || res.status === 400) continue;
+        if (res.status === 429) throw lastError;
+        continue;
+      }
+
+      const data = await res.json();
+      const raw = data?.choices?.[0]?.message?.content || '{}';
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (e) {
+        console.log(`⚠️ [AI-Rules] JSON inválido con ${model}: ${raw.substring(0, 200)}`);
+        lastError = new Error('JSON inválido');
+        continue;
+      }
+      console.log(`✅ [AI-Rules] Respuesta OK con ${model}`);
+      return parsed;
+    } catch (e) {
+      lastError = e;
+      console.log(`⚠️ [AI-Rules] Error con ${model}: ${e.message}`);
+      continue;
+    }
+  }
+  throw lastError || new Error('Todos los modelos fallaron');
+}
+
+function validateRuleShape(rule) {
+  if (!rule || typeof rule !== 'object') return 'not_object';
+  if (rule.error) return null;
+
+  const validFields = ['from', 'to', 'cc', 'subject', 'body', 'hasAttachment', 'sizeKb'];
+  const validOperators = [
+    'contains', 'notContains', 'equals', 'notEquals',
+    'startsWith', 'endsWith', 'regex',
+    'isTrue', 'isFalse', 'greaterThan', 'lessThan',
+  ];
+  const validActions = [
+    'moveTo', 'markRead', 'markUnread', 'star', 'unstar',
+    'deleteMessage', 'markSpam', 'forward',
+  ];
+
+  if (typeof rule.name !== 'string' || rule.name.trim().length === 0) return 'name';
+  if (!Array.isArray(rule.conditions) || rule.conditions.length === 0) return 'conditions';
+  if (!Array.isArray(rule.actions) || rule.actions.length === 0) return 'actions';
+
+  for (const c of rule.conditions) {
+    if (!c || !validFields.includes(c.field)) return 'condition_field';
+    if (!validOperators.includes(c.operator)) return 'condition_operator';
+    if (c.field !== 'hasAttachment' && (typeof c.value !== 'string' && typeof c.value !== 'number')) {
+      return 'condition_value';
+    }
+  }
+  for (const a of rule.actions) {
+    if (!a || !validActions.includes(a.type)) return 'action_type';
+    if ((a.type === 'moveTo' || a.type === 'forward') && (!a.value || String(a.value).trim().length === 0)) {
+      return 'action_value';
+    }
+  }
+  return null;
+}
+
+app.post('/api/ai/rules/parse', async (req, res) => {
+  if (!groqEnabled) {
+    return res.status(503).json({
+      success: false,
+      error: 'ai_unavailable',
+      message: 'IA no disponible en el servidor.',
+    });
+  }
+  try {
+    const { email, prompt, folders } = req.body || {};
+    if (!email || typeof email !== 'string') {
+      return res.status(400).json({ success: false, error: 'email_required' });
+    }
+    if (!prompt || typeof prompt !== 'string' || prompt.trim().length < 4) {
+      return res.status(400).json({ success: false, error: 'prompt_too_short' });
+    }
+    if (prompt.length > 500) {
+      return res.status(400).json({ success: false, error: 'prompt_too_long' });
+    }
+
+    // Comprobar preferencia del usuario
+    const prefs = await getAiPreferences(email);
+    if (!prefs.naturalLanguageRules) {
+      return res.status(403).json({
+        success: false,
+        error: 'nl_rules_disabled',
+        message: 'Activa primero "Reglas con lenguaje natural" en Mi Perfil → Asistente IA.',
+      });
+    }
+
+    console.log(`✨ [AI-Rules] Parseando para ${email}: "${prompt.substring(0, 80)}"`);
+
+    const parsed = await callGroqForRuleJson(prompt.trim(), folders || []);
+
+    if (parsed && parsed.error) {
+      return res.json({
+        success: false,
+        error: 'ai_parse_failed',
+        message: String(parsed.error),
+      });
+    }
+
+    const invalid = validateRuleShape(parsed);
+    if (invalid) {
+      console.log(`⚠️ [AI-Rules] Forma inválida: ${invalid}`);
+      return res.json({
+        success: false,
+        error: 'ai_invalid_rule',
+        message: 'La IA no ha generado una regla válida. Intenta reformular la frase.',
+      });
+    }
+
+    const rule = {
+      name: String(parsed.name).trim().substring(0, 60),
+      enabled: parsed.enabled !== false,
+      matchAll: parsed.matchAll !== false,
+      stopProcessing: parsed.stopProcessing === true,
+      conditions: parsed.conditions.slice(0, 3).map((c) => ({
+        field: c.field,
+        operator: c.operator,
+        value: c.field === 'hasAttachment' ? '' : String(c.value ?? ''),
+      })),
+      actions: parsed.actions.slice(0, 3).map((a) => ({
+        type: a.type,
+        value: a.value != null ? String(a.value) : '',
+      })),
+    };
+
+    res.json({ success: true, rule });
+  } catch (e) {
+    console.error('❌ Error en /api/ai/rules/parse:', e.message);
+    res.status(500).json({
+      success: false,
+      error: /429|rate limit/i.test(e.message)
+        ? 'El asistente está saturado. Inténtalo en unos segundos.'
+        : e.message,
+    });
   }
 });
 

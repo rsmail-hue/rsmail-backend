@@ -1118,7 +1118,7 @@ async function runImapLoop(state) {
 }
 
 // ------------------------------------------------------------
-//  CRON: CALENDARIO (data-only)
+//  CRON: CALENDARIO (data-only) + 1 DÍA + 1 HORA + 15 MIN
 // ------------------------------------------------------------
 cron.schedule('* * * * *', async () => {
   if (!db) return;
@@ -1136,6 +1136,7 @@ cron.schedule('* * * * *', async () => {
       const recipientEmail = event.email || (Array.isArray(event.sharedEmails) && event.sharedEmails.length > 0 ? event.sharedEmails[0] : null);
       if (!recipientEmail) continue;
 
+      // 📅 Recordatorio 1 DÍA ANTES
       if (!event.notified1Day && diffHours <= 25 && diffHours > 23) {
         console.log(`📅 Recordatorio 1 DÍA ANTES: ${event.title} → ${recipientEmail}`);
         await sendPushNotification(recipientEmail, {
@@ -1153,6 +1154,27 @@ cron.schedule('* * * * *', async () => {
         }, { dataOnly: true });
         await doc.ref.update({ notified1Day: true });
       }
+
+      // ⏰ Recordatorio 1 HORA ANTES
+      if (!event.notified1Hour && diffMs <= 65 * 60 * 1000 && diffMs > 55 * 60 * 1000) {
+        console.log(`⏰ Recordatorio 1 HORA ANTES: ${event.title} → ${recipientEmail}`);
+        await sendPushNotification(recipientEmail, {
+          title: `⏰ En 1 hora: ${event.title}`,
+          body: event.description || `El evento comienza a las ${formattedTime}`,
+          data: {
+            type: 'calendar_event',
+            eventId: doc.id,
+            eventTitle: event.title,
+            eventTime: eventDate.toISOString(),
+            eventDate: formattedTime,
+            notice: '1hour',
+            text: `En 1 hora: ${event.title}. Comienza a las ${formattedTime}`,
+          },
+        }, { dataOnly: true });
+        await doc.ref.update({ notified1Hour: true });
+      }
+
+      // ⏰ Recordatorio 15 MIN ANTES
       if (!event.notifiedEvent && diffMs <= 15 * 60 * 1000 && diffMs > 0) {
         console.log(`⏰ Recordatorio 15 MIN ANTES: ${event.title} → ${recipientEmail}`);
         await sendPushNotification(recipientEmail, {
@@ -1173,6 +1195,273 @@ cron.schedule('* * * * *', async () => {
     }
   } catch (e) { console.error('❌ Error en Cron Job:', e.message); }
 });
+
+// ------------------------------------------------------------
+//  CRON: EMAIL SEMANAL DOMINGO 8:00 (hora Madrid)
+// ------------------------------------------------------------
+cron.schedule('0 8 * * 0', async () => {
+  if (!db) return;
+  console.log('📧 [Weekly] Generando reporte semanal de eventos...');
+
+  try {
+    // 1) Coger todas las cuentas activas
+    const accountsSnap = await db.collection('user_accounts').get();
+    if (accountsSnap.empty) {
+      console.log('📧 [Weekly] Sin cuentas registradas');
+      return;
+    }
+
+    // 2) Calcular rango: próximo lunes 00:00 → domingo siguiente 23:59
+    const now = new Date();
+    const nextMonday = new Date(now);
+    const daysUntilMonday = (8 - now.getDay()) % 7 || 7;
+    nextMonday.setDate(now.getDate() + daysUntilMonday);
+    nextMonday.setHours(0, 0, 0, 0);
+
+    const nextSundayEnd = new Date(nextMonday);
+    nextSundayEnd.setDate(nextMonday.getDate() + 6);
+    nextSundayEnd.setHours(23, 59, 59, 999);
+
+    console.log(`📧 [Weekly] Rango: ${nextMonday.toISOString()} → ${nextSundayEnd.toISOString()}`);
+
+    let emailsSent = 0;
+
+    for (const accDoc of accountsSnap.docs) {
+      const acc = accDoc.data();
+      const email = acc.email;
+      if (!email) continue;
+
+      try {
+        const emailLower = email.toLowerCase();
+
+        // Eventos como dueño
+        const ownerSnap = await db.collection('calendar_events')
+          .where('ownerEmail', '==', emailLower)
+          .where('eventTime', '>=', admin.firestore.Timestamp.fromDate(nextMonday))
+          .where('eventTime', '<=', admin.firestore.Timestamp.fromDate(nextSundayEnd))
+          .get();
+
+        // Eventos como invitado
+        const sharedSnap = await db.collection('calendar_events')
+          .where('sharedEmails', 'arrayContains', email)
+          .where('eventTime', '>=', admin.firestore.Timestamp.fromDate(nextMonday))
+          .where('eventTime', '<=', admin.firestore.Timestamp.fromDate(nextSundayEnd))
+          .get();
+
+        // Unir sin duplicados
+        const seenIds = new Set();
+        const events = [];
+        for (const d of ownerSnap.docs) {
+          if (!seenIds.has(d.id)) {
+            seenIds.add(d.id);
+            events.push({ id: d.id, ...d.data() });
+          }
+        }
+        for (const d of sharedSnap.docs) {
+          if (!seenIds.has(d.id)) {
+            seenIds.add(d.id);
+            events.push({ id: d.id, ...d.data() });
+          }
+        }
+
+        // Si no hay eventos, NO enviar nada
+        if (events.length === 0) {
+          console.log(`📧 [Weekly] ${email}: sin eventos → no se envía`);
+          continue;
+        }
+
+        // Ordenar por fecha ascendente
+        events.sort((a, b) => {
+          const ta = a.eventTime?.toDate ? a.eventTime.toDate() : new Date(a.eventTime);
+          const tb = b.eventTime?.toDate ? b.eventTime.toDate() : new Date(b.eventTime);
+          return ta - tb;
+        });
+
+        console.log(`📧 [Weekly] ${email}: ${events.length} evento(s) → enviando email`);
+
+        // Construir HTML
+        const html = buildWeeklyReportHtml({
+          recipientEmail: email,
+          recipientName: (acc.email || '').split('@')[0],
+          weekStart: nextMonday,
+          weekEnd: nextSundayEnd,
+          events,
+        });
+
+        // Enviar vía Brevo
+        try {
+          await sendViaBrevo({
+            fromEmail: 'hola@rsmail.app',
+            fromName: 'RSMail · Calendario',
+            to: email,
+            subject: `📅 Tu semana en RSMail: ${events.length} evento${events.length === 1 ? '' : 's'}`,
+            html,
+          });
+          emailsSent++;
+          console.log(`   ✅ Enviado a ${email}`);
+        } catch (e) {
+          console.error(`   ❌ Fallo enviando a ${email}:`, e.message);
+        }
+      } catch (e) {
+        console.error(`⚠️ [Weekly] Error procesando ${email}:`, e.message);
+      }
+    }
+
+    console.log(`📧 [Weekly] Completado. Emails enviados: ${emailsSent}`);
+  } catch (e) {
+    console.error('❌ [Weekly] Error general:', e.message);
+  }
+}, {
+  timezone: 'Europe/Madrid',
+});
+
+// ------------------------------------------------------------
+//  HELPER: HTML del reporte semanal
+// ------------------------------------------------------------
+function buildWeeklyReportHtml({ recipientEmail, recipientName, weekStart, weekEnd, events }) {
+  const fmtDate = (d) => d.toLocaleDateString('es-ES', {
+    weekday: 'long', day: 'numeric', month: 'long',
+    timeZone: 'Europe/Madrid',
+  });
+  const fmtTime = (d) => d.toLocaleTimeString('es-ES', {
+    hour: '2-digit', minute: '2-digit',
+    timeZone: 'Europe/Madrid',
+  });
+
+  const rangeStr = `${fmtDate(weekStart)} → ${fmtDate(weekEnd)}`;
+
+  const cards = events.map((ev) => {
+    const raw = ev.eventTime || ev.startTime;
+    const dt = raw?.toDate ? raw.toDate() : new Date(raw);
+    const dayStr = fmtDate(dt);
+    const timeStr = fmtTime(dt);
+
+    const type = (ev.type || 'cita').toLowerCase();
+    let typeLabel = 'Evento', typeColor = '#1A73E8', typeEmoji = '📌';
+    if (type === 'cita') { typeLabel = 'Cita'; typeColor = '#1A73E8'; typeEmoji = '📅'; }
+    else if (type === 'tarea') { typeLabel = 'Tarea'; typeColor = '#FB8C00'; typeEmoji = '✅'; }
+    else if (type === 'alarma') { typeLabel = 'Alarma'; typeColor = '#E53935'; typeEmoji = '⏰'; }
+
+    const isUrgent = ev.urgent === true;
+    const isCompleted = ev.completed === true;
+    const desc = (ev.description || '').trim();
+    const location = (ev.location || '').trim();
+
+    const esc = (s) => String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+    const escNl = (s) => esc(s).replace(/\n/g, '<br>');
+
+    return `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+           style="margin-bottom:14px;background:#ffffff;border-radius:14px;border:1px solid #E0E7EF;overflow:hidden;">
+      <tr>
+        <td style="width:6px;background:${typeColor};"></td>
+        <td style="padding:16px 18px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+            <tr>
+              <td style="vertical-align:top;">
+                <div style="font-size:17px;font-weight:700;color:#111;margin-bottom:6px;line-height:1.3;
+                            ${isCompleted ? 'text-decoration:line-through;color:#888;' : ''}">
+                  ${esc(ev.title || 'Evento')}
+                  ${isUrgent ? '<span style="display:inline-block;background:#FDECEA;color:#C62828;font-size:10px;font-weight:700;padding:3px 8px;border-radius:6px;margin-left:8px;vertical-align:middle;">URGENTE</span>' : ''}
+                </div>
+                <div style="font-size:13px;color:#5A6B7B;line-height:1.7;">
+                  <span style="display:inline-block;min-width:18px;">🗓</span>
+                  <b style="color:#1A73E8;">${esc(dayStr)}</b>
+                  &nbsp;·&nbsp;
+                  <b style="color:#1A73E8;">${esc(timeStr)}</b>
+                </div>
+                <div style="font-size:13px;color:#5A6B7B;line-height:1.7;">
+                  <span style="display:inline-block;min-width:18px;">${typeEmoji}</span>
+                  ${typeLabel}
+                  ${location ? `&nbsp;·&nbsp;📍 ${esc(location)}` : ''}
+                </div>
+                ${desc ? `
+                <div style="margin-top:10px;padding:10px 12px;background:#F7F9FC;border-radius:8px;
+                            font-size:12.5px;color:#3A4A5B;line-height:1.5;">
+                  ${escNl(desc)}
+                </div>` : ''}
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>`;
+  }).join('');
+
+  return `<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tu semana en RSMail</title>
+</head>
+<body style="margin:0;padding:0;background:#EEF3F8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#EEF3F8;padding:24px 12px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0"
+               style="max-width:600px;width:100%;">
+
+          <tr>
+            <td style="background:linear-gradient(135deg,#1A73E8 0%,#0D47A1 100%);
+                       padding:28px 24px;border-radius:18px 18px 0 0;text-align:center;">
+              <div style="font-size:40px;line-height:1;margin-bottom:10px;">📅</div>
+              <div style="font-size:22px;font-weight:700;color:#ffffff;letter-spacing:0.3px;">
+                Tu semana en RSMail
+              </div>
+              <div style="font-size:13px;color:#B3D4FC;margin-top:6px;">
+                ${rangeStr}
+              </div>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="background:#ffffff;padding:22px 24px 8px 24px;">
+              <div style="font-size:15px;color:#1A2A3A;line-height:1.6;">
+                Hola <b>${recipientName || 'usuario'}</b>,
+              </div>
+              <div style="font-size:14px;color:#5A6B7B;line-height:1.6;margin-top:6px;">
+                Esto es lo que tienes programado para la próxima semana:
+                <b style="color:#1A73E8;">${events.length} evento${events.length === 1 ? '' : 's'}</b>.
+              </div>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="background:#ffffff;padding:16px 24px 8px 24px;">
+              ${cards}
+            </td>
+          </tr>
+
+          <tr>
+            <td style="background:#ffffff;padding:12px 24px 24px 24px;text-align:center;">
+              <div style="font-size:12px;color:#8896A5;line-height:1.6;">
+                Abre RSMail para ver todos los detalles, editar o compartir tus eventos.
+              </div>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="background:#F5F8FB;padding:16px 24px;border-radius:0 0 18px 18px;
+                       text-align:center;border-top:1px solid #E0E7EF;">
+              <div style="font-size:11px;color:#8896A5;line-height:1.6;">
+                Enviado automáticamente por <b>RSMail</b> · Cada domingo a las 8:00<br>
+                Si no tienes eventos la próxima semana, no te enviaremos este correo.
+              </div>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+
+</body>
+</html>`;
+}
 
 // ------------------------------------------------------------
 //  CRON: REANIMACIÓN DE WORKERS
@@ -2026,7 +2315,7 @@ app.post('/api/message-detail', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  🔥 MOVER MENSAJE A CARPETA (NUEVO)
+//  🔥 MOVER MENSAJE A CARPETA
 // ------------------------------------------------------------
 app.post('/api/move-message', async (req, res) => {
   const { email, password, host, port, uid, fromFolder, toFolder } = req.body;
@@ -2047,7 +2336,6 @@ app.post('/api/move-message', async (req, res) => {
 
     const lock = await client.getMailboxLock(fromFolder);
     try {
-      // Resolver el nombre real de la carpeta destino
       let targetFolder = toFolder;
       try {
         const list = await client.list();
@@ -2084,7 +2372,7 @@ app.post('/api/move-message', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  🔥 CREAR CARPETA (NUEVO)
+//  🔥 CREAR CARPETA
 // ------------------------------------------------------------
 app.post('/api/create-folder', async (req, res) => {
   const { email, password, host, port, folderName } = req.body;
@@ -2121,7 +2409,7 @@ app.post('/api/create-folder', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  🔥 ELIMINAR CARPETA (NUEVO)
+//  🔥 ELIMINAR CARPETA
 // ------------------------------------------------------------
 app.post('/api/delete-folder', async (req, res) => {
   const { email, password, host, port, folderName } = req.body;
@@ -2140,7 +2428,6 @@ app.post('/api/delete-folder', async (req, res) => {
     const conn = await connectImapAuto(email, password, host);
     client = conn.client;
 
-    // Buscar el path real
     let targetFolder = folderName;
     try {
       const list = await client.list();

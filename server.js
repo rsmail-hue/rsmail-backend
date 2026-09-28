@@ -3188,7 +3188,7 @@ h1{color:#c62828;font-size:20px;margin:0 0 8px;}p{color:#666;font-size:14px;marg
 });
 
 // ------------------------------------------------------------
-//  🔥 IA — GEMINI 2.5 FLASH (SDK @google/genai)
+//  🔥 IA — GEMINI 3.8 FLASH (SDK @google/genai + Interactions API)
 // ------------------------------------------------------------
 let geminiClient = null;
 try {
@@ -3196,7 +3196,7 @@ try {
   const geminiKey = process.env.GEMINI_API_KEY;
   if (geminiKey) {
     geminiClient = new GoogleGenAI({ apiKey: geminiKey });
-    console.log('✅ Gemini 2.5 Flash inicializado (SDK @google/genai)');
+    console.log('✅ Gemini 3.8 Flash inicializado (SDK @google/genai + Interactions API)');
   } else {
     console.log('⚠️ GEMINI_API_KEY no configurada → IA deshabilitada');
   }
@@ -3229,38 +3229,23 @@ app.post('/api/ai/chat', async (req, res) => {
 
     console.log(`🤖 [AI] Consulta: "${message.substring(0, 80)}..."`);
 
-    const response = await geminiClient.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: {
-        systemInstruction:
-          'Eres RSMail AI, el asistente inteligente integrado en la aplicación RSMail. ' +
-          'Ayudas con dudas sobre correo, calendario, contactos, reglas y automatizaciones. ' +
-          'Hablas SIEMPRE en español, con tono cercano y profesional. ' +
-          'Eres conciso (máximo 150 palabras por respuesta salvo que pidan detalle).',
-        temperature: 0.7,
-        maxOutputTokens: 1024,
-      },
+    const interaction = await geminiClient.interactions.create({
+      model: 'gemini-3.8-flash',
+      input: prompt,
+      system_instruction:
+        'Eres RSMail AI, el asistente inteligente integrado en la aplicación RSMail. ' +
+        'Ayudas con dudas sobre correo, calendario, contactos, reglas y automatizaciones. ' +
+        'Hablas SIEMPRE en español, con tono cercano y profesional. ' +
+        'Eres conciso (máximo 150 palabras por respuesta salvo que pidan detalle).',
     });
 
-    // En @google/genai, response.text es una propiedad
-    let replyText = '';
-    try {
-      replyText = response.text || '';
-    } catch (_) {
-      replyText = '';
-    }
-    if (!replyText && response.candidates && response.candidates.length > 0) {
-      const parts = response.candidates[0].content?.parts || [];
-      replyText = parts.map((p) => p.text || '').join('');
-    }
-
+    const replyText = interaction.output_text || '(Sin respuesta)';
     console.log(`✅ [AI] Respuesta (${replyText.length} chars)`);
 
     res.json({
       success: true,
-      reply: replyText || '(Sin respuesta)',
-      model: 'gemini-2.5-flash',
+      reply: replyText,
+      model: 'gemini-3.8-flash',
     });
   } catch (e) {
     console.error('❌ Error en /api/ai/chat:', e.message);

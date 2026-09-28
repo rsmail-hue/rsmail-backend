@@ -3195,6 +3195,42 @@ const GROQ_MODELS_FALLBACK = [
   'openai/gpt-oss-120b',
 ];
 
+const RSMAIL_SYSTEM_PROMPT = `Eres RSMail AI, el asistente inteligente integrado en la aplicación RSMail.
+
+REGLAS DE FORMATO (MUY IMPORTANTE):
+- NUNCA uses markdown. Nada de **negrita**, ni ## títulos, ni \`código\`, ni listas con - o *.
+- Escribe en texto plano, como si fuera una conversación normal.
+- Puedes usar números para pasos: 1., 2., 3.
+- Puedes usar emojis con moderación (1 o 2 por respuesta máximo).
+- Máximo 120 palabras por respuesta salvo que el usuario pida detalle.
+
+CONOCIMIENTO REAL DE LA APP (usa esta información para responder con precisión):
+- Las reglas y filtros se configuran en: Mi Cuenta → Reglas y filtros → Gestionar reglas.
+- Las firmas: Mi Cuenta → Firmas → Gestionar firmas.
+- Las plantillas de correo: Mi Cuenta → Plantillas de correo.
+- Los recordatorios de correo: Mi Cuenta → Recordatorios.
+- Las ausencias/vacaciones: Mi Cuenta → Ausencias y vacaciones.
+- La traducción automática: Mi Cuenta → Traducción automática.
+- El backup: Mi Cuenta → Backup y restauración.
+- Las suscripciones: Mi Cuenta → Suscripciones.
+- Los datos personales: Mi Cuenta → Datos personales.
+- La apariencia (tema): Mi Cuenta → Apariencia.
+- Los permisos y notificaciones: Mi Cuenta → Permisos y notificaciones.
+- Los contactos: menú lateral del correo → Contactos.
+- Las carpetas nuevas: menú lateral del correo → Nueva carpeta.
+- El calendario: pestaña Calendario (abajo). Tiene dos vistas: Semana y Calendario (mes).
+- Crear un evento: botón + en la barra superior del calendario.
+- Compartir un evento por WhatsApp: abrir el evento y pulsar "Compartir por WhatsApp".
+- Compartir un evento por email: abrir el evento y pulsar "Compartir por email".
+- El modo confidencial: se activa al redactar un correo.
+- El chat interno: menú lateral del correo → Chat.
+- Los adjuntos del chat van a Cloudinary automáticamente.
+
+EJEMPLO DE RESPUESTA CORRECTA (cuando preguntan cómo crear una regla para mover facturas):
+"Ve a Mi Cuenta, entra en Reglas y filtros y pulsa Gestionar reglas. Ahí crea una nueva regla: como condición pon Asunto contiene Factura (o Invoice), y como acción elige Mover a la carpeta que quieras. Guarda y listo."
+
+Sé conciso, claro y directo. Si no sabes algo, dilo claramente en vez de inventarlo.`;
+
 let groqEnabled = false;
 try {
   const groqKey = process.env.GROQ_API_KEY;
@@ -3209,20 +3245,12 @@ try {
   groqEnabled = false;
 }
 
-// Helper: prueba varios modelos de Groq hasta que uno funcione
 async function callGroqChat({ history, prompt }) {
   const groqKey = process.env.GROQ_API_KEY;
   if (!groqKey) throw new Error('GROQ_API_KEY no configurada');
 
   const messages = [
-    {
-      role: 'system',
-      content:
-        'Eres RSMail AI, el asistente inteligente integrado en la aplicación RSMail. ' +
-        'Ayudas con dudas sobre correo, calendario, contactos, reglas y automatizaciones. ' +
-        'Hablas SIEMPRE en español, con tono cercano y profesional. ' +
-        'Eres conciso (máximo 150 palabras por respuesta salvo que pidan detalle).',
-    },
+    { role: 'system', content: RSMAIL_SYSTEM_PROMPT },
     ...history,
     { role: 'user', content: prompt },
   ];
@@ -3240,7 +3268,7 @@ async function callGroqChat({ history, prompt }) {
         body: JSON.stringify({
           model,
           messages,
-          temperature: 0.7,
+          temperature: 0.5,
           max_tokens: 1024,
         }),
       });
@@ -3258,7 +3286,13 @@ async function callGroqChat({ history, prompt }) {
       }
 
       const data = await res.json();
-      const reply = data?.choices?.[0]?.message?.content || '(Sin respuesta)';
+      let reply = data?.choices?.[0]?.message?.content || '(Sin respuesta)';
+
+      // 🔥 Limpieza final: por si el modelo desobedece y mete markdown
+      reply = reply.replace(/\*\*/g, '');
+      reply = reply.replace(/^#+\s*/gm, '');
+      reply = reply.replace(/`([^`]+)`/g, '$1');
+
       console.log(`✅ [AI-Groq] Respuesta obtenida con ${model}`);
       return { reply, model };
     } catch (e) {

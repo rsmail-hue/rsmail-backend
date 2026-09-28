@@ -2042,7 +2042,7 @@ app.get('/api/debug/workers', (req, res) => {
     microsoftClientIdConfigured: !!MICROSOFT_CLIENT_ID,
     firestoreAvailable: !!db,
     storageAvailable: !!storageBucket,
-    geminiConfigured: !!geminiModel,
+    geminiConfigured: !!geminiClient,
     blockedAccounts: Array.from(failedAccounts.entries()).map(([e, v]) => ({ email: e, count: v.count, until: v.until ? new Date(v.until).toISOString() : null })),
   });
 });
@@ -3188,7 +3188,7 @@ h1{color:#c62828;font-size:20px;margin:0 0 8px;}p{color:#666;font-size:14px;marg
 });
 
 // ------------------------------------------------------------
-//  🔥 IA — GEMINI 3.8 FLASH (NUEVO SDK @google/genai)
+//  🔥 IA — GEMINI 2.5 FLASH (SDK @google/genai)
 // ------------------------------------------------------------
 let geminiClient = null;
 try {
@@ -3196,7 +3196,7 @@ try {
   const geminiKey = process.env.GEMINI_API_KEY;
   if (geminiKey) {
     geminiClient = new GoogleGenAI({ apiKey: geminiKey });
-    console.log('✅ Gemini 3.8 Flash inicializado');
+    console.log('✅ Gemini 2.5 Flash inicializado (SDK @google/genai)');
   } else {
     console.log('⚠️ GEMINI_API_KEY no configurada → IA deshabilitada');
   }
@@ -3228,23 +3228,67 @@ app.post('/api/ai/chat', async (req, res) => {
     }
 
     console.log(`🤖 [AI] Consulta: "${message.substring(0, 80)}..."`);
-    
-    const interaction = await geminiClient.interactions.create({
-      model: 'gemini-3.8-flash',
-      input: prompt,
-      system_instruction: `Eres RSMail AI, el asistente inteligente integrado en la aplicación RSMail. 
-      Ayudas con dudas sobre correo, calendario, contactos, reglas y automatizaciones. 
-      Hablas SIEMPRE en español, con tono cercano y profesional. 
-      Eres conciso (máximo 150 palabras por respuesta salvo que pidan detalle).`
+
+    const response = await geminiClient.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+      config: {
+        systemInstruction:
+          'Eres RSMail AI, el asistente inteligente integrado en la aplicación RSMail. ' +
+          'Ayudas con dudas sobre correo, calendario, contactos, reglas y automatizaciones. ' +
+          'Hablas SIEMPRE en español, con tono cercano y profesional. ' +
+          'Eres conciso (máximo 150 palabras por respuesta salvo que pidan detalle).',
+        temperature: 0.7,
+        maxOutputTokens: 1024,
+      },
     });
+
+    // En @google/genai, response.text es una propiedad
+    let replyText = '';
+    try {
+      replyText = response.text || '';
+    } catch (_) {
+      replyText = '';
+    }
+    if (!replyText && response.candidates && response.candidates.length > 0) {
+      const parts = response.candidates[0].content?.parts || [];
+      replyText = parts.map((p) => p.text || '').join('');
+    }
+
+    console.log(`✅ [AI] Respuesta (${replyText.length} chars)`);
 
     res.json({
       success: true,
-      reply: interaction.output_text,
-      model: 'gemini-3.8-flash',
+      reply: replyText || '(Sin respuesta)',
+      model: 'gemini-2.5-flash',
     });
   } catch (e) {
     console.error('❌ Error en /api/ai/chat:', e.message);
+    if (e.stack) console.error('   Stack:', e.stack.split('\n').slice(0, 3).join(' | '));
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ------------------------------------------------------------
+//  DIAGNÓSTICO: lista los modelos disponibles
+// ------------------------------------------------------------
+app.get('/api/ai/models', async (req, res) => {
+  try {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) {
+      return res.status(503).json({ success: false, error: 'GEMINI_API_KEY no configurada' });
+    }
+    const r = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${key}`
+    );
+    const data = await r.json();
+    const models = (data.models || []).map((m) => ({
+      name: m.name,
+      displayName: m.displayName,
+      methods: m.supportedGenerationMethods,
+    }));
+    res.json({ success: true, total: models.length, models });
+  } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
 });

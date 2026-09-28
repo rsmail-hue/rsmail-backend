@@ -1185,8 +1185,6 @@ async function runImapLoop(state) {
 //  - 1 DÍA ANTES
 //  - 1 HORA ANTES
 //  - 15 MIN ANTES
-//  Hora/fecha del evento formateada en la zona LOCAL del destinatario
-//  (offset enviado por el móvil vía /api/fcm-token).
 // ------------------------------------------------------------
 cron.schedule('* * * * *', async () => {
   if (!db) return;
@@ -1230,7 +1228,6 @@ cron.schedule('* * * * *', async () => {
       else if (type === 'alarma') { typeLabel = 'Alarma'; typeEmoji = '⏰'; }
       else { typeLabel = 'Evento'; typeEmoji = '📌'; }
 
-      // 🔥 Dos líneas: cuándo ES el evento + cuándo SE NOTIFICA
       const nowLocalStr = formatNowLocal(offsetMin, now);
       const infoLine =
         `${typeEmoji} ${typeLabel} · ${fullStr}\n` +
@@ -2051,6 +2048,7 @@ app.get('/api/debug/workers', (req, res) => {
     microsoftClientIdConfigured: !!MICROSOFT_CLIENT_ID,
     firestoreAvailable: !!db,
     storageAvailable: !!storageBucket,
+    geminiConfigured: !!geminiModel,
     blockedAccounts: Array.from(failedAccounts.entries()).map(([e, v]) => ({ email: e, count: v.count, until: v.until ? new Date(v.until).toISOString() : null })),
   });
 });
@@ -2355,7 +2353,6 @@ function detectAttachmentsFromStructure(structure) {
   return false;
 }
 
-// 🔥 NUEVO: incluye preview + fromName + toName
 app.post('/api/messages', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
   let client;
@@ -2379,7 +2376,6 @@ app.post('/api/messages', async (req, res) => {
         const toAddr = msg.envelope?.to?.[0]?.address || '';
         const toName = msg.envelope?.to?.[0]?.name || '';
 
-        // 🔥 Vista previa: limpiar espacios/saltos y limitar a 160 chars
         let preview = (msg.preview || '').toString();
         preview = preview.replace(/\s+/g, ' ').trim();
         if (preview.length > 160) {
@@ -3198,6 +3194,91 @@ h1{color:#c62828;font-size:20px;margin:0 0 8px;}p{color:#666;font-size:14px;marg
 });
 
 // ------------------------------------------------------------
+//  🔥 IA — GEMINI 1.5 FLASH
+// ------------------------------------------------------------
+let geminiModel = null;
+try {
+  const { GoogleGenerativeAI } = require('@google/generative-ai');
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (geminiKey) {
+    const genAI = new GoogleGenerativeAI(geminiKey);
+    geminiModel = genAI.getGenerativeModel({
+      model: 'gemini-1.5-flash',
+      systemInstruction: `Eres RSMail AI, el asistente inteligente integrado en la aplicación RSMail.
+
+RSMail es una app de correo electrónico y productividad empresarial con estas funciones:
+- Correo (IMAP/SMTP, múltiples cuentas, carpetas personalizables, reglas automáticas)
+- Calendario (citas, tareas, alarmas, eventos compartidos con invitaciones)
+- Chat interno entre contactos con adjuntos en la nube
+- Contactos con enriquecimiento automático (nombre, empresa, teléfono...)
+- Firmas y plantillas de correo
+- Modo confidencial (correos con contraseña y caducidad)
+- Ausencias/vacaciones con respuesta automática
+- Traducción automática de correos
+- Modo oscuro, widgets de Android, Wear OS
+
+Tu trabajo:
+- Ayudar al usuario con dudas sobre cómo usar la app
+- Resumir correos largos si te los pega
+- Redactar respuestas profesionales
+- Sugerir reglas o automatizaciones
+- Explicar funciones de RSMail con pasos concretos y numerados
+- Hablar SIEMPRE en español, con tono cercano y profesional
+- Ser conciso (máximo 150 palabras por respuesta salvo que pidan detalle)
+- Si no sabes algo, dilo claramente`,
+      generationConfig: {
+        temperature: 0.7,
+        maxOutputTokens: 1024,
+      },
+    });
+    console.log('✅ Gemini 1.5 Flash inicializado');
+  } else {
+    console.log('⚠️ GEMINI_API_KEY no configurada → IA deshabilitada');
+  }
+} catch (e) {
+  console.error('❌ Error inicializando Gemini:', e.message);
+  geminiModel = null;
+}
+
+app.post('/api/ai/chat', async (req, res) => {
+  if (!geminiModel) {
+    return res.status(503).json({
+      success: false,
+      error: 'IA no disponible. Configura GEMINI_API_KEY en el servidor.',
+    });
+  }
+  try {
+    const { message, history } = req.body || {};
+    if (!message || typeof message !== 'string') {
+      return res.status(400).json({ success: false, error: 'message_required' });
+    }
+
+    let prompt = message;
+    if (Array.isArray(history) && history.length > 0) {
+      const historyText = history
+        .slice(-6)
+        .map((m) => `${m.role === 'user' ? 'Usuario' : 'RSMail AI'}: ${m.content}`)
+        .join('\n');
+      prompt = `Contexto de la conversación previa:\n${historyText}\n\nNuevo mensaje del usuario:\n${message}`;
+    }
+
+    console.log(`🤖 [AI] Consulta: "${message.substring(0, 80)}..."`);
+    const result = await geminiModel.generateContent(prompt);
+    const response = await result.response;
+    const text = response.text();
+
+    res.json({
+      success: true,
+      reply: text,
+      model: 'gemini-1.5-flash',
+    });
+  } catch (e) {
+    console.error('❌ Error en /api/ai/chat:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ------------------------------------------------------------
 //  INICIAR SERVIDOR
 // ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
@@ -3207,5 +3288,6 @@ server.listen(PORT, async () => {
   console.log(`   Firebase Storage: ${storageBucket ? storageBucket.name : 'NO DISPONIBLE'}`);
   console.log(`   Cloudinary: ${CLOUDINARY_ENABLED ? 'OK' : 'NO'}`);
   console.log(`   Microsoft OAuth client_id: ${MICROSOFT_CLIENT_ID ? MICROSOFT_CLIENT_ID.substring(0, 12) + '...' : '❌ NO CONFIGURADO'}`);
+  console.log(`   Gemini AI: ${geminiModel ? 'OK' : 'NO CONFIGURADO'}`);
   await restoreWorkers();
 });

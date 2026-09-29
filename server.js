@@ -458,6 +458,84 @@ function invalidateAiPreferencesCache(email) {
   if (email) _aiPrefsCache.delete(email);
 }
 
+// ------------------------------------------------------------
+//  🎓 IA — CATEGORÍAS APRENDIDAS
+// ------------------------------------------------------------
+const GENERIC_EMAIL_DOMAINS = [
+  'gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com',
+  'live.com', 'msn.com', 'yahoo.com', 'yahoo.es', 'yahoo.co.uk',
+  'icloud.com', 'me.com', 'mac.com', 'gmx.com', 'gmx.es',
+  'aol.com', 'protonmail.com', 'proton.me', 'zoho.com',
+  'mail.com', 'yandex.com', 'tutanota.com',
+];
+
+function isGenericDomain(domain) {
+  return GENERIC_EMAIL_DOMAINS.includes(domain.toLowerCase());
+}
+
+const _learnedCache = new Map();
+const LEARNED_CACHE_TTL_MS = 5 * 60 * 1000;
+
+async function getLearnedRules(email) {
+  if (!db || !email) return {};
+  const now = Date.now();
+  const cached = _learnedCache.get(email);
+  if (cached && cached.expiresAt > now) return cached.rules;
+  try {
+    const doc = await db.collection('learned_categories').doc(email).get();
+    const rules = doc.exists ? (doc.data()?.rules || {}) : {};
+    _learnedCache.set(email, { rules, expiresAt: now + LEARNED_CACHE_TTL_MS });
+    return rules;
+  } catch (e) { return {}; }
+}
+
+function invalidateLearnedCache(email) {
+  if (email) _learnedCache.delete(email);
+}
+
+function matchLearnedRule(from, rules) {
+  if (!from || !rules) return null;
+  const fromLower = String(from).toLowerCase().trim();
+  if (!fromLower) return null;
+  if (rules[fromLower]) {
+    return { category: rules[fromLower], matchType: 'email', key: fromLower };
+  }
+  const atIdx = fromLower.lastIndexOf('@');
+  if (atIdx > 0) {
+    const domain = fromLower.substring(atIdx + 1);
+    if (rules[domain]) {
+      return { category: rules[domain], matchType: 'domain', key: domain };
+    }
+  }
+  return null;
+}
+
+async function addLearnedRule(email, senderEmail, category) {
+  if (!db || !email || !senderEmail || !category) return;
+  try {
+    const fromLower = String(senderEmail).toLowerCase().trim();
+    const atIdx = fromLower.lastIndexOf('@');
+    if (atIdx <= 0) return;
+    const domain = fromLower.substring(atIdx + 1);
+    const cat = String(category).toLowerCase().trim();
+
+    const doc = await db.collection('learned_categories').doc(email).get();
+    const existing = doc.exists ? (doc.data()?.rules || {}) : {};
+    const newRules = { ...existing };
+    newRules[fromLower] = cat;
+    if (!isGenericDomain(domain)) newRules[domain] = cat;
+
+    await db.collection('learned_categories').doc(email).set({
+      rules: newRules,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+    invalidateLearnedCache(email);
+    console.log(`📚 [Learned] ${email}: +${fromLower}${!isGenericDomain(domain) ? ' +' + domain : ''} → ${cat}`);
+  } catch (e) {
+    console.error('❌ addLearnedRule:', e.message);
+  }
+}
+
 async function getRulesForAccount(email) {
   if (!db) return [];
   const now = Date.now();
@@ -688,7 +766,6 @@ async function checkUrgencyAndNotify({ email, password, host, uid, from, subject
   } catch (_) {}
 }
 
-// 🔒 Cola serial para clasificaciones (evita solapar llamadas a Groq)
 let _classifyChain = Promise.resolve();
 function enqueueClassification(taskFn) {
   const run = _classifyChain.then(taskFn, taskFn);
@@ -811,6 +888,28 @@ async function checkAndClassifyEmail({ email, uid, from, subject, preview, folde
   if (!prefs.autoClassify) return;
   if (!Array.isArray(prefs.categories) || prefs.categories.length === 0) return;
 
+  // 🎓 1º intentar con reglas aprendidas (sin tocar Groq)
+  const learned = await getLearnedRules(email);
+  const match = matchLearnedRule(from, learned);
+  if (match) {
+    console.log(`🎓 [AI-Classify] UID ${uid}: regla aprendida (${match.matchType}:${match.key}) → ${match.category}`);
+    try {
+      await db.collection('email_classifications').doc(email).collection('messages').doc(String(uid)).set({
+        category: match.category,
+        confidence: 1.0,
+        reason: `Regla aprendida (${match.matchType})`,
+        folder,
+        subject: subject || '',
+        from: from || '',
+        manualOverride: false,
+        learnedRule: true,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (_) {}
+    return;
+  }
+
+  // 🏷️ 2º si no hay regla aprendida, usar IA
   return enqueueClassification(async () => {
     let result;
     try {
@@ -2230,6 +2329,7 @@ CONOCIMIENTO REAL DE LA APP:
 - Carpetas: menú lateral → Nueva carpeta.
 - Calendario: pestaña Calendario (abajo).
 - Asistente IA: Mi Cuenta → Asistente IA (4 funciones: chat, reglas NL, urgencia, clasificación).
+- Categorías aprendidas: Mi Cuenta → Asistente IA → Categorías aprendidas.
 - Modo confidencial: al redactar un correo.
 - Chat interno: menú lateral → Chat.
 
@@ -2345,6 +2445,60 @@ app.get('/api/ai/preferences/:email', async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
+// ------------------------------------------------------------
+//  🎓 IA — Endpoints de reglas aprendidas
+// ------------------------------------------------------------
+app.get('/api/ai/learned/:email', async (req, res) => {
+  if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
+  try {
+    const email = decodeURIComponent(req.params.email);
+    const rules = await getLearnedRules(email);
+    const items = Object.entries(rules).map(([key, cat]) => ({
+      key,
+      category: cat,
+      isDomain: !key.includes('@'),
+      isEmail: key.includes('@'),
+    }));
+    items.sort((a, b) => {
+      if (a.isEmail && !b.isEmail) return -1;
+      if (!a.isEmail && b.isEmail) return 1;
+      return a.key.localeCompare(b.key);
+    });
+    res.json({ success: true, count: items.length, rules: items });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.delete('/api/ai/learned/:email/:key', async (req, res) => {
+  if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
+  try {
+    const email = decodeURIComponent(req.params.email);
+    const key = decodeURIComponent(req.params.key).toLowerCase().trim();
+    const doc = await db.collection('learned_categories').doc(email).get();
+    if (!doc.exists) return res.status(404).json({ success: false, error: 'No hay reglas' });
+    const rules = doc.data()?.rules || {};
+    if (!rules[key]) return res.status(404).json({ success: false, error: 'Regla no encontrada' });
+    delete rules[key];
+    await db.collection('learned_categories').doc(email).set({
+      rules,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+    invalidateLearnedCache(email);
+    console.log(`🗑️ [Learned] ${email}: -${key}`);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.delete('/api/ai/learned/:email', async (req, res) => {
+  if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
+  try {
+    const email = decodeURIComponent(req.params.email);
+    await db.collection('learned_categories').doc(email).delete();
+    invalidateLearnedCache(email);
+    console.log(`🗑️ [Learned] ${email}: todas las reglas borradas`);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
 app.post('/api/ai/classify/override', async (req, res) => {
   if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
   try {
@@ -2368,8 +2522,15 @@ app.post('/api/ai/classify/override', async (req, res) => {
       manualOverride: true,
       overriddenAt: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
-    console.log(`🏷️ [Override] ${email} UID ${uid} → ${cat}`);
-    res.json({ success: true, category: cat });
+
+    let learned = false;
+    if (from) {
+      await addLearnedRule(email, from, cat);
+      learned = true;
+    }
+
+    console.log(`🏷️ [Override] ${email} UID ${uid} → ${cat}${learned ? ' (+aprendida)' : ''}`);
+    res.json({ success: true, category: cat, learned });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }

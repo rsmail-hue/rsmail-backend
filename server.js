@@ -621,10 +621,17 @@ Score:
         headers: { 'Authorization': `Bearer ${groqKey}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ model, messages, temperature: 0.1, max_tokens: 200, response_format: { type: 'json_object' } }),
       });
+      if (res.status === 429) {
+        const errBody = await res.text();
+        const match = errBody.match(/try again in ([\d.]+)\s*s/i);
+        const waitSec = match ? Math.min(parseFloat(match[1]) + 0.5, 10) : 3;
+        await new Promise((r) => setTimeout(r, waitSec * 1000));
+        lastError = new Error('Groq 429');
+        continue;
+      }
       if (!res.ok) {
         lastError = new Error(`Groq ${res.status}`);
         if (res.status === 404 || res.status === 400) continue;
-        if (res.status === 429) throw lastError;
         continue;
       }
       const data = await res.json();
@@ -681,6 +688,14 @@ async function checkUrgencyAndNotify({ email, password, host, uid, from, subject
   } catch (_) {}
 }
 
+// 🔒 Cola serial para clasificaciones (evita solapar llamadas a Groq)
+let _classifyChain = Promise.resolve();
+function enqueueClassification(taskFn) {
+  const run = _classifyChain.then(taskFn, taskFn);
+  _classifyChain = run.catch(() => {});
+  return run;
+}
+
 async function classifyEmailWithGroq({ from, subject, preview, categories }) {
   const groqKey = process.env.GROQ_API_KEY;
   if (!groqKey) throw new Error('GROQ_API_KEY no configurada');
@@ -694,7 +709,7 @@ Asunto: ${subject || '(sin asunto)'}
 Vista previa: ${(preview || '').substring(0, 300)}
 
 REGLAS DE PRIORIDAD:
-1. FACTURAS: "factura", "recibo", "invoice", "pago", "cargo", "abono", "seguro", "contrato", "presupuesto", "nómina", o remitentes de bancos/utilities.
+1. FACTURAS: "factura", "recibo", "invoice", "pago", "cargo", "seguro", "contrato", "presupuesto", "nómina", o remitentes de bancos/utilities.
 2. NOTIFICACIONES: "tu pedido", "envío", "seguimiento", "verificación", "código", "bienvenido a", o remitentes no-reply/noreply/notificaciones.
 3. PUBLICIDAD: "%", "descuento", "oferta", "promo", "black friday", "rebajas", "gratis", "newsletter", o remitentes marketing/newsletter.
 4. SOCIAL: remitentes de facebook, twitter, instagram, linkedin, tiktok, reddit.
@@ -702,30 +717,34 @@ REGLAS DE PRIORIDAD:
 6. PERSONAL: personas con nombre propio, asunto casual.
 7. OTRO: lo que no encaje.
 
-Devuelve SOLO un JSON de la forma: { "category": "una_categoria_valida", "confidence": 0.9, "reason": "frase corta" }`;
+Devuelve SOLO un JSON: { "category": "una_categoria_valida", "confidence": 0.9, "reason": "frase corta" }`;
 
   const messages = [
     { role: 'system', content: 'Eres un clasificador de correos. Devuelves SOLO JSON válido.' },
     { role: 'user', content: prompt },
   ];
 
+  const MODELS_TO_TRY = ['openai/gpt-oss-20b', 'openai/gpt-oss-120b'];
+  const MAX_ATTEMPTS = 3;
+
   let lastError = null;
+  let totalAttempts = 0;
 
-  for (const model of GROQ_MODELS_FALLBACK) {
-    const attempts = [
-      { model, response_format: { type: 'json_object' } },
-      { model, response_format: null },
-    ];
+  for (const model of MODELS_TO_TRY) {
+    if (totalAttempts >= MAX_ATTEMPTS) break;
 
-    for (const cfg of attempts) {
+    for (const useJsonMode of [true, false]) {
+      if (totalAttempts >= MAX_ATTEMPTS) break;
+      totalAttempts++;
+
       try {
         const body = {
-          model: cfg.model,
+          model,
           messages,
           temperature: 0.1,
-          max_tokens: 300,
+          max_tokens: 200,
         };
-        if (cfg.response_format) body.response_format = cfg.response_format;
+        if (useJsonMode) body.response_format = { type: 'json_object' };
 
         const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
           method: 'POST',
@@ -733,14 +752,23 @@ Devuelve SOLO un JSON de la forma: { "category": "una_categoria_valida", "confid
           body: JSON.stringify(body),
         });
 
+        if (res.status === 429) {
+          const errBody = await res.text();
+          const match = errBody.match(/try again in ([\d.]+)\s*s/i);
+          const waitSec = match ? Math.min(parseFloat(match[1]) + 0.5, 10) : 3;
+          console.log(`⏸️ [AI-Classify] Rate limit — esperando ${waitSec.toFixed(1)}s...`);
+          await new Promise((r) => setTimeout(r, waitSec * 1000));
+          lastError = new Error('Groq 429');
+          continue;
+        }
+
         if (!res.ok) {
           const errBody = await res.text();
-          console.log(`⚠️ [AI-Classify] ${cfg.model} ${cfg.response_format ? 'JSON-mode' : 'plain'} falló ${res.status}: ${errBody.substring(0, 300)}`);
+          console.log(`⚠️ [AI-Classify] ${model} ${useJsonMode ? 'JSON' : 'plain'} falló ${res.status}: ${errBody.substring(0, 200)}`);
           lastError = new Error(`Groq ${res.status}`);
           if (res.status === 404) break;
-          if (res.status === 400 && cfg.response_format) continue;
+          if (res.status === 400 && useJsonMode) continue;
           if (res.status === 400) break;
-          if (res.status === 429) throw lastError;
           break;
         }
 
@@ -748,17 +776,14 @@ Devuelve SOLO un JSON de la forma: { "category": "una_categoria_valida", "confid
         const raw = data?.choices?.[0]?.message?.content || '{}';
 
         let parsed = null;
-        try {
-          parsed = JSON.parse(raw);
-        } catch (_) {
+        try { parsed = JSON.parse(raw); }
+        catch (_) {
           const m = raw.match(/\{[\s\S]*\}/);
-          if (m) {
-            try { parsed = JSON.parse(m[0]); } catch (_) {}
-          }
+          if (m) { try { parsed = JSON.parse(m[0]); } catch (_) {} }
         }
         if (!parsed || !parsed.category) {
-          lastError = new Error('JSON sin campo category');
-          console.log(`⚠️ [AI-Classify] Respuesta sin category: ${raw.substring(0, 200)}`);
+          lastError = new Error('JSON sin category');
+          console.log(`⚠️ [AI-Classify] Sin category: ${raw.substring(0, 150)}`);
           continue;
         }
 
@@ -767,11 +792,11 @@ Devuelve SOLO un JSON de la forma: { "category": "una_categoria_valida", "confid
         const confidence = Math.max(0, Math.min(1, parseFloat(parsed.confidence) || 0));
         const reason = String(parsed.reason || '').substring(0, 80);
 
-        console.log(`✅ [AI-Classify] ${cfg.model}${cfg.response_format ? '' : ' (sin JSON-mode)'}`);
-        return { category, confidence, reason, model: cfg.model };
+        console.log(`✅ [AI-Classify] ${model}${useJsonMode ? '' : ' (sin JSON-mode)'}`);
+        return { category, confidence, reason, model };
       } catch (e) {
         lastError = e;
-        console.log(`⚠️ [AI-Classify] Excepción ${cfg.model}: ${e.message}`);
+        console.log(`⚠️ [AI-Classify] Excepción ${model}: ${e.message}`);
         continue;
       }
     }
@@ -785,22 +810,26 @@ async function checkAndClassifyEmail({ email, uid, from, subject, preview, folde
   try { prefs = await getAiPreferences(email); } catch (_) { return; }
   if (!prefs.autoClassify) return;
   if (!Array.isArray(prefs.categories) || prefs.categories.length === 0) return;
-  let result;
-  try {
-    result = await classifyEmailWithGroq({ from, subject, preview, categories: prefs.categories });
-  } catch (e) {
-    console.log(`⚠️ [AI-Classify] Fallo UID ${uid}: ${e.message}`);
-    return;
-  }
-  console.log(`🏷️ [AI-Classify] UID ${uid}: ${result.category} (${(result.confidence * 100).toFixed(0)}%)`);
-  try {
-    await db.collection('email_classifications').doc(email).collection('messages').doc(String(uid)).set({
-      category: result.category, confidence: result.confidence, reason: result.reason,
-      folder, subject: subject || '', from: from || '',
-      manualOverride: false,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-  } catch (_) {}
+
+  return enqueueClassification(async () => {
+    let result;
+    try {
+      result = await classifyEmailWithGroq({ from, subject, preview, categories: prefs.categories });
+    } catch (e) {
+      console.log(`⚠️ [AI-Classify] Fallo UID ${uid}: ${e.message}`);
+      return;
+    }
+    console.log(`🏷️ [AI-Classify] UID ${uid}: ${result.category} (${(result.confidence * 100).toFixed(0)}%)`);
+    try {
+      await db.collection('email_classifications').doc(email).collection('messages').doc(String(uid)).set({
+        category: result.category, confidence: result.confidence, reason: result.reason,
+        folder, subject: subject || '', from: from || '',
+        manualOverride: false,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (_) {}
+    await new Promise((r) => setTimeout(r, 1500));
+  });
 }
 
 const _translateCache = new Map();
@@ -1673,7 +1702,6 @@ function detectAttachmentsFromStructure(structure) {
   return false;
 }
 
-// 🔥 OPTIMIZADO: batch read de urgencias + clasificaciones
 app.post('/api/messages', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
   let client;
@@ -1708,7 +1736,6 @@ app.post('/api/messages', async (req, res) => {
     } finally { lock.release(); }
     await client.logout();
 
-    // 🔥 OPTIMIZACIÓN: leer urgencias y clasificaciones en lote (30 UIDs por consulta)
     if (db && messages.length > 0) {
       try {
         const uids = messages.map((m) => String(m.uid));
@@ -2258,10 +2285,14 @@ async function callGroqChat({ history, prompt }) {
         headers: { 'Authorization': `Bearer ${groqKey}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ model, messages, temperature: 0.5, max_tokens: 1024 }),
       });
+      if (res.status === 429) {
+        lastError = new Error('Groq 429');
+        await new Promise(r => setTimeout(r, 3000));
+        continue;
+      }
       if (!res.ok) {
         lastError = new Error(`Groq ${res.status}`);
         if (res.status === 404 || res.status === 400) continue;
-        if (res.status === 429) throw lastError;
         continue;
       }
       const data = await res.json();
@@ -2312,120 +2343,6 @@ app.get('/api/ai/preferences/:email', async (req, res) => {
     const prefs = await getAiPreferences(email);
     res.json({ success: true, preferences: prefs });
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
-});
-
-app.post('/api/ai/reprocess', async (req, res) => {
-  if (!groqEnabled) return res.status(503).json({ success: false, error: 'IA no disponible' });
-  if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
-  const { email, limit = 30, skipClassified = true } = req.body || {};
-  if (!email) return res.status(400).json({ success: false, error: 'email_required' });
-
-  const prefs = await getAiPreferences(email);
-  if (!prefs.autoClassify && !prefs.detectUrgency) {
-    return res.status(403).json({
-      success: false,
-      error: 'no_features_enabled',
-      message: 'Activa clasificación automática o detección de urgencia para reprocesar.',
-    });
-  }
-
-  let client;
-  try {
-    console.log(`♻️ [Reprocess] Iniciando para ${email} (limit=${limit})`);
-    const accountDoc = await db.collection('user_accounts').doc(email).get();
-    if (!accountDoc.exists) return res.status(404).json({ success: false, error: 'account_not_found' });
-    const accData = accountDoc.data();
-    const password = accData.password;
-    const host = accData.imapHost;
-
-    const conn = await connectImapAuto(email, password, host);
-    client = conn.client;
-
-    const alreadyClassified = new Set();
-    if (skipClassified) {
-      try {
-        const snap = await db.collection('email_classifications').doc(email).collection('messages').get();
-        snap.forEach((d) => alreadyClassified.add(d.id));
-      } catch (_) {}
-    }
-
-    const lock = await client.getMailboxLock('INBOX', { readOnly: true });
-    const items = [];
-    try {
-      const status = await client.status('INBOX', { messages: true });
-      const total = status.messages || 0;
-      const startSeq = Math.max(1, total - limit + 1);
-      const iter = client.fetch(`${startSeq}:*`, { uid: true, envelope: true }, { uid: true });
-      for await (const msg of iter) {
-        if (!msg.uid) continue;
-        items.push({
-          uid: msg.uid,
-          from: msg.envelope?.from?.[0]?.address || '',
-          subject: msg.envelope?.subject || '',
-        });
-      }
-    } finally { lock.release(); }
-    await client.logout();
-    client = null;
-
-    const toProcess = items.filter((it) => !alreadyClassified.has(String(it.uid)));
-    console.log(`♻️ [Reprocess] ${items.length} leídos, ${toProcess.length} a procesar`);
-
-    let classified = 0;
-    let urgencyChecked = 0;
-    let errors = 0;
-    const t0 = Date.now();
-
-    for (const it of toProcess) {
-      try {
-        if (prefs.autoClassify) {
-          await checkAndClassifyEmail({
-            email, uid: it.uid, from: it.from, subject: it.subject,
-            preview: it.subject, folder: 'INBOX',
-          });
-          classified++;
-        }
-        if (prefs.detectUrgency) {
-          try {
-            const urg = await detectUrgencyWithGroq({
-              from: it.from, subject: it.subject, preview: it.subject,
-              level: prefs.urgencyLevel,
-            });
-            const threshold = urgencyThresholdForLevel(prefs.urgencyLevel);
-            const isUrgent = urg.score >= threshold;
-            await db.collection('email_urgency').doc(email).collection('messages').doc(String(it.uid)).set({
-              score: urg.score, reason: urg.reason, level: prefs.urgencyLevel, isUrgent,
-              folder: 'INBOX', subject: it.subject, from: it.from,
-              createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            });
-            urgencyChecked++;
-          } catch (_) {}
-        }
-        await new Promise((r) => setTimeout(r, 400));
-      } catch (e) {
-        errors++;
-        console.log(`⚠️ [Reprocess] Error UID ${it.uid}: ${e.message}`);
-      }
-    }
-
-    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-    console.log(`♻️ [Reprocess] Completado: ${classified} clasificados, ${urgencyChecked} urgencias, ${errors} errores (${elapsed}s)`);
-
-    res.json({
-      success: true,
-      totalRead: items.length,
-      processed: toProcess.length,
-      classified,
-      urgencyChecked,
-      errors,
-      elapsedSeconds: parseFloat(elapsed),
-      skippedAlreadyClassified: items.length - toProcess.length,
-    });
-  } catch (e) {
-    if (client) await client.logout().catch(() => {});
-    console.error('❌ /api/ai/reprocess:', e.message);
-    res.status(500).json({ success: false, error: e.message });
-  }
 });
 
 app.post('/api/ai/classify/override', async (req, res) => {
@@ -2499,10 +2416,14 @@ async function callGroqForRuleJson(prompt, folders) {
         headers: { 'Authorization': `Bearer ${groqKey}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ model, messages, temperature: 0.2, max_tokens: 800, response_format: { type: 'json_object' } }),
       });
+      if (res.status === 429) {
+        lastError = new Error('Groq 429');
+        await new Promise(r => setTimeout(r, 3000));
+        continue;
+      }
       if (!res.ok) {
         lastError = new Error(`Groq ${res.status}`);
         if (res.status === 404 || res.status === 400) continue;
-        if (res.status === 429) throw lastError;
         continue;
       }
       const data = await res.json();

@@ -715,7 +715,7 @@ async function checkUrgencyAndNotify({ email, password, host, uid, from, subject
 }
 
 // ------------------------------------------------------------
-//  IA — CLASIFICACIÓN (con prompt mejorado + override manual)
+//  IA — CLASIFICACIÓN (con fallback y logging robusto)
 // ------------------------------------------------------------
 async function classifyEmailWithGroq({ from, subject, preview, categories }) {
   const groqKey = process.env.GROQ_API_KEY;
@@ -729,82 +729,94 @@ Remitente: ${from || '(desconocido)'}
 Asunto: ${subject || '(sin asunto)'}
 Vista previa: ${(preview || '').substring(0, 300)}
 
-REGLAS DE PRIORIDAD (aplica en este orden):
+REGLAS DE PRIORIDAD:
+1. FACTURAS: "factura", "recibo", "invoice", "pago", "cargo", "abono", "seguro", "contrato", "presupuesto", "nómina", o remitentes de bancos/utilities.
+2. NOTIFICACIONES: "tu pedido", "envío", "seguimiento", "verificación", "código", "bienvenido a", o remitentes no-reply/noreply/notificaciones.
+3. PUBLICIDAD: "%", "descuento", "oferta", "promo", "black friday", "rebajas", "gratis", "newsletter", o remitentes marketing/newsletter.
+4. SOCIAL: remitentes de facebook, twitter, instagram, linkedin, tiktok, reddit.
+5. TRABAJO: remitentes con dominio corporativo, asunto "reunión", "proyecto", "informe", "cliente".
+6. PERSONAL: personas con nombre propio, asunto casual.
+7. OTRO: lo que no encaje.
 
-1. FACTURAS: si el asunto o remitente contiene:
-   - "factura", "recibo", "invoice", "pago", "payment", "cargo", "abono", "seguro", "póliza", "contrato", "renovación", "presupuesto", "albarán", "nómina"
-   - remitentes de bancos, aseguradoras, utilities (endesa, iberdrola, naturgy, vodafone, movistar, orange...)
-   → facturas
-
-2. NOTIFICACIONES: si el asunto contiene:
-   - "tu pedido", "envío", "seguimiento", "entrega", "verificación", "código", "activación", "restablecer contraseña", "confirmación de cuenta", "bienvenido a", "actualización de"
-   - remitentes tipo "no-reply@", "noreply@", "notificaciones@", "notifications@", "info@"
-   - plataformas: Amazon, PayPal, Google, Microsoft, Dropbox, redes sociales
-   → notificaciones
-
-3. PUBLICIDAD: si el asunto contiene:
-   - "%", "descuento", "oferta", "promo", "black friday", "rebajas", "última oportunidad", "no te lo pierdas", "gratis", "newsletter"
-   - remitentes: "marketing@", "newsletter@", "promo@", "info@tienda..."
-   → publicidad
-
-4. SOCIAL: si el remitente es de:
-   - facebook, twitter/x, instagram, linkedin, tiktok, reddit, pinterest, discord, whatsapp, telegram, foros
-   → social
-
-5. TRABAJO: si el remitente:
-   - tiene dominio corporativo (empresa.com, .es, .org no personal)
-   - asunto con "reunión", "proyecto", "informe", "presupuesto", "cliente", "propuesta", "deadline", "entrega"
-   → trabajo
-
-6. PERSONAL: si el remitente:
-   - es una persona con nombre y apellido
-   - usa gmail/outlook/hotmail/etc.
-   - el asunto es casual ("nos vamos", "felicidades", "cómo estás")
-   → personal
-
-7. OTRO: si no encaja en ninguna
-
-EJEMPLOS:
-- "Factura Endesa nº 12345" de facturacion@endesa.com → facturas
-- "Tu pedido #1234 ha sido enviado" de no-reply@amazon.es → notificaciones
-- "Reunión mañana 10:00" de jefe@empresa.com → trabajo
-- "¡Nos vamos de viaje!" de amigo@gmail.com → personal
-- "🔥 Black Friday -50% en TODO" de ofertas@tienda.com → publicidad
-- "Nueva solicitud de amistad" de notification@facebook.com → social
-- "Código de verificación: 483920" de noreply@paypal.com → notificaciones
-
-Devuelve SOLO un JSON: { "category": "<una de las categorías>", "confidence": <0-1>, "reason": "<frase corta, máx 50 caracteres>" }`;
+Devuelve SOLO un JSON de la forma: { "category": "una_categoria_valida", "confidence": 0.9, "reason": "frase corta" }`;
 
   const messages = [
-    { role: 'system', content: 'Eres un clasificador experto de correos. Devuelves SOLO JSON válido, sin markdown ni texto extra.' },
+    { role: 'system', content: 'Eres un clasificador de correos. Devuelves SOLO JSON válido.' },
     { role: 'user', content: prompt },
   ];
 
   let lastError = null;
+
   for (const model of GROQ_MODELS_FALLBACK) {
-    try {
-      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${groqKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, messages, temperature: 0.1, max_tokens: 250, response_format: { type: 'json_object' } }),
-      });
-      if (!res.ok) {
-        lastError = new Error(`Groq ${res.status}`);
-        if (res.status === 404 || res.status === 400) continue;
-        if (res.status === 429) throw lastError;
+    // 2 intentos por modelo:
+    //   1) con response_format json_object
+    //   2) sin response_format (por si el modelo no lo soporta)
+    const attempts = [
+      { model, response_format: { type: 'json_object' } },
+      { model, response_format: null },
+    ];
+
+    for (const cfg of attempts) {
+      try {
+        const body = {
+          model: cfg.model,
+          messages,
+          temperature: 0.1,
+          max_tokens: 300,
+        };
+        if (cfg.response_format) body.response_format = cfg.response_format;
+
+        const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${groqKey}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+
+        if (!res.ok) {
+          const errBody = await res.text();
+          console.log(`⚠️ [AI-Classify] ${cfg.model} ${cfg.response_format ? 'JSON-mode' : 'plain'} falló ${res.status}: ${errBody.substring(0, 300)}`);
+          lastError = new Error(`Groq ${res.status}`);
+          if (res.status === 404) break;
+          if (res.status === 400 && cfg.response_format) continue;
+          if (res.status === 400) break;
+          if (res.status === 429) throw lastError;
+          break;
+        }
+
+        const data = await res.json();
+        const raw = data?.choices?.[0]?.message?.content || '{}';
+
+        // Parseo robusto
+        let parsed = null;
+        try {
+          parsed = JSON.parse(raw);
+        } catch (_) {
+          const m = raw.match(/\{[\s\S]*\}/);
+          if (m) {
+            try { parsed = JSON.parse(m[0]); } catch (_) {}
+          }
+        }
+        if (!parsed || !parsed.category) {
+          lastError = new Error('JSON sin campo category');
+          console.log(`⚠️ [AI-Classify] Respuesta sin category: ${raw.substring(0, 200)}`);
+          continue;
+        }
+
+        let category = String(parsed.category || 'otro').toLowerCase().trim();
+        if (!catsList.includes(category)) category = 'otro';
+        const confidence = Math.max(0, Math.min(1, parseFloat(parsed.confidence) || 0));
+        const reason = String(parsed.reason || '').substring(0, 80);
+
+        console.log(`✅ [AI-Classify] ${cfg.model}${cfg.response_format ? '' : ' (sin JSON-mode)'}`);
+        return { category, confidence, reason, model: cfg.model };
+      } catch (e) {
+        lastError = e;
+        console.log(`⚠️ [AI-Classify] Excepción ${cfg.model}: ${e.message}`);
         continue;
       }
-      const data = await res.json();
-      const raw = data?.choices?.[0]?.message?.content || '{}';
-      const parsed = JSON.parse(raw);
-      let category = String(parsed.category || 'otro').toLowerCase();
-      if (!catsList.includes(category)) category = 'otro';
-      const confidence = Math.max(0, Math.min(1, parseFloat(parsed.confidence) || 0));
-      const reason = String(parsed.reason || '').substring(0, 80);
-      return { category, confidence, reason, model };
-    } catch (e) { lastError = e; continue; }
+    }
   }
-  throw lastError || new Error('Todos los modelos fallaron');
+  throw lastError || new Error('Todos los intentos fallaron');
 }
 
 async function checkAndClassifyEmail({ email, uid, from, subject, preview, folder = 'INBOX' }) {
@@ -2282,11 +2294,7 @@ REGLAS:
 2. "alguno/algunos/o" → matchAll: false
 3. moveTo SOLO usa carpetas de CARPETAS DISPONIBLES.
 4. Máx 3 condiciones y 3 acciones.
-5. Si no es una regla clara: {"error": "No he entendido"}
-
-EJEMPLOS:
-"mueve facturas a la carpeta Facturas" → {"name":"Facturas a Facturas","enabled":true,"matchAll":true,"stopProcessing":false,"conditions":[{"field":"subject","operator":"contains","value":"factura"}],"actions":[{"type":"moveTo","value":"Facturas"}]}
-"correos de juan lopez, importantes y leídos" → {"name":"Juan López importante","enabled":true,"matchAll":true,"stopProcessing":false,"conditions":[{"field":"from","operator":"contains","value":"juan lopez"}],"actions":[{"type":"star"},{"type":"markRead"}]}`;
+5. Si no es una regla clara: {"error": "No he entendido"}`;
 
 let groqEnabled = false;
 try {
@@ -2374,8 +2382,7 @@ app.get('/api/ai/preferences/:email', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  🔥 IA — REPROCESAR CORREOS EXISTENTES
-//  Procesa los últimos N correos de INBOX con clasificación + urgencia.
+//  🔥 IA — REPROCESAR
 // ------------------------------------------------------------
 app.post('/api/ai/reprocess', async (req, res) => {
   if (!groqEnabled) return res.status(503).json({ success: false, error: 'IA no disponible' });
@@ -2394,7 +2401,7 @@ app.post('/api/ai/reprocess', async (req, res) => {
 
   let client;
   try {
-    console.log(`♻️ [Reprocess] Iniciando para ${email} (limit=${limit}, skipClassified=${skipClassified})`);
+    console.log(`♻️ [Reprocess] Iniciando para ${email} (limit=${limit})`);
     const accountDoc = await db.collection('user_accounts').doc(email).get();
     if (!accountDoc.exists) return res.status(404).json({ success: false, error: 'account_not_found' });
     const accData = accountDoc.data();
@@ -2404,13 +2411,12 @@ app.post('/api/ai/reprocess', async (req, res) => {
     const conn = await connectImapAuto(email, password, host);
     client = conn.client;
 
-    // Cargar ya clasificados para saltarlos (opcional)
     const alreadyClassified = new Set();
     if (skipClassified) {
       try {
         const snap = await db.collection('email_classifications').doc(email).collection('messages').get();
         snap.forEach((d) => alreadyClassified.add(d.id));
-        console.log(`♻️ [Reprocess] ${alreadyClassified.size} ya clasificados (se saltarán)`);
+        console.log(`♻️ [Reprocess] ${alreadyClassified.size} ya clasificados`);
       } catch (_) {}
     }
 
@@ -2433,9 +2439,8 @@ app.post('/api/ai/reprocess', async (req, res) => {
     await client.logout();
     client = null;
 
-    // Filtrar los ya clasificados
     const toProcess = items.filter((it) => !alreadyClassified.has(String(it.uid)));
-    console.log(`♻️ [Reprocess] ${items.length} correos leídos, ${toProcess.length} a procesar`);
+    console.log(`♻️ [Reprocess] ${items.length} leídos, ${toProcess.length} a procesar`);
 
     let classified = 0;
     let urgencyChecked = 0;
@@ -2452,7 +2457,6 @@ app.post('/api/ai/reprocess', async (req, res) => {
           classified++;
         }
         if (prefs.detectUrgency) {
-          // En reproceso NO enviamos push ni marcamos \Flagged (para no spamear)
           try {
             const urg = await detectUrgencyWithGroq({
               from: it.from, subject: it.subject, preview: it.subject,
@@ -2468,7 +2472,6 @@ app.post('/api/ai/reprocess', async (req, res) => {
             urgencyChecked++;
           } catch (_) {}
         }
-        // Pausa para no saturar Groq (30 req/min free tier)
         await new Promise((r) => setTimeout(r, 400));
       } catch (e) {
         errors++;
@@ -2497,9 +2500,7 @@ app.post('/api/ai/reprocess', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-//  🏷️ IA — CLASIFICACIÓN: OVERRIDE MANUAL
-//  El usuario cambia la categoría de un correo. Se guarda marcado
-//  como manualOverride=true para no sobrescribirlo.
+//  🏷️ IA — OVERRIDE MANUAL
 // ------------------------------------------------------------
 app.post('/api/ai/classify/override', async (req, res) => {
   if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });

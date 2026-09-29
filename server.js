@@ -11,9 +11,6 @@ const cron = require('node-cron');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
 
-// ------------------------------------------------------------
-//  CLOUDINARY
-// ------------------------------------------------------------
 const CLOUDINARY_ENABLED =
   !!process.env.CLOUDINARY_CLOUD_NAME &&
   !!process.env.CLOUDINARY_API_KEY &&
@@ -29,9 +26,6 @@ if (CLOUDINARY_ENABLED) {
   console.log('✅ Cloudinary configurado');
 }
 
-// ------------------------------------------------------------
-//  FIREBASE ADMIN
-// ------------------------------------------------------------
 let db = null;
 let storageBucket = null;
 try {
@@ -78,9 +72,6 @@ app.use(express.json({ limit: '50mb' }));
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// ------------------------------------------------------------
-//  Microsoft OAuth2
-// ------------------------------------------------------------
 const MICROSOFT_CLIENT_ID = process.env.MICROSOFT_CLIENT_ID || '';
 const MICROSOFT_SCOPES =
   'https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send offline_access openid profile';
@@ -125,9 +116,6 @@ async function resolveAccessToken(email, password) {
   catch (e) { return null; }
 }
 
-// ------------------------------------------------------------
-//  WORKERS
-// ------------------------------------------------------------
 const activeWorkers = new Map();
 const failedAccounts = new Map();
 const MAX_FAILURES = 5;
@@ -153,9 +141,6 @@ function isAccountBlocked(email) {
   return false;
 }
 
-// ------------------------------------------------------------
-//  AUTO-CONFIG
-// ------------------------------------------------------------
 function getAutoConfig(email) {
   if (!email) return null;
   const domain = email.split('@')[1]?.toLowerCase();
@@ -209,9 +194,6 @@ function getImapCandidates(email) {
   return candidates;
 }
 
-// ------------------------------------------------------------
-//  CUENTAS
-// ------------------------------------------------------------
 async function saveAccount(email, password, imapHost) {
   if (!db) return;
   try {
@@ -301,9 +283,6 @@ async function createSmtpTransporter({ email, password, host, port, secure }) {
   });
 }
 
-// ------------------------------------------------------------
-//  BREVO
-// ------------------------------------------------------------
 async function sendViaBrevo({ fromEmail, fromName, to, subject, html }) {
   const brevoKey = process.env.BREVO_API_KEY;
   if (!brevoKey) throw new Error('BREVO_API_KEY no configurada');
@@ -321,9 +300,6 @@ async function sendViaBrevo({ fromEmail, fromName, to, subject, html }) {
   return true;
 }
 
-// ------------------------------------------------------------
-//  TIMEZONE HELPERS
-// ------------------------------------------------------------
 async function getUserTimezoneOffset(email) {
   if (!db || !email) return 0;
   try {
@@ -367,9 +343,6 @@ function formatNowLocal(offsetMinutes, referenceNow = new Date()) {
   return `${String(local.getUTCDate()).padStart(2, '0')}/${String(local.getUTCMonth() + 1).padStart(2, '0')} ${String(local.getUTCHours()).padStart(2, '0')}:${String(local.getUTCMinutes()).padStart(2, '0')}`;
 }
 
-// ------------------------------------------------------------
-//  AUSENCIAS
-// ------------------------------------------------------------
 async function getActiveAbsencePeriod(accountEmail) {
   if (!db) return null;
   try {
@@ -445,9 +418,6 @@ async function checkAndSendAutoReply({ accountEmail, accountPassword, incomingFr
   } catch (e) {}
 }
 
-// ------------------------------------------------------------
-//  REGLAS
-// ------------------------------------------------------------
 const _rulesCache = new Map();
 const RULES_CACHE_TTL_MS = 5 * 60 * 1000;
 
@@ -610,9 +580,6 @@ async function applyRulesToMessage({ accountEmail, accountPassword, accountHost,
   }
 }
 
-// ------------------------------------------------------------
-//  IA — URGENCIA
-// ------------------------------------------------------------
 function urgencyThresholdForLevel(level) {
   switch (level) {
     case 'low': return 85;
@@ -714,9 +681,6 @@ async function checkUrgencyAndNotify({ email, password, host, uid, from, subject
   } catch (_) {}
 }
 
-// ------------------------------------------------------------
-//  IA — CLASIFICACIÓN (con fallback y logging robusto)
-// ------------------------------------------------------------
 async function classifyEmailWithGroq({ from, subject, preview, categories }) {
   const groqKey = process.env.GROQ_API_KEY;
   if (!groqKey) throw new Error('GROQ_API_KEY no configurada');
@@ -748,9 +712,6 @@ Devuelve SOLO un JSON de la forma: { "category": "una_categoria_valida", "confid
   let lastError = null;
 
   for (const model of GROQ_MODELS_FALLBACK) {
-    // 2 intentos por modelo:
-    //   1) con response_format json_object
-    //   2) sin response_format (por si el modelo no lo soporta)
     const attempts = [
       { model, response_format: { type: 'json_object' } },
       { model, response_format: null },
@@ -786,7 +747,6 @@ Devuelve SOLO un JSON de la forma: { "category": "una_categoria_valida", "confid
         const data = await res.json();
         const raw = data?.choices?.[0]?.message?.content || '{}';
 
-        // Parseo robusto
         let parsed = null;
         try {
           parsed = JSON.parse(raw);
@@ -843,9 +803,6 @@ async function checkAndClassifyEmail({ email, uid, from, subject, preview, folde
   } catch (_) {}
 }
 
-// ------------------------------------------------------------
-//  TRADUCCIÓN
-// ------------------------------------------------------------
 const _translateCache = new Map();
 const TRANSLATE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const GOOGLE_HARD_LIMIT = 4500;
@@ -967,9 +924,6 @@ cron.schedule('0 */12 * * *', async () => {
   } catch (_) {}
 });
 
-// ------------------------------------------------------------
-//  CHAT — SUBIDA
-// ------------------------------------------------------------
 const multerMemory = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 
 app.post('/api/chat/upload', multerMemory.single('file'), async (req, res) => {
@@ -1024,9 +978,6 @@ app.get('/api/chat/file/:filename', (req, res) => {
   } catch (e) { res.status(500).send(e.message); }
 });
 
-// ------------------------------------------------------------
-//  WEBSOCKETS
-// ------------------------------------------------------------
 wss.on('connection', (ws) => {
   let userEmail = null;
   ws.on('message', async (message) => {
@@ -1044,9 +995,6 @@ wss.on('connection', (ws) => {
   });
 });
 
-// ------------------------------------------------------------
-//  MOTOR IMAP
-// ------------------------------------------------------------
 function startImapWorker(email, password, customHost, ws = null) {
   if (activeWorkers.has(email)) {
     const existing = activeWorkers.get(email);
@@ -1180,9 +1128,6 @@ async function runImapLoop(state) {
   }
 }
 
-// ------------------------------------------------------------
-//  CRON CALENDARIO
-// ------------------------------------------------------------
 cron.schedule('* * * * *', async () => {
   if (!db) return;
   try {
@@ -1233,9 +1178,6 @@ cron.schedule('* * * * *', async () => {
   } catch (e) {}
 });
 
-// ------------------------------------------------------------
-//  CRON REPORTE SEMANAL
-// ------------------------------------------------------------
 cron.schedule('0 8 * * 0', async () => {
   if (!db) return;
   try {
@@ -1304,9 +1246,6 @@ function buildWeeklyReportHtml({ recipientEmail, recipientName, weekStart, weekE
   return `<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body style="margin:0;padding:0;background:#EEF3F8;font-family:sans-serif;"><table width="100%" style="padding:24px 12px;"><tr><td align="center"><table width="600" style="max-width:600px;"><tr><td style="background:linear-gradient(135deg,#1A73E8,#0D47A1);padding:28px;border-radius:18px 18px 0 0;text-align:center;color:#fff;"><div style="font-size:40px;">📅</div><div style="font-size:22px;font-weight:700;">Tu semana en RSMail</div><div style="font-size:13px;color:#B3D4FC;">${rangeStr}</div></td></tr><tr><td style="background:#fff;padding:22px 24px 8px;"><div style="font-size:15px;color:#1A2A3A;">Hola <b>${recipientName || 'usuario'}</b>,</div><div style="font-size:14px;color:#5A6B7B;margin-top:6px;">Tienes <b style="color:#1A73E8;">${events.length} evento${events.length === 1 ? '' : 's'}</b> esta semana.</div></td></tr><tr><td style="background:#fff;padding:16px 24px;">${cards}</td></tr><tr><td style="background:#F5F8FB;padding:16px;text-align:center;border-radius:0 0 18px 18px;"><div style="font-size:11px;color:#8896A5;">RSMail · Cada domingo a las 8:00</div></td></tr></table></td></tr></table></body></html>`;
 }
 
-// ------------------------------------------------------------
-//  CRON REANIMACIÓN
-// ------------------------------------------------------------
 cron.schedule('*/3 * * * *', async () => {
   if (!db) return;
   try {
@@ -1326,9 +1265,6 @@ cron.schedule('*/3 * * * *', async () => {
   } catch (e) {}
 });
 
-// ------------------------------------------------------------
-//  CRON RECORDATORIOS
-// ------------------------------------------------------------
 cron.schedule('* * * * *', async () => {
   if (!db) return;
   try {
@@ -1371,9 +1307,6 @@ cron.schedule('0 */6 * * *', async () => {
   } catch (_) {}
 });
 
-// ------------------------------------------------------------
-//  FCM
-// ------------------------------------------------------------
 async function sendPushNotification(email, payload, options = {}) {
   if (!db) return;
   const dataOnly = options.dataOnly === true;
@@ -1407,9 +1340,6 @@ async function sendPushNotification(email, payload, options = {}) {
   } catch (e) {}
 }
 
-// ------------------------------------------------------------
-//  CONFIDENCIAL
-// ------------------------------------------------------------
 app.post('/api/confidential/create', async (req, res) => {
   if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
   try {
@@ -1522,9 +1452,6 @@ cron.schedule('*/30 * * * *', async () => {
   } catch (_) {}
 });
 
-// ------------------------------------------------------------
-//  AUTH
-// ------------------------------------------------------------
 const handleAuth = async (req, res) => {
   const { email, password, host, port } = req.body;
   if (!email || !password) return res.status(400).json({ success: false, error: 'Email y contraseña requeridos' });
@@ -1564,9 +1491,6 @@ app.post('/api/rules/invalidate', (req, res) => {
   res.json({ ok: true });
 });
 
-// ------------------------------------------------------------
-//  DIAGNÓSTICO
-// ------------------------------------------------------------
 app.get('/ping', async (req, res) => {
   if (db) {
     try {
@@ -1734,9 +1658,6 @@ app.post('/api/folders', async (req, res) => {
   } catch (err) { if (client) await client.logout().catch(() => {}); res.status(500).json({ success: false, error: err.message }); }
 });
 
-// ------------------------------------------------------------
-//  MENSAJES
-// ------------------------------------------------------------
 function detectAttachmentsFromStructure(structure) {
   if (!structure) return false;
   const stack = [structure];
@@ -1752,6 +1673,7 @@ function detectAttachmentsFromStructure(structure) {
   return false;
 }
 
+// 🔥 OPTIMIZADO: batch read de urgencias + clasificaciones
 app.post('/api/messages', async (req, res) => {
   const { email, password, host, port, folder = 'INBOX', limit = 20 } = req.body;
   let client;
@@ -1786,32 +1708,58 @@ app.post('/api/messages', async (req, res) => {
     } finally { lock.release(); }
     await client.logout();
 
-    if (db) {
+    // 🔥 OPTIMIZACIÓN: leer urgencias y clasificaciones en lote (30 UIDs por consulta)
+    if (db && messages.length > 0) {
       try {
-        const urgencyCol = db.collection('email_urgency').doc(email).collection('messages');
-        const classCol = db.collection('email_classifications').doc(email).collection('messages');
+        const uids = messages.map((m) => String(m.uid));
+        const chunks = [];
+        for (let i = 0; i < uids.length; i += 30) {
+          chunks.push(uids.slice(i, i + 30));
+        }
+
+        const urgencyMap = new Map();
+        const classMap = new Map();
+
+        await Promise.all(
+          chunks.map(async (chunk) => {
+            try {
+              const urgSnap = await db
+                .collection('email_urgency')
+                .doc(email)
+                .collection('messages')
+                .where(admin.firestore.FieldPath.documentId(), 'in', chunk)
+                .get();
+              urgSnap.forEach((d) => urgencyMap.set(d.id, d.data()));
+            } catch (_) {}
+            try {
+              const clsSnap = await db
+                .collection('email_classifications')
+                .doc(email)
+                .collection('messages')
+                .where(admin.firestore.FieldPath.documentId(), 'in', chunk)
+                .get();
+              clsSnap.forEach((d) => classMap.set(d.id, d.data()));
+            } catch (_) {}
+          })
+        );
+
         for (const m of messages) {
-          try {
-            const doc = await urgencyCol.doc(String(m.uid)).get();
-            if (doc.exists) {
-              const d = doc.data();
-              m['isUrgent'] = d.isUrgent === true;
-              m['urgentScore'] = d.score || 0;
-              m['urgentReason'] = d.reason || '';
-            }
-          } catch (_) {}
-          try {
-            const doc = await classCol.doc(String(m.uid)).get();
-            if (doc.exists) {
-              const d = doc.data();
-              m['category'] = d.category || null;
-              m['categoryConfidence'] = d.confidence || 0;
-              m['categoryReason'] = d.reason || '';
-              m['categoryManual'] = d.manualOverride === true;
-            } else {
-              m['category'] = null;
-            }
-          } catch (_) { m['category'] = null; }
+          const key = String(m.uid);
+          const urg = urgencyMap.get(key);
+          if (urg) {
+            m['isUrgent'] = urg.isUrgent === true;
+            m['urgentScore'] = urg.score || 0;
+            m['urgentReason'] = urg.reason || '';
+          }
+          const cls = classMap.get(key);
+          if (cls) {
+            m['category'] = cls.category || null;
+            m['categoryConfidence'] = cls.confidence || 0;
+            m['categoryReason'] = cls.reason || '';
+            m['categoryManual'] = cls.manualOverride === true;
+          } else {
+            m['category'] = null;
+          }
         }
       } catch (_) {}
     }
@@ -1864,9 +1812,6 @@ app.post('/api/message-detail', async (req, res) => {
   } catch (err) { if (client) await client.logout().catch(() => {}); res.status(500).json({ success: false, error: err.message }); }
 });
 
-// ------------------------------------------------------------
-//  MOVER / CREAR / BORRAR / DELETE / READ / FLAG
-// ------------------------------------------------------------
 app.post('/api/move-message', async (req, res) => {
   const { email, password, host, port, uid, fromFolder, toFolder } = req.body;
   if (!email || !password || !uid || !fromFolder || !toFolder) return res.status(400).json({ success: false, error: 'Faltan parámetros' });
@@ -2001,9 +1946,6 @@ app.post('/api/toggle-flagged', async (req, res) => {
   } catch (e) { if (client) await client.logout().catch(() => {}); res.status(500).json({ success: false, error: e.message }); }
 });
 
-// ------------------------------------------------------------
-//  ADJUNTOS / SUSCRIPCIONES
-// ------------------------------------------------------------
 function collectAttachmentParts(structure, prefix = '') {
   const out = [];
   const walk = (node, currentPart) => {
@@ -2197,9 +2139,6 @@ app.delete('/api/account/:email', async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// ------------------------------------------------------------
-//  COMPARTIR EVENTO
-// ------------------------------------------------------------
 app.get('/event/invite/:id', async (req, res) => {
   if (!db) return res.status(500).send('Firestore no disponible');
   try {
@@ -2237,9 +2176,6 @@ app.get('/event/invite/:id', async (req, res) => {
   } catch (e) { res.status(500).send(`<html><body>${e.message}</body></html>`); }
 });
 
-// ------------------------------------------------------------
-//  🔥 IA — GROQ
-// ------------------------------------------------------------
 const GROQ_MODELS_FALLBACK = ['openai/gpt-oss-20b', 'openai/gpt-oss-120b'];
 
 const RSMAIL_SYSTEM_PROMPT = `Eres RSMail AI, el asistente inteligente integrado en la aplicación RSMail.
@@ -2350,9 +2286,6 @@ app.post('/api/ai/chat', async (req, res) => {
   }
 });
 
-// ------------------------------------------------------------
-//  🔥 IA — PREFERENCIAS
-// ------------------------------------------------------------
 app.post('/api/ai/preferences', async (req, res) => {
   if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
   try {
@@ -2381,9 +2314,6 @@ app.get('/api/ai/preferences/:email', async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// ------------------------------------------------------------
-//  🔥 IA — REPROCESAR
-// ------------------------------------------------------------
 app.post('/api/ai/reprocess', async (req, res) => {
   if (!groqEnabled) return res.status(503).json({ success: false, error: 'IA no disponible' });
   if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
@@ -2416,7 +2346,6 @@ app.post('/api/ai/reprocess', async (req, res) => {
       try {
         const snap = await db.collection('email_classifications').doc(email).collection('messages').get();
         snap.forEach((d) => alreadyClassified.add(d.id));
-        console.log(`♻️ [Reprocess] ${alreadyClassified.size} ya clasificados`);
       } catch (_) {}
     }
 
@@ -2499,9 +2428,6 @@ app.post('/api/ai/reprocess', async (req, res) => {
   }
 });
 
-// ------------------------------------------------------------
-//  🏷️ IA — OVERRIDE MANUAL
-// ------------------------------------------------------------
 app.post('/api/ai/classify/override', async (req, res) => {
   if (!db) return res.status(500).json({ success: false, error: 'Firestore no configurado' });
   try {
@@ -2532,9 +2458,6 @@ app.post('/api/ai/classify/override', async (req, res) => {
   }
 });
 
-// ------------------------------------------------------------
-//  🏷️ IA — CLASIFICACIÓN: endpoints test
-// ------------------------------------------------------------
 app.post('/api/ai/classify', async (req, res) => {
   if (!groqEnabled) return res.status(503).json({ success: false, error: 'ai_unavailable' });
   try {
@@ -2559,9 +2482,6 @@ app.get('/api/ai/classify/:email/:uid', async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// ------------------------------------------------------------
-//  🔥 IA — REGLAS NL
-// ------------------------------------------------------------
 async function callGroqForRuleJson(prompt, folders) {
   const groqKey = process.env.GROQ_API_KEY;
   if (!groqKey) throw new Error('GROQ_API_KEY no configurada');
@@ -2667,9 +2587,6 @@ app.get('/api/ai/models', async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// ------------------------------------------------------------
-//  SERVIDOR
-// ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, async () => {
   console.log(`✅ Backend RSMAIL activo en puerto ${PORT}`);
